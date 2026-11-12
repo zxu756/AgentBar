@@ -42,11 +42,11 @@ public enum AgentVendor: String, CaseIterable, Codable, Identifiable, Sendable {
 
     public var color: Color {
         switch self {
-        case .claudeCode: return Color(red: 0.90, green: 0.50, blue: 0.36)   // Terracotta
-        case .codex: return Color(red: 0.20, green: 0.83, blue: 0.60)        // Emerald
-        case .openCode: return Color(red: 0.22, green: 0.74, blue: 0.97)     // Sky Cyan
-        case .mistralVibe: return Color(red: 0.98, green: 0.75, blue: 0.15)  // Solar Amber
-        case .antigravity: return Color(red: 0.66, green: 0.55, blue: 0.98)  // Indigo Violet
+        case .claudeCode: return Color(red: 0.88, green: 0.48, blue: 0.28)   // Burnished Copper
+        case .codex: return Color(red: 0.29, green: 0.62, blue: 0.51)        // Mineral Jade
+        case .openCode: return Color(red: 0.36, green: 0.55, blue: 0.75)     // Steel Cerulean
+        case .mistralVibe: return Color(red: 0.85, green: 0.64, blue: 0.25)  // Ochre Gold
+        case .antigravity: return Color(red: 0.61, green: 0.49, blue: 0.78)  // Muted Iris
         }
     }
 

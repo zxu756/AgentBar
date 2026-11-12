@@ -300,22 +300,22 @@ public enum ScreenshotExporter {
         let monitor = TelemetryMonitor.preview
 
         let dashView = DashboardView(monitor: monitor)
-            .background(Color(red: 0.045, green: 0.058, blue: 0.090))
-        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 665)) {
+            .background(AgentBarPalette.canvas)
+        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 675)) {
             try dashPNG.write(to: directory.appendingPathComponent("screenshot-dashboard.png"))
         }
 
         let popView = MenuBarPopoverView(monitor: monitor, onOpenDashboard: {}, onOpenSettings: {})
-            .background(Color(red: 0.055, green: 0.070, blue: 0.105))
+            .background(AgentBarPalette.canvas)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                    .strokeBorder(AgentBarPalette.rule, lineWidth: 1)
             )
             .padding(16)
-            .frame(width: 420, height: 500)
-            .background(Color(red: 0.03, green: 0.04, blue: 0.06))
-        if let popPNG = renderPNG(view: popView, size: CGSize(width: 420, height: 500)) {
+            .frame(width: 424, height: 495)
+            .background(Color(red: 0.055, green: 0.050, blue: 0.046))
+        if let popPNG = renderPNG(view: popView, size: CGSize(width: 424, height: 495)) {
             try popPNG.write(to: directory.appendingPathComponent("screenshot-menubar.png"))
         }
     }
