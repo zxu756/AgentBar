@@ -76,6 +76,15 @@ public enum MenuBarLabelMode: String, CaseIterable, Codable, Identifiable, Senda
         case .iconOnly: return "Icon Only"
         }
     }
+
+    @MainActor
+    public func localizedTitle(_ localizer: AppLocalizer) -> String {
+        switch self {
+        case .todayCost: return localizer.L("Today API-Eq Spend ($)", "今日 API 等效开销 ($)")
+        case .fiveHourTokens: return localizer.L("5h Rolling Tokens", "5 小时滚动 Token")
+        case .iconOnly: return localizer.L("Icon Only", "仅显示图标")
+        }
+    }
 }
 
 public enum PriceCatalog {
@@ -284,6 +293,21 @@ public struct RelayBatonStep: Identifiable, Codable, Sendable, Equatable {
         self.model = model
         self.costUSD = costUSD
         self.tokens = tokens
+    }
+
+    @MainActor
+    public func localizedStatus(_ localizer: AppLocalizer) -> String {
+        let lower = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lower == "ok" || lower == "done" || lower == "pass" {
+            return localizer.L(status, "完成")
+        }
+        if lower.contains("flag") || lower.contains("warn") {
+            return localizer.L(status, "告警")
+        }
+        if lower.contains("fail") || lower.contains("err") {
+            return localizer.L(status, "失败")
+        }
+        return status
     }
 }
 

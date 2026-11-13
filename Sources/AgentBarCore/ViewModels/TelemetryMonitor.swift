@@ -295,28 +295,40 @@ public enum ScreenshotExporter {
     }
 
     @MainActor
-    public static func exportMarketingScreenshots(to directory: URL) throws {
+    public static func exportMarketingScreenshots(
+        to directory: URL,
+        language: AppLanguage = .en
+    ) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let monitor = TelemetryMonitor.preview
+        let localizer = AppLocalizer(fixedLanguage: language)
+        let suffix = (language == .zhHans) ? "-zh" : ""
 
-        let dashView = DashboardView(monitor: monitor)
+        let dashView = DashboardView(monitor: monitor, localizer: localizer)
+            .environment(\.locale, language.locale)
             .background(AgentBarPalette.canvas)
         if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 675)) {
-            try dashPNG.write(to: directory.appendingPathComponent("screenshot-dashboard.png"))
+            try dashPNG.write(to: directory.appendingPathComponent("screenshot-dashboard\(suffix).png"))
         }
 
-        let popView = MenuBarPopoverView(monitor: monitor, onOpenDashboard: {}, onOpenSettings: {})
-            .background(AgentBarPalette.canvas)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(AgentBarPalette.rule, lineWidth: 1)
-            )
-            .padding(16)
-            .frame(width: 424, height: 495)
-            .background(Color(red: 0.055, green: 0.050, blue: 0.046))
-        if let popPNG = renderPNG(view: popView, size: CGSize(width: 424, height: 495)) {
-            try popPNG.write(to: directory.appendingPathComponent("screenshot-menubar.png"))
+        let popView = MenuBarPopoverView(
+            monitor: monitor,
+            localizer: localizer,
+            onOpenDashboard: {},
+            onOpenSettings: {}
+        )
+        .environment(\.locale, language.locale)
+        .background(AgentBarPalette.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(AgentBarPalette.rule, lineWidth: 1)
+        )
+        .padding(16)
+        .frame(width: 428, height: 524)
+        .background(Color(red: 0.055, green: 0.050, blue: 0.046))
+        if let popPNG = renderPNG(view: popView, size: CGSize(width: 428, height: 524)) {
+            try popPNG.write(to: directory.appendingPathComponent("screenshot-menubar\(suffix).png"))
         }
     }
 }

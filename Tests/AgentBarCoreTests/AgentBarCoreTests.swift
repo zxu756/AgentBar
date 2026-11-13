@@ -125,11 +125,110 @@ struct AgentBarCoreTests {
         )
         let popData = ScreenshotExporter.renderPNG(
             view: MenuBarPopoverView(monitor: monitor, onOpenDashboard: {}, onOpenSettings: {}),
-            size: CGSize(width: 388, height: 480),
+            size: CGSize(width: 396, height: 500),
             scale: 2.0
         )
         #expect((dashData?.count ?? 0) > 20_000)
         #expect((popData?.count ?? 0) > 10_000)
+    }
+
+    @Test("Toggles live between zh-Hans and en and persists to UserDefaults")
+    @MainActor
+    func languageToggleAndPersistence() throws {
+        let suiteName = "agentbar.i18n.toggle.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let key = "local.xu.AgentBar.language"
+        let localizer = AppLocalizer(
+            arguments: ["AgentBar"],
+            userDefaults: defaults,
+            preferenceKey: key,
+            preferredLanguages: ["en-US"]
+        )
+        #expect(localizer.language == .en)
+        #expect(localizer.language.badge == "EN")
+        #expect(localizer.L("Refresh", "刷新") == "Refresh")
+
+        localizer.toggle()
+        #expect(localizer.language == .zhHans)
+        #expect(localizer.language.badge == "中文")
+        #expect(localizer.L("Refresh", "刷新") == "刷新")
+        #expect(defaults.string(forKey: key) == "zh-Hans")
+
+        localizer.toggle()
+        #expect(localizer.language == .en)
+        #expect(defaults.string(forKey: key) == "en")
+    }
+
+    @Test("Auto-detects Simplified Chinese system locale and respects UserDefaults override")
+    @MainActor
+    func chineseLocaleAutoDetection() throws {
+        let suiteName = "agentbar.i18n.locale.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let key = "local.xu.AgentBar.language"
+        let zhDetected = AppLocalizer(
+            arguments: ["AgentBar"],
+            userDefaults: defaults,
+            preferenceKey: key,
+            preferredLanguages: ["zh-Hans-CN", "en-US"]
+        )
+        #expect(zhDetected.language == .zhHans)
+
+        defaults.set("en", forKey: key)
+        let savedOverride = AppLocalizer(
+            arguments: ["AgentBar"],
+            userDefaults: defaults,
+            preferenceKey: key,
+            preferredLanguages: ["zh-Hans-CN"]
+        )
+        #expect(savedOverride.language == .en)
+    }
+
+    @Test("CLI --lang flag takes highest precedence and exports -zh screenshots cleanly")
+    @MainActor
+    func cliLangFlagAndChineseScreenshotExport() throws {
+        let suiteName = "agentbar.i18n.cli.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let key = "local.xu.AgentBar.language"
+        defaults.set("en", forKey: key)
+
+        let cliZH = AppLocalizer(
+            arguments: ["AgentBar", "--lang", "zh"],
+            userDefaults: defaults,
+            preferenceKey: key,
+            preferredLanguages: ["en-US"]
+        )
+        #expect(cliZH.language == .zhHans)
+
+        let cliEN = AppLocalizer(
+            arguments: ["AgentBar", "--lang=en"],
+            userDefaults: defaults,
+            preferenceKey: key,
+            preferredLanguages: ["zh-Hans-CN"]
+        )
+        #expect(cliEN.language == .en)
+
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-shots-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+
+        let sentinel = Data("keep-en".utf8)
+        let enDash = tmpDir.appendingPathComponent("screenshot-dashboard.png")
+        try sentinel.write(to: enDash)
+
+        try ScreenshotExporter.exportMarketingScreenshots(to: tmpDir, language: .zhHans)
+        #expect(try Data(contentsOf: enDash) == sentinel)
+        let zhDash = tmpDir.appendingPathComponent("screenshot-dashboard-zh.png")
+        let zhMenu = tmpDir.appendingPathComponent("screenshot-menubar-zh.png")
+        #expect(FileManager.default.fileExists(atPath: zhDash.path))
+        #expect(FileManager.default.fileExists(atPath: zhMenu.path))
+        #expect((try Data(contentsOf: zhDash)).count > 20_000)
+        #expect((try Data(contentsOf: zhMenu)).count > 10_000)
     }
 
     private func execSQL(at url: URL, sql: String) throws {

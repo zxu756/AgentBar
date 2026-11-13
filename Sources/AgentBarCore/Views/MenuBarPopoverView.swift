@@ -2,15 +2,19 @@ import SwiftUI
 
 public struct MenuBarPopoverView: View {
     @ObservedObject public var monitor: TelemetryMonitor
+    @ObservedObject public var localizer: AppLocalizer
     public var onOpenDashboard: () -> Void
     public var onOpenSettings: () -> Void
 
+    @MainActor
     public init(
         monitor: TelemetryMonitor,
+        localizer: AppLocalizer? = nil,
         onOpenDashboard: @escaping () -> Void,
         onOpenSettings: @escaping () -> Void
     ) {
         self.monitor = monitor
+        self.localizer = localizer ?? .shared
         self.onOpenDashboard = onOpenDashboard
         self.onOpenSettings = onOpenSettings
     }
@@ -31,48 +35,70 @@ public struct MenuBarPopoverView: View {
             footerControls
         }
         .padding(16)
-        .frame(width: 392)
+        .frame(width: 396)
         .background(AgentBarPalette.canvas)
+        .environment(\.locale, localizer.language.locale)
         .preferredColorScheme(.dark)
     }
 
     private var headerSection: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("AgentBar · Local telemetry")
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .center) {
+                Text(localizer.L("AgentBar · Local telemetry", "AgentBar · 本地只读遥测"))
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(AgentBarPalette.muted)
+                    .fixedSize(horizontal: true, vertical: false)
+                Spacer()
+                LanguageTogglePill(localizer: localizer, compact: true)
+            }
+
+            HStack(alignment: .bottom) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(TelemetryFormatter.usd(snap.todayTotalCostUSD))
                         .font(.system(size: 28, weight: .bold))
                         .tracking(-0.7)
                         .monospacedDigit()
                         .foregroundStyle(AgentBarPalette.copper)
-                    Text("today · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tok")
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(AgentBarPalette.muted)
-                }
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 3) {
-                Text("5-hour burst")
-                    .font(.system(size: 11.5))
+                    Text(localizer.L(
+                        "today · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tok",
+                        "今日 · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
+                    ))
+                    .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(AgentBarPalette.muted)
-                Text(TelemetryFormatter.compactTokens(snap.fiveHourTotalTokens))
-                    .font(.system(size: 15, weight: .bold, design: .monospaced))
-                    .foregroundStyle(AgentBarPalette.ink)
-                if snap.rateLimitHits24h > 0 {
-                    Text(verbatim: "\(snap.rateLimitHits24h) × 429 (24h)")
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(localizer.L("5-hour burst", "5 小时突发"))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(AgentBarPalette.muted)
+                        Text(TelemetryFormatter.compactTokens(snap.fiveHourTotalTokens))
+                            .font(.system(size: 15, weight: .bold, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.ink)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+
+                    if snap.rateLimitHits24h > 0 {
+                        Text(localizer.L(
+                            "\(snap.rateLimitHits24h) × 429 (24h)",
+                            "24h 限流 \(snap.rateLimitHits24h) 次"
+                        ))
                         .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
+                        .fixedSize(horizontal: true, vertical: false)
                         .background(AgentBarPalette.copper.opacity(0.18))
                         .foregroundStyle(AgentBarPalette.copper)
                         .clipShape(RoundedRectangle(cornerRadius: 4))
-                } else {
-                    Text("Zero 429s")
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundStyle(AgentBarPalette.jade)
+                    } else {
+                        Text(localizer.L("Zero 429s", "24h 零限流"))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.jade)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                 }
             }
         }
@@ -110,15 +136,16 @@ public struct MenuBarPopoverView: View {
                         Text(item.vendor.displayName)
                             .font(.system(size: 12.5, weight: .semibold))
                             .foregroundStyle(item.sourceAvailable ? AgentBarPalette.ink : AgentBarPalette.muted)
+                            .fixedSize(horizontal: true, vertical: false)
                         Text(item.activeModel)
                             .font(.system(size: 10.5, design: .monospaced))
                             .foregroundStyle(AgentBarPalette.muted)
                             .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
+                        Spacer(minLength: 4)
                         Text(TelemetryFormatter.compactTokens(item.fiveHourTokens))
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(AgentBarPalette.muted)
+                            .fixedSize(horizontal: true, vertical: false)
                         Text(TelemetryFormatter.usd(item.todayCostUSD))
                             .font(.system(size: 12, weight: .semibold, design: .monospaced))
                             .foregroundStyle(AgentBarPalette.ink)
@@ -142,13 +169,16 @@ public struct MenuBarPopoverView: View {
     private func relayStrip(_ run: RelayRunSummary) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("Relay · \(run.projectName)")
+                Text(localizer.L("Relay · \(run.projectName)", "接力 · \(run.projectName)"))
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
-                Text(verbatim: "\(run.steps.count) batons · \(TelemetryFormatter.usd(run.totalCostUSD))")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(AgentBarPalette.muted)
+                Text(localizer.L(
+                    "\(run.steps.count) batons · \(TelemetryFormatter.usd(run.totalCostUSD))",
+                    "\(run.steps.count) 棒 · \(TelemetryFormatter.usd(run.totalCostUSD))"
+                ))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(AgentBarPalette.muted)
             }
             HStack(spacing: 5) {
                 ForEach(run.steps.suffix(4)) { step in
@@ -173,11 +203,12 @@ public struct MenuBarPopoverView: View {
     private var footerControls: some View {
         HStack(spacing: 8) {
             Button(action: onOpenDashboard) {
-                Text("Open ledger")
+                Text(localizer.L("Open ledger", "打开完整账本"))
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(AgentBarPalette.canvas)
                     .padding(.horizontal, 11)
                     .padding(.vertical, 5)
+                    .fixedSize(horizontal: true, vertical: false)
                     .background(AgentBarPalette.ink)
                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
@@ -196,6 +227,7 @@ public struct MenuBarPopoverView: View {
                     )
             }
             .buttonStyle(.plain)
+            .help(localizer.L("Refresh telemetry", "刷新本地遥测"))
 
             Button(action: onOpenSettings) {
                 Image(systemName: "gearshape")
@@ -208,19 +240,22 @@ public struct MenuBarPopoverView: View {
                     )
             }
             .buttonStyle(.plain)
+            .help(localizer.L("Settings", "偏好设置"))
 
             Spacer()
 
-            Text("Read-only")
+            Text(localizer.L("Read-only", "本地只读"))
                 .font(.system(size: 10.5, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
+                .fixedSize(horizontal: true, vertical: false)
 
-            Button("Quit") {
+            Button(localizer.L("Quit", "退出")) {
                 NSApplication.shared.terminate(nil)
             }
             .buttonStyle(.plain)
             .font(.system(size: 11.5))
             .foregroundStyle(AgentBarPalette.muted)
+            .fixedSize(horizontal: true, vertical: false)
         }
     }
 }

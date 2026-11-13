@@ -1,8 +1,10 @@
-# AgentBar
+# AgentBar `v0.2.0`
+
+**English** | **[简体中文](README.zh-CN.md)**
 
 **Native macOS Menu Bar & Swift Charts Telemetry Monitor for Multi-Agent Coding Workflows** (`Claude Code`, `Codex CLI`, `OpenCode`, `Mistral Vibe`, `Antigravity`, and [`agent-relay`](https://github.com/zxu756/agent-relay) pipelines).
 
-**Zero network calls · `SQLITE_OPEN_READONLY` · Zero third-party dependencies · Pure SwiftPM (`macOS 14.0+`)**
+**Zero network calls · `SQLITE_OPEN_READONLY` · Live `中文 / EN` Bilingual UI · Zero third-party dependencies · Pure SwiftPM (`macOS 14.0+`)**
 
 ![AgentBar Dashboard](docs/screenshot-dashboard.png)
 
@@ -16,13 +18,14 @@
 
 Developers running modern multi-CLI coding harnesses (`claude`, `codex`, `opencode`, `vibe`, `agy`) split work across flat-rate 5-hour burst windows, prepaid API credits, and headless file-handoff relays—yet usage visibility is scattered across incompatible SQLite databases, JSONL transcripts, and `.relay/LOG.md` files.
 
-**AgentBar** unifies all five harnesses into a ~1.5 MB native SwiftUI + Swift Charts instrument panel that sits quietly in your macOS menu bar:
+**AgentBar `v0.2.0`** unifies all five harnesses into a ~1.5 MB native SwiftUI + Swift Charts instrument panel that sits quietly in your macOS menu bar:
 
 - **Proportional Multi-CLI Fuel Strip**: Instant breakdown of today's API-equivalent spend and token volume across Claude Code, Codex CLI, OpenCode, Mistral Vibe, and Antigravity.
 - **5-Hour Rolling Burst Gauges**: Tracks rolling 5-hour token velocity per CLI alongside 24-hour HTTP `429` / `RESOURCE_EXHAUSTED` rate-limit counters.
 - **14-Day Stacked Velocity Chart (`Swift Charts`)**: Toggle between daily API-equivalent USD spend and million-token throughput.
 - **Prompt Cache Efficiency**: Computes real cache-read hit ratios (`cache_read / (input + cache_read + cache_write)`) per CLI.
 - **Native [`agent-relay`](https://github.com/zxu756/agent-relay) Baton Inspector**: Automatically discovers `<workspace>/*/.relay/LOG.md` pipelines and surfaces step durations, active models, per-baton costs, and flagged statuses.
+- **Live `中文 / EN` Bilingual Switching (`v0.2.0`)**: Auto-detects Simplified Chinese macOS system locales on first launch, provides a one-click **`中文 | EN`** segmented pill in both the main ledger header and menu bar popover, supports `⇧⌘L` (`切换语言 / Toggle Language`), and accepts `--lang zh|en` from the CLI.
 
 ---
 
@@ -45,7 +48,7 @@ Unlike Electron dashboards or cloud proxies that ask for session cookies, OAuth 
 
 ---
 
-## Install
+## Install (`v0.2.0`)
 
 ### Homebrew Cask (Recommended)
 
@@ -62,7 +65,7 @@ Requires macOS 14.0+ (Sonoma or newer) and Swift 6.0+ / Command Line Tools:
 ```bash
 git clone https://github.com/zxu756/AgentBar.git
 cd AgentBar
-swift test
+swift test --no-parallel
 ./Scripts/build-app.sh
 open build/AgentBar.app
 ```

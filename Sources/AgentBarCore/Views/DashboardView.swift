@@ -14,16 +14,27 @@ public enum AgentBarPalette {
 
 public struct DashboardView: View {
     @ObservedObject public var monitor: TelemetryMonitor
+    @ObservedObject public var localizer: AppLocalizer
     @State private var chartMetric: ChartMetric = .cost
 
     public enum ChartMetric: String, CaseIterable, Identifiable {
-        case cost = "API-eq spend ($)"
-        case tokens = "Tokens"
+        case cost = "cost"
+        case tokens = "tokens"
         public var id: String { rawValue }
+
+        @MainActor
+        public func localizedTitle(_ localizer: AppLocalizer) -> String {
+            switch self {
+            case .cost: return localizer.L("API-eq spend ($)", "API 等效开销 ($)")
+            case .tokens: return localizer.L("Tokens", "Token 用量")
+            }
+        }
     }
 
-    public init(monitor: TelemetryMonitor) {
+    @MainActor
+    public init(monitor: TelemetryMonitor, localizer: AppLocalizer? = nil) {
         self.monitor = monitor
+        self.localizer = localizer ?? .shared
     }
 
     private var snap: TelemetrySnapshot { monitor.snapshot }
@@ -65,11 +76,12 @@ public struct DashboardView: View {
         .padding(.vertical, 20)
         .frame(minWidth: 960, minHeight: 640, alignment: .top)
         .background(AgentBarPalette.canvas)
+        .environment(\.locale, localizer.language.locale)
         .preferredColorScheme(.dark)
     }
 
     private var topMasthead: some View {
-        HStack(alignment: .center, spacing: 14) {
+        HStack(alignment: .center, spacing: 12) {
             HStack(spacing: 11) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -84,24 +96,30 @@ public struct DashboardView: View {
                         .font(.system(size: 18, weight: .bold))
                         .tracking(-0.4)
                         .foregroundStyle(AgentBarPalette.ink)
-                    Text("Local read-only multi-CLI token & spend ledger")
-                        .font(.system(size: 13))
-                        .foregroundStyle(AgentBarPalette.muted)
+                    Text(localizer.L(
+                        "Local read-only multi-CLI token & spend ledger",
+                        "本地只读 · 多智能体 CLI 用量与开销账本"
+                    ))
+                    .font(.system(size: 13))
+                    .foregroundStyle(AgentBarPalette.muted)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 12)
 
             HStack(spacing: 2) {
                 ForEach(ChartMetric.allCases) { m in
                     Button {
                         chartMetric = m
                     } label: {
-                        Text(m.rawValue)
+                        Text(m.localizedTitle(localizer))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(chartMetric == m ? AgentBarPalette.ink : AgentBarPalette.muted)
                             .padding(.horizontal, 11)
                             .padding(.vertical, 5)
+                            .fixedSize(horizontal: true, vertical: false)
                             .background(
                                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                                     .fill(chartMetric == m ? AgentBarPalette.raised : Color.clear)
@@ -117,6 +135,9 @@ public struct DashboardView: View {
             .padding(3)
             .background(AgentBarPalette.well)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .fixedSize(horizontal: true, vertical: false)
+
+            LanguageTogglePill(localizer: localizer)
 
             Button {
                 monitor.refreshNow()
@@ -124,12 +145,15 @@ public struct DashboardView: View {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .semibold))
-                    Text(monitor.isRefreshing ? "Scanning…" : "Refresh")
+                    Text(monitor.isRefreshing
+                         ? localizer.L("Scanning…", "扫描中…")
+                         : localizer.L("Refresh", "刷新"))
                         .font(.system(size: 12, weight: .medium))
                 }
                 .foregroundStyle(AgentBarPalette.ink)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
+                .fixedSize(horizontal: true, vertical: false)
                 .background(Color.clear)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -144,30 +168,42 @@ public struct DashboardView: View {
         HStack(alignment: .top, spacing: 0) {
             statCell(
                 value: TelemetryFormatter.usd(snap.todayTotalCostUSD),
-                label: "Today's API-eq spend",
-                detail: "\(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tokens today",
+                label: localizer.L("Today's API-eq spend", "今日 API 等效开销"),
+                detail: localizer.L(
+                    "\(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tokens today",
+                    "今日累计 \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
+                ),
                 highlight: true,
                 isFirst: true
             )
             verticalHairline
             statCell(
                 value: TelemetryFormatter.compactTokens(snap.fiveHourTotalTokens),
-                label: "5-hour rolling burst",
-                detail: "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) across \(snap.activeVendorCount) harnesses"
+                label: localizer.L("5-hour rolling burst", "5 小时滚动突发"),
+                detail: localizer.L(
+                    "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) across \(snap.activeVendorCount) harnesses",
+                    "跨 \(snap.activeVendorCount) 个 CLI · 折合 \(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD))"
+                )
             )
             verticalHairline
             statCell(
                 value: TelemetryFormatter.usd(snap.thirtyDayTotalCostUSD),
-                label: "30-day cumulative",
-                detail: "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) total tokens"
+                label: localizer.L("30-day cumulative", "30 天累计开销"),
+                detail: localizer.L(
+                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) total tokens",
+                    "30 天总计 \(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token"
+                )
             )
             verticalHairline
             statCell(
                 value: "\(snap.activeVendorCount) / \(AgentVendor.allCases.count)",
-                label: "Active local harnesses",
+                label: localizer.L("Active local harnesses", "本地活跃 CLI 工具"),
                 detail: snap.rateLimitHits24h == 0
-                    ? "Zero 429 hits in 24h"
-                    : "\(snap.rateLimitHits24h) rate-limit \(snap.rateLimitHits24h == 1 ? "hit" : "hits") in 24h"
+                    ? localizer.L("Zero 429 hits in 24h", "24 小时内 0 次 429 限流")
+                    : localizer.L(
+                        "\(snap.rateLimitHits24h) rate-limit \(snap.rateLimitHits24h == 1 ? "hit" : "hits") in 24h",
+                        "24 小时内 \(snap.rateLimitHits24h) 次 429 限流"
+                    )
             )
         }
     }
@@ -195,6 +231,7 @@ public struct DashboardView: View {
             Text(label)
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(AgentBarPalette.ink.opacity(0.88))
+                .lineLimit(1)
             Text(detail)
                 .font(.system(size: 11.5, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
@@ -206,9 +243,9 @@ public struct DashboardView: View {
     private var dailyVelocitySection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
-                Text("14-day multi-CLI velocity")
+                Text(localizer.L("14-day multi-CLI velocity", "14 天多 CLI 吞吐趋势"))
                     .font(.system(size: 14, weight: .semibold))
-                    .tracking(-0.2)
+                    .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
                 HStack(spacing: 12) {
@@ -227,9 +264,9 @@ public struct DashboardView: View {
 
             Chart(snap.dailyBuckets) { bucket in
                 BarMark(
-                    x: .value("Day", bucket.date, unit: .day),
+                    x: .value(localizer.L("Day", "日期"), bucket.date, unit: .day),
                     y: .value(
-                        chartMetric.rawValue,
+                        chartMetric.localizedTitle(localizer),
                         chartMetric == .cost ? bucket.costUSD : Double(bucket.tokens) / 1_000_000.0
                     )
                 )
@@ -237,10 +274,14 @@ public struct DashboardView: View {
                 .cornerRadius(2)
             }
             .chartXAxis {
-                AxisMarks(values: .stride(by: .day, count: 2)) { _ in
-                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(AgentBarPalette.muted)
+                AxisMarks(values: .stride(by: .day, count: 2)) { val in
+                    AxisValueLabel {
+                        if let date = val.as(Date.self) {
+                            Text(formatAxisDate(date))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.muted)
+                        }
+                    }
                 }
             }
             .chartYAxis {
@@ -260,54 +301,79 @@ public struct DashboardView: View {
         }
     }
 
+    private func formatAxisDate(_ date: Date) -> String {
+        let df = DateFormatter()
+        if localizer.isChinese {
+            df.locale = Locale(identifier: "zh-Hans")
+            df.dateFormat = "M月d日"
+        } else {
+            df.locale = Locale(identifier: "en_GB")
+            df.dateFormat = "d MMM"
+        }
+        return df.string(from: date)
+    }
+
     private var recentSessionsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Recent local sessions")
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(localizer.L("Recent local sessions", "最近本地会话"))
                     .font(.system(size: 14, weight: .semibold))
-                    .tracking(-0.2)
+                    .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
-                Text("metadata only, zero prompts read")
+                Text(localizer.L("metadata only, zero prompts read", "仅读取元数据 · 零提示词采集"))
                     .font(.system(size: 11.5))
                     .foregroundStyle(AgentBarPalette.muted)
                 Spacer()
-                Text(verbatim: "\(snap.recentSessions.count) active")
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundStyle(AgentBarPalette.muted)
+                Text(localizer.L(
+                    "\(snap.recentSessions.count) active",
+                    "\(snap.recentSessions.count) 个活跃会话"
+                ))
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundStyle(AgentBarPalette.muted)
             }
 
-            VStack(spacing: 0) {
-                ForEach(Array(snap.recentSessions.prefix(5).enumerated()), id: \.element.id) { idx, sess in
-                    if idx > 0 {
-                        Rectangle().fill(AgentBarPalette.rule.opacity(0.65)).frame(height: 1)
+            if snap.recentSessions.isEmpty {
+                Text(localizer.L(
+                    "No local CLI sessions detected in the last 30 days.",
+                    "近 30 天未检测到本地 CLI 会话记录。"
+                ))
+                .font(.system(size: 12))
+                .foregroundStyle(AgentBarPalette.muted)
+                .padding(.vertical, 8)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(snap.recentSessions.prefix(5).enumerated()), id: \.element.id) { idx, sess in
+                        if idx > 0 {
+                            Rectangle().fill(AgentBarPalette.rule.opacity(0.65)).frame(height: 1)
+                        }
+                        HStack(spacing: 10) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(sess.vendor.color)
+                                .frame(width: 8, height: 8)
+                            Text(sess.vendor.shortLabel)
+                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.ink)
+                                .frame(width: 66, alignment: .leading)
+                            Text(sess.projectName)
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(AgentBarPalette.ink)
+                                .frame(width: 124, alignment: .leading)
+                                .lineLimit(1)
+                            Text(sess.model)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.muted)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(TelemetryFormatter.compactTokens(sess.totalTokens))
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.muted)
+                            Text(TelemetryFormatter.usd(sess.effectiveCostUSD))
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.ink)
+                                .frame(width: 60, alignment: .trailing)
+                        }
+                        .padding(.vertical, 7)
                     }
-                    HStack(spacing: 10) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(sess.vendor.color)
-                            .frame(width: 8, height: 8)
-                        Text(sess.vendor.shortLabel)
-                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                            .foregroundStyle(AgentBarPalette.ink)
-                            .frame(width: 66, alignment: .leading)
-                        Text(sess.projectName)
-                            .font(.system(size: 12.5, weight: .medium))
-                            .foregroundStyle(AgentBarPalette.ink)
-                            .frame(width: 124, alignment: .leading)
-                            .lineLimit(1)
-                        Text(sess.model)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(AgentBarPalette.muted)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(TelemetryFormatter.compactTokens(sess.totalTokens))
-                            .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(AgentBarPalette.muted)
-                        Text(TelemetryFormatter.usd(sess.effectiveCostUSD))
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(AgentBarPalette.ink)
-                            .frame(width: 60, alignment: .trailing)
-                    }
-                    .padding(.vertical, 7)
                 }
             }
         }
@@ -316,12 +382,12 @@ public struct DashboardView: View {
     private var vendorBreakdownSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Harness share & cache hit")
+                Text(localizer.L("Harness share & cache hit", "各工具占比与缓存命中率"))
                     .font(.system(size: 14, weight: .semibold))
-                    .tracking(-0.2)
+                    .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
-                Text("30d / cache")
+                Text(localizer.L("30d / cache", "30天 / 缓存"))
                     .font(.system(size: 11.5, design: .monospaced))
                     .foregroundStyle(AgentBarPalette.muted)
             }
@@ -357,9 +423,12 @@ public struct DashboardView: View {
                                 .foregroundStyle(AgentBarPalette.muted)
                                 .lineLimit(1)
                             Spacer()
-                            Text(verbatim: "\(item.sessionCount30d) sess · 5h \(TelemetryFormatter.compactTokens(item.fiveHourTokens))")
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(AgentBarPalette.muted)
+                            Text(localizer.L(
+                                "\(item.sessionCount30d) sess · 5h \(TelemetryFormatter.compactTokens(item.fiveHourTokens))",
+                                "\(item.sessionCount30d) 次会话 · 5h \(TelemetryFormatter.compactTokens(item.fiveHourTokens))"
+                            ))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.muted)
                         }
                     }
                     .padding(.vertical, 7)
@@ -371,9 +440,9 @@ public struct DashboardView: View {
     private var relayInspectorSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Cross-vendor relay batons")
+                Text(localizer.L("Cross-vendor relay batons", "跨厂商接力流水线"))
                     .font(.system(size: 14, weight: .semibold))
-                    .tracking(-0.2)
+                    .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
                 if let first = snap.relayRuns.first {
@@ -397,7 +466,7 @@ public struct DashboardView: View {
                                 .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.ink)
                             Spacer()
-                            Text(verbatim: "\(step.durationSeconds)s")
+                            Text(localizer.L("\(step.durationSeconds)s", "\(step.durationSeconds)秒"))
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
                             if let cost = step.costUSD {
@@ -409,10 +478,11 @@ public struct DashboardView: View {
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(AgentBarPalette.muted)
                             }
-                            Text(step.status)
+                            Text(step.localizedStatus(localizer))
                                 .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
+                                .fixedSize(horizontal: true, vertical: false)
                                 .background(AgentBarPalette.jade.opacity(0.18))
                                 .foregroundStyle(AgentBarPalette.jade)
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
@@ -424,10 +494,13 @@ public struct DashboardView: View {
                 .background(AgentBarPalette.well)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             } else {
-                Text("No .relay/LOG.md pipelines recorded in workspace.")
-                    .font(.system(size: 12))
-                    .foregroundStyle(AgentBarPalette.muted)
-                    .padding(.vertical, 8)
+                Text(localizer.L(
+                    "No .relay/LOG.md pipelines recorded in workspace.",
+                    "当前工作区暂未记录 .relay/LOG.md 接力流水线。"
+                ))
+                .font(.system(size: 12))
+                .foregroundStyle(AgentBarPalette.muted)
+                .padding(.vertical, 8)
             }
         }
     }
