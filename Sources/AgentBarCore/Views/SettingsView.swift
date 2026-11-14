@@ -49,10 +49,10 @@ public struct SettingsView: View {
                 .font(.system(.body, design: .monospaced))
             }
 
-            Section(localizer.L("Privacy & Security Guarantee", "隐私与安全承诺")) {
+            Section(localizer.L("Pricing & Read-Only Privacy", "计价口径与只读隐私说明")) {
                 Text(localizer.L(
-                    "AgentBar opens local SQLite files strictly with SQLITE_OPEN_READONLY, extracts only numeric token/cost/model/timestamp metadata, never reads prompt or response text, and makes zero network requests.",
-                    "AgentBar 严格以 SQLITE_OPEN_READONLY 只读模式打开本地 SQLite 数据库，仅提取数值型 Token、开销、模型名与时间戳元数据，绝不读取提示词或回复正文，且发起零网络请求。"
+                    "All estimated dollar amounts are API-equivalent conversions using the \(PriceCatalog.pricingVersion) pricing table; unrecognized models are counted separately instead of guessed. AgentBar opens SQLite files strictly with SQLITE_OPEN_READONLY, never reads prompt/reply text, and makes zero network requests.",
+                    "所有估算美元金额均按 API 价折算（价格表 \(PriceCatalog.pricingVersion)），未收录模型单独统计而不猜测单价。AgentBar 严格以 SQLITE_OPEN_READONLY 只读打开本地数据库，绝不读取提示词或回复正文，且发起零网络请求。"
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -60,6 +60,6 @@ public struct SettingsView: View {
         }
         .formStyle(.grouped)
         .environment(\.locale, localizer.language.locale)
-        .frame(width: 480, height: 375)
+        .frame(width: 480, height: 390)
     }
 }

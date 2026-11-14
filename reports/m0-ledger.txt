@@ -1,0 +1,13 @@
+==============================================================================
+AgentBar M0 Independent Acceptance Ledger (measurement date: 2026-11-14)
+Binary: .build/debug/AgentBar
+Frozen evaluation epoch (--now): 1794629969
+==============================================================================
+[Row 1] PASS | Claude 30d: raw_lines=20742 -> dedup_records=8468 (ref=8468, diff=0.0000%), totalTokens=2,463,176,809 (ref=2,463,176,809, diff=0.0000%), in=28,843, out=9,576,629, cacheRead=2,415,670,683, cacheWrite=37,900,654, hitRate=0.9845, estCostUSD=$3678.03, unmatchedModels=1263
+[Row 2] PASS | Codex 30d (live 105/105 rollouts): in=19,617,608, cacheRead=849,549,824, out=2,001,037, total=871,168,469, hitRate=0.9774, estCostUSD=$480.02; missing-rollout fixture -> completeness=totalOnly ('Total only'/'只有总量'), breakdown=null, cost=null
+[Row 3] PASS | .relay/LOG.md: live rea-lol 126/126 steps, 88-verify vendor=None, recordedCost=$5.4971; synthetic 126/126 verified
+[Row 4] PASS | Sources/ scan for 0.85|0.15: 0 matches
+[Row 5] PASS | Scoped Collectors tests exit=0 (claudeStreamingDeduplication + cacheHitRateFormulaIncludesAllThreeDenominatorTerms present)
+[Row 6] PASS | vibe=relayOnly ('Relay logs only'/'只有接力里的部分'), agy=relayOnly ('Relay logs only'/'只有接力里的部分'), opencode_30d_tokens=4,866,870,275 (records=240), invalid_subcmd_exit=2
+==============================================================================
+RESULT: ALL 6 M0 ACCEPTANCE ROWS PASSED (EN + zh-Hans, read-only verified).

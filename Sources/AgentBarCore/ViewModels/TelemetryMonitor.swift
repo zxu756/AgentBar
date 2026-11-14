@@ -4,33 +4,311 @@ import Foundation
 import ServiceManagement
 import SwiftUI
 
+public enum DemoSnapshotFactory {
+    public static func makePreviewSnapshot() -> TelemetrySnapshot {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = Date(timeIntervalSince1970: 1_794_560_400)
+        let startToday = cal.startOfDay(for: now)
+
+        func fullWindows(
+            source: String,
+            tok5h: Int, cost5h: Double,
+            tokToday: Int, costToday: Double,
+            tok7d: Int, cost7d: Double,
+            tok30d: Int, cost30d: Double,
+            rec30d: Int, hit: Double, unknownModels: Int = 0
+        ) -> [TelemetryWindow: VendorWindowMetrics] {
+            let cr30 = Int(Double(tok30d) * hit * 0.92)
+            let out30 = max(1_000, Int(Double(tok30d) * 0.04))
+            let inp30 = max(1_000, tok30d - cr30 - out30)
+            return [
+                .fiveHours: VendorWindowMetrics(
+                    inputTokens: max(0, tok5h / 10),
+                    outputTokens: max(0, tok5h / 20),
+                    cacheReadTokens: max(0, tok5h - (tok5h / 10) - (tok5h / 20)),
+                    cacheWriteTokens: 0,
+                    totalTokens: tok5h,
+                    recordCount: max(1, rec30d / 12),
+                    estimatedCostUSD: cost5h,
+                    unknownModelRecordCount: 0,
+                    cacheHitRate: hit,
+                    dataSource: source,
+                    completeness: .complete
+                ),
+                .today: VendorWindowMetrics(
+                    inputTokens: max(0, tokToday / 10),
+                    outputTokens: max(0, tokToday / 20),
+                    cacheReadTokens: max(0, tokToday - (tokToday / 10) - (tokToday / 20)),
+                    cacheWriteTokens: 0,
+                    totalTokens: tokToday,
+                    recordCount: max(1, rec30d / 8),
+                    estimatedCostUSD: costToday,
+                    unknownModelRecordCount: 0,
+                    cacheHitRate: hit,
+                    dataSource: source,
+                    completeness: .complete
+                ),
+                .sevenDays: VendorWindowMetrics(
+                    inputTokens: max(0, tok7d / 10),
+                    outputTokens: max(0, tok7d / 20),
+                    cacheReadTokens: max(0, tok7d - (tok7d / 10) - (tok7d / 20)),
+                    cacheWriteTokens: 0,
+                    totalTokens: tok7d,
+                    recordCount: max(1, rec30d / 3),
+                    estimatedCostUSD: cost7d,
+                    unknownModelRecordCount: unknownModels,
+                    cacheHitRate: hit,
+                    dataSource: source,
+                    completeness: .complete
+                ),
+                .thirtyDays: VendorWindowMetrics(
+                    inputTokens: inp30,
+                    outputTokens: out30,
+                    cacheReadTokens: cr30,
+                    cacheWriteTokens: 0,
+                    totalTokens: tok30d,
+                    recordCount: rec30d,
+                    estimatedCostUSD: cost30d,
+                    unknownModelRecordCount: unknownModels,
+                    cacheHitRate: hit,
+                    dataSource: source,
+                    completeness: .complete
+                )
+            ]
+        }
+
+        let claudeSource = LocalTelemetryCollector.defaultDataSourceDescription(for: .claudeCode)
+        let codexSource = LocalTelemetryCollector.defaultDataSourceDescription(for: .codex)
+        let openCodeSource = LocalTelemetryCollector.defaultDataSourceDescription(for: .openCode)
+        let vibeSource = LocalTelemetryCollector.defaultDataSourceDescription(for: .mistralVibe)
+        let agySource = LocalTelemetryCollector.defaultDataSourceDescription(for: .antigravity)
+
+        let summaries: [VendorSummary] = [
+            VendorSummary(
+                vendor: .claudeCode,
+                sourceAvailable: true,
+                dataSource: claudeSource,
+                completeness: .complete,
+                windows: fullWindows(
+                    source: claudeSource,
+                    tok5h: 910_000, cost5h: 4.18,
+                    tokToday: 1_420_000, costToday: 6.84,
+                    tok7d: 9_600_000, cost7d: 31.40,
+                    tok30d: 28_400_000, cost30d: 94.20,
+                    rec30d: 186, hit: 0.94, unknownModels: 4
+                ),
+                sessionCount30d: 64,
+                activeModel: "claude-opus-5-5",
+                lastActive: now.addingTimeInterval(-420),
+                rateLimitHits24h: 0
+            ),
+            VendorSummary(
+                vendor: .codex,
+                sourceAvailable: true,
+                dataSource: codexSource,
+                completeness: .complete,
+                windows: fullWindows(
+                    source: codexSource,
+                    tok5h: 640_000, cost5h: 0.52,
+                    tokToday: 980_000, costToday: 0.89,
+                    tok7d: 6_800_000, cost7d: 5.40,
+                    tok30d: 19_200_000, cost30d: 14.60,
+                    rec30d: 41, hit: 0.97
+                ),
+                sessionCount30d: 41,
+                activeModel: "gpt-6.1-sol",
+                lastActive: now.addingTimeInterval(-1_380),
+                rateLimitHits24h: 0
+            ),
+            VendorSummary(
+                vendor: .openCode,
+                sourceAvailable: true,
+                dataSource: openCodeSource,
+                completeness: .complete,
+                windows: fullWindows(
+                    source: openCodeSource,
+                    tok5h: 1_480_000, cost5h: 0.34,
+                    tokToday: 2_310_000, costToday: 0.56,
+                    tok7d: 16_200_000, cost7d: 3.90,
+                    tok30d: 48_900_000, cost30d: 11.80,
+                    rec30d: 83, hit: 0.96
+                ),
+                sessionCount30d: 83,
+                activeModel: "deepseek-v4.1-flash",
+                lastActive: now.addingTimeInterval(-190),
+                rateLimitHits24h: 0
+            ),
+            VendorSummary(
+                vendor: .mistralVibe,
+                sourceAvailable: true,
+                dataSource: vibeSource,
+                completeness: .relayOnly,
+                windows: [
+                    .fiveHours: .empty(dataSource: vibeSource, completeness: .noData),
+                    .today: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: nil, recordCount: 2, estimatedCostUSD: 0.31, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
+                    ),
+                    .sevenDays: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: nil, recordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
+                    ),
+                    .thirtyDays: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: nil, recordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
+                    )
+                ],
+                sessionCount30d: 8,
+                activeModel: "deepseek-v4-1-flash-1017",
+                lastActive: now.addingTimeInterval(-2_400),
+                rateLimitHits24h: 0
+            ),
+            VendorSummary(
+                vendor: .antigravity,
+                sourceAvailable: true,
+                dataSource: agySource,
+                completeness: .relayOnly,
+                windows: [
+                    .fiveHours: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: 392_854, recordCount: 1, estimatedCostUSD: nil, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: agySource, completeness: .relayOnly
+                    ),
+                    .today: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: 722_000, recordCount: 2, estimatedCostUSD: nil, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: agySource, completeness: .relayOnly
+                    ),
+                    .sevenDays: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: 11_230_126, recordCount: 14, estimatedCostUSD: nil, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: agySource, completeness: .relayOnly
+                    ),
+                    .thirtyDays: VendorWindowMetrics(
+                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
+                        totalTokens: 11_230_126, recordCount: 14, estimatedCostUSD: nil, unknownModelRecordCount: 0,
+                        cacheHitRate: nil, dataSource: agySource, completeness: .relayOnly
+                    )
+                ],
+                sessionCount30d: 14,
+                activeModel: "gemini-4-carbon-high",
+                lastActive: now.addingTimeInterval(-95),
+                rateLimitHits24h: 0
+            )
+        ]
+
+        let dailyProfile: [(Double, Double, Double, Double, Double)] = [
+            (4.2, 0.9, 0.5, 0.0, 0.0),
+            (5.8, 1.2, 0.7, 0.4, 0.0),
+            (3.1, 0.7, 0.4, 0.0, 0.0),
+            (7.4, 1.5, 0.9, 0.8, 0.0),
+            (6.2, 1.3, 0.8, 0.5, 0.0),
+            (2.8, 0.5, 0.4, 0.0, 0.0),
+            (4.9, 1.0, 0.6, 0.4, 0.0),
+            (8.6, 1.8, 1.1, 1.2, 0.0),
+            (6.5, 1.3, 0.8, 0.5, 0.0),
+            (5.1, 0.9, 0.7, 0.0, 0.0),
+            (7.9, 1.6, 1.0, 0.9, 0.0),
+            (9.1, 1.9, 1.2, 0.5, 0.0),
+            (6.0, 1.2, 0.8, 0.0, 0.0),
+            (6.84, 0.89, 0.56, 0.31, 0.0)
+        ]
+
+        var buckets: [DailyVendorBucket] = []
+        for (idx, tuple) in dailyProfile.enumerated() {
+            let dayDate = cal.date(byAdding: .day, value: idx - 13, to: startToday) ?? startToday
+            let costs = [tuple.0, tuple.1, tuple.2, tuple.3, tuple.4]
+            for (vIdx, vendor) in AgentVendor.allCases.enumerated() {
+                let c = costs[vIdx]
+                let tok = (vendor == .antigravity) ? (idx >= 10 ? 950_000 : 0) : Int(c * 240_000)
+                buckets.append(
+                    DailyVendorBucket(
+                        date: dayDate,
+                        vendor: vendor,
+                        tokens: tok,
+                        costUSD: c,
+                        sessions: tok > 0 || c > 0 ? max(1, Int(c * 1.5)) : 0
+                    )
+                )
+            }
+        }
+
+        let relay = RelayRunSummary(
+            projectName: "shader-pipeline",
+            logPath: "~/Projects/shader-pipeline/.relay/LOG.md",
+            updatedAt: now.addingTimeInterval(-300),
+            steps: [
+                RelayBatonStep(stepID: "01-claude", vendor: .claudeCode, status: "ok", durationSeconds: 48, timestampString: "2026-11-13 07:12", model: "claude-opus-5-5", costUSD: 0.42, tokens: nil),
+                RelayBatonStep(stepID: "02-codex", vendor: .codex, status: "ok", durationSeconds: 63, timestampString: "2026-11-13 07:14", model: "gpt-6.1-sol", costUSD: nil, tokens: 112_400),
+                RelayBatonStep(stepID: "03-vibe", vendor: .mistralVibe, status: "ok", durationSeconds: 27, timestampString: "2026-11-13 07:15", model: "deepseek-v4-1-flash-1017", costUSD: 0.058, tokens: nil),
+                RelayBatonStep(stepID: "04-verify", vendor: nil, status: "passed", durationSeconds: 9, timestampString: "2026-11-13 07:16", model: "default", costUSD: nil, tokens: nil)
+            ]
+        )
+
+        let sessions: [UsageSample] = [
+            UsageSample(unsplitID: "s1", vendor: .antigravity, origin: .relayLog, timestamp: now.addingTimeInterval(-95), sessionID: "agy-98", projectName: "shader-pipeline", model: "gemini-4-carbon-high", rawTotalTokens: 392_854, recordedCostUSD: nil),
+            UsageSample(id: "s2", vendor: .openCode, timestamp: now.addingTimeInterval(-190), sessionID: "ses-441", projectName: "kernel-bench", model: "deepseek-v4.1-flash", inputTokens: 64_000, outputTokens: 19_800, cacheReadTokens: 780_000, recordedCostUSD: 0.21),
+            UsageSample(id: "s3", vendor: .claudeCode, timestamp: now.addingTimeInterval(-420), sessionID: "cld-772", projectName: "shader-pipeline", model: "claude-opus-5-5", inputTokens: 48_000, outputTokens: 11_400, cacheReadTokens: 420_000, cacheWriteTokens: 22_000),
+            UsageSample(id: "s4", vendor: .codex, timestamp: now.addingTimeInterval(-1380), sessionID: "cdx-118", projectName: "wasm-guard", model: "gpt-6.1-sol", inputTokens: 18_000, outputTokens: 3_400, cacheReadTokens: 460_000),
+            UsageSample(unsplitID: "s5", vendor: .mistralVibe, origin: .relayLog, timestamp: now.addingTimeInterval(-2400), sessionID: "vib-305", projectName: "shader-pipeline", model: "deepseek-v4-1-flash-1017", rawTotalTokens: nil, recordedCostUSD: 0.089)
+        ]
+
+        return TelemetrySnapshot(
+            capturedAt: now,
+            isDemoData: true,
+            vendorSummaries: summaries,
+            dailyBuckets: buckets,
+            recentSessions: sessions,
+            relayRuns: [relay]
+        )
+    }
+}
+
 @MainActor
 public final class TelemetryMonitor: ObservableObject {
     @Published public private(set) var snapshot: TelemetrySnapshot
     @Published public private(set) var isRefreshing: Bool = false
+    @Published public private(set) var hasLoadedInitialSnapshot: Bool
     @Published public var labelMode: MenuBarLabelMode {
-        didSet { UserDefaults.standard.set(labelMode.rawValue, forKey: "agentbar.labelMode") }
+        didSet {
+            guard !isPreviewInstance else { return }
+            userDefaults.set(labelMode.rawValue, forKey: "agentbar.labelMode")
+        }
     }
     @Published public var refreshIntervalSeconds: Int {
         didSet {
-            UserDefaults.standard.set(refreshIntervalSeconds, forKey: "agentbar.refreshSeconds")
+            guard !isPreviewInstance else { return }
+            userDefaults.set(refreshIntervalSeconds, forKey: "agentbar.refreshSeconds")
             scheduleTimer()
         }
     }
     @Published public var workspacePath: String {
-        didSet { UserDefaults.standard.set(workspacePath, forKey: "agentbar.workspacePath") }
+        didSet {
+            guard !isPreviewInstance else { return }
+            userDefaults.set(workspacePath, forKey: "agentbar.workspacePath")
+        }
     }
 
     private let isPreviewInstance: Bool
+    private let userDefaults: UserDefaults
     private var timer: Timer?
 
-    public init(previewSnapshot: TelemetrySnapshot? = nil) {
-        let savedMode = UserDefaults.standard.string(forKey: "agentbar.labelMode")
+    public init(
+        previewSnapshot: TelemetrySnapshot? = nil,
+        startImmediately: Bool = true,
+        userDefaults: UserDefaults = .standard
+    ) {
+        self.userDefaults = userDefaults
+        let savedMode = userDefaults.string(forKey: "agentbar.labelMode")
             .flatMap(MenuBarLabelMode.init(rawValue:)) ?? .todayCost
-        let savedRefresh = UserDefaults.standard.integer(forKey: "agentbar.refreshSeconds")
+        let savedRefresh = userDefaults.integer(forKey: "agentbar.refreshSeconds")
         let defaultWorkspace = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Projects").path
-        let savedWorkspace = UserDefaults.standard.string(forKey: "agentbar.workspacePath") ?? defaultWorkspace
+        let savedWorkspace = userDefaults.string(forKey: "agentbar.workspacePath") ?? defaultWorkspace
 
         self.labelMode = savedMode
         self.refreshIntervalSeconds = savedRefresh > 0 ? savedRefresh : 30
@@ -38,23 +316,25 @@ public final class TelemetryMonitor: ObservableObject {
 
         if let previewSnapshot {
             self.isPreviewInstance = true
+            self.hasLoadedInitialSnapshot = true
             self.snapshot = previewSnapshot
         } else {
             self.isPreviewInstance = false
+            self.hasLoadedInitialSnapshot = false
             self.snapshot = TelemetrySnapshot(
                 capturedAt: Date(),
-                vendorSummaries: AgentVendor.allCases.map {
-                    VendorSummary(
-                        vendor: $0,
+                isDemoData: false,
+                vendorSummaries: AgentVendor.allCases.map { vendor in
+                    let src = LocalTelemetryCollector.defaultDataSourceDescription(for: vendor)
+                    return VendorSummary(
+                        vendor: vendor,
                         sourceAvailable: false,
-                        todayCostUSD: 0,
-                        todayTokens: 0,
-                        fiveHourTokens: 0,
-                        fiveHourCostUSD: 0,
-                        thirtyDayCostUSD: 0,
-                        thirtyDayTokens: 0,
+                        dataSource: src,
+                        completeness: .noData,
+                        windows: Dictionary(uniqueKeysWithValues: TelemetryWindow.allCases.map {
+                            ($0, VendorWindowMetrics.empty(dataSource: src, completeness: .noData))
+                        }),
                         sessionCount30d: 0,
-                        cacheHitRatio: 0,
                         activeModel: "—",
                         lastActive: nil,
                         rateLimitHits24h: 0
@@ -64,20 +344,41 @@ public final class TelemetryMonitor: ObservableObject {
                 recentSessions: [],
                 relayRuns: []
             )
-            refreshNow()
-            scheduleTimer()
+            if startImmediately {
+                refreshNow()
+                scheduleTimer()
+            }
         }
     }
 
     public var menuBarText: String? {
+        if !hasLoadedInitialSnapshot {
+            return labelMode == .iconOnly ? nil : "…"
+        }
         switch labelMode {
         case .todayCost:
+            if snapshot.activeVendorCount == 0 {
+                return "—"
+            }
             return TelemetryFormatter.usd(snapshot.todayTotalCostUSD)
         case .fiveHourTokens:
+            if snapshot.activeVendorCount == 0 {
+                return "—"
+            }
             return TelemetryFormatter.compactTokens(snapshot.fiveHourTotalTokens)
         case .iconOnly:
             return nil
         }
+    }
+
+    public func statusSummaryLabel(in language: AppLanguage) -> String {
+        if !hasLoadedInitialSnapshot {
+            return language == .zhHans ? "刷新中…" : "Refreshing…"
+        }
+        if snapshot.activeVendorCount == 0 {
+            return language == .zhHans ? "没有数据" : "No data"
+        }
+        return PriceCatalog.costDisclaimer(in: language)
     }
 
     public func refreshNow() {
@@ -85,12 +386,12 @@ public final class TelemetryMonitor: ObservableObject {
         isRefreshing = true
         let wsURL = URL(fileURLWithPath: workspacePath)
         Task.detached(priority: .utility) {
-            var paths = CollectorPaths.liveDefault()
-            paths.workspaceRootDir = wsURL
+            let paths = CollectorPaths.liveDefault(workspaceRoot: wsURL)
             let collected = LocalTelemetryCollector.collectSnapshot(paths: paths)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.snapshot = collected
+                self.hasLoadedInitialSnapshot = true
                 self.isRefreshing = false
             }
         }
@@ -124,158 +425,14 @@ public final class TelemetryMonitor: ObservableObject {
         }
     }
 
-    // MARK: - Deterministic Preview / Screenshot Fixture
+    // MARK: - Deterministic Preview / Screenshot Fixture (Explicit Demo Mode Only)
 
     public static var preview: TelemetryMonitor {
         TelemetryMonitor(previewSnapshot: makePreviewSnapshot())
     }
 
     public static func makePreviewSnapshot() -> TelemetrySnapshot {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(secondsFromGMT: 0)!
-        let now = Date(timeIntervalSince1970: 1_794_560_400) // Fixed reference timestamp
-        let startToday = cal.startOfDay(for: now)
-
-        let summaries: [VendorSummary] = [
-            VendorSummary(
-                vendor: .claudeCode,
-                sourceAvailable: true,
-                todayCostUSD: 6.84,
-                todayTokens: 1_420_000,
-                fiveHourTokens: 910_000,
-                fiveHourCostUSD: 4.18,
-                thirtyDayCostUSD: 94.20,
-                thirtyDayTokens: 28_400_000,
-                sessionCount30d: 64,
-                cacheHitRatio: 0.89,
-                activeModel: "claude-opus-5-5",
-                lastActive: now.addingTimeInterval(-420),
-                rateLimitHits24h: 0
-            ),
-            VendorSummary(
-                vendor: .codex,
-                sourceAvailable: true,
-                todayCostUSD: 3.12,
-                todayTokens: 980_000,
-                fiveHourTokens: 640_000,
-                fiveHourCostUSD: 1.95,
-                thirtyDayCostUSD: 46.50,
-                thirtyDayTokens: 19_200_000,
-                sessionCount30d: 41,
-                cacheHitRatio: 0.74,
-                activeModel: "gpt-6.1-codex",
-                lastActive: now.addingTimeInterval(-1_380),
-                rateLimitHits24h: 0
-            ),
-            VendorSummary(
-                vendor: .openCode,
-                sourceAvailable: true,
-                todayCostUSD: 1.46,
-                todayTokens: 2_310_000,
-                fiveHourTokens: 1_480_000,
-                fiveHourCostUSD: 0.88,
-                thirtyDayCostUSD: 27.80,
-                thirtyDayTokens: 48_900_000,
-                sessionCount30d: 83,
-                cacheHitRatio: 0.93,
-                activeModel: "deepseek-v4.1-flash",
-                lastActive: now.addingTimeInterval(-190),
-                rateLimitHits24h: 0
-            ),
-            VendorSummary(
-                vendor: .mistralVibe,
-                sourceAvailable: true,
-                todayCostUSD: 0.54,
-                todayTokens: 1_190_000,
-                fiveHourTokens: 820_000,
-                fiveHourCostUSD: 0.36,
-                thirtyDayCostUSD: 7.31,
-                thirtyDayTokens: 16_400_000,
-                sessionCount30d: 37,
-                cacheHitRatio: 0.81,
-                activeModel: "deepseek-v4-1-flash",
-                lastActive: now.addingTimeInterval(-2_400),
-                rateLimitHits24h: 0
-            ),
-            VendorSummary(
-                vendor: .antigravity,
-                sourceAvailable: true,
-                todayCostUSD: 2.28,
-                todayTokens: 1_060_000,
-                fiveHourTokens: 590_000,
-                fiveHourCostUSD: 1.24,
-                thirtyDayCostUSD: 33.10,
-                thirtyDayTokens: 18_700_000,
-                sessionCount30d: 29,
-                cacheHitRatio: 0.78,
-                activeModel: "gemini-4-carbon-high",
-                lastActive: now.addingTimeInterval(-95),
-                rateLimitHits24h: 1
-            )
-        ]
-
-        let dailyProfile: [(Double, Double, Double, Double, Double)] = [
-            (4.2, 1.9, 1.1, 0.3, 1.4),
-            (5.8, 2.4, 1.5, 0.4, 1.8),
-            (3.1, 1.4, 0.9, 0.2, 1.1),
-            (7.4, 3.2, 1.8, 0.6, 2.5),
-            (6.2, 2.9, 2.1, 0.5, 2.0),
-            (2.8, 1.1, 0.8, 0.2, 0.9),
-            (4.9, 2.2, 1.3, 0.4, 1.7),
-            (8.6, 3.8, 2.4, 0.8, 2.9),
-            (6.5, 2.7, 1.9, 0.5, 2.1),
-            (5.1, 2.0, 1.6, 0.4, 1.6),
-            (7.9, 3.5, 2.2, 0.7, 2.6),
-            (9.1, 4.1, 2.5, 0.9, 3.1),
-            (6.0, 2.8, 1.7, 0.5, 1.9),
-            (6.84, 3.12, 1.46, 0.54, 2.28)
-        ]
-
-        var buckets: [DailyVendorBucket] = []
-        for (idx, tuple) in dailyProfile.enumerated() {
-            let dayDate = cal.date(byAdding: .day, value: idx - 13, to: startToday) ?? startToday
-            let costs = [tuple.0, tuple.1, tuple.2, tuple.3, tuple.4]
-            for (vIdx, vendor) in AgentVendor.allCases.enumerated() {
-                let c = costs[vIdx]
-                buckets.append(
-                    DailyVendorBucket(
-                        date: dayDate,
-                        vendor: vendor,
-                        tokens: Int(c * 240_000),
-                        costUSD: c,
-                        sessions: max(1, Int(c * 1.5))
-                    )
-                )
-            }
-        }
-
-        let relay = RelayRunSummary(
-            projectName: "shader-pipeline",
-            logPath: "~/Projects/shader-pipeline/.relay/LOG.md",
-            updatedAt: now.addingTimeInterval(-300),
-            steps: [
-                RelayBatonStep(stepID: "01-claude", vendor: .claudeCode, status: "ok", durationSeconds: 48, timestampString: "2026-11-13 07:12", model: "claude-opus-5-5", costUSD: 0.42, tokens: 84_200),
-                RelayBatonStep(stepID: "02-codex", vendor: .codex, status: "ok", durationSeconds: 63, timestampString: "2026-11-13 07:14", model: "gpt-6.1-codex", costUSD: 0.29, tokens: 112_400),
-                RelayBatonStep(stepID: "03-vibe", vendor: .mistralVibe, status: "ok", durationSeconds: 27, timestampString: "2026-11-13 07:15", model: "deepseek-v4-1-flash", costUSD: 0.031, tokens: 96_800),
-                RelayBatonStep(stepID: "04-agy", vendor: .antigravity, status: "ok", durationSeconds: 34, timestampString: "2026-11-13 07:16", model: "gemini-4-carbon-high", costUSD: 0.18, tokens: 71_500)
-            ]
-        )
-
-        let sessions: [UsageSample] = [
-            UsageSample(id: "s1", vendor: .antigravity, timestamp: now.addingTimeInterval(-95), sessionID: "agy-901", projectName: "AgentBar", model: "gemini-4-carbon-high", inputTokens: 82_000, outputTokens: 14_200, cacheReadTokens: 310_000, recordedCostUSD: 0.44),
-            UsageSample(id: "s2", vendor: .openCode, timestamp: now.addingTimeInterval(-190), sessionID: "ses-441", projectName: "kernel-bench", model: "deepseek-v4.1-flash", inputTokens: 64_000, outputTokens: 19_800, cacheReadTokens: 780_000, recordedCostUSD: 0.21),
-            UsageSample(id: "s3", vendor: .claudeCode, timestamp: now.addingTimeInterval(-420), sessionID: "cld-772", projectName: "shader-pipeline", model: "claude-opus-5-5", inputTokens: 48_000, outputTokens: 11_400, cacheReadTokens: 420_000, cacheWriteTokens: 22_000, recordedCostUSD: 2.64),
-            UsageSample(id: "s4", vendor: .codex, timestamp: now.addingTimeInterval(-1380), sessionID: "cdx-118", projectName: "wasm-guard", model: "gpt-6.1-codex", inputTokens: 195_000, outputTokens: 28_400, cacheReadTokens: 260_000, recordedCostUSD: 0.96),
-            UsageSample(id: "s5", vendor: .mistralVibe, timestamp: now.addingTimeInterval(-2400), sessionID: "vib-305", projectName: "shader-pipeline", model: "deepseek-v4-1-flash", inputTokens: 142_000, outputTokens: 34_100, cacheReadTokens: 410_000, recordedCostUSD: 0.089)
-        ]
-
-        return TelemetrySnapshot(
-            capturedAt: now,
-            vendorSummaries: summaries,
-            dailyBuckets: buckets,
-            recentSessions: sessions,
-            relayRuns: [relay]
-        )
+        DemoSnapshotFactory.makePreviewSnapshot()
     }
 }
 
@@ -307,7 +464,7 @@ public enum ScreenshotExporter {
         let dashView = DashboardView(monitor: monitor, localizer: localizer)
             .environment(\.locale, language.locale)
             .background(AgentBarPalette.canvas)
-        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 675)) {
+        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 690)) {
             try dashPNG.write(to: directory.appendingPathComponent("screenshot-dashboard\(suffix).png"))
         }
 
@@ -325,9 +482,9 @@ public enum ScreenshotExporter {
                 .strokeBorder(AgentBarPalette.rule, lineWidth: 1)
         )
         .padding(16)
-        .frame(width: 428, height: 524)
+        .frame(width: 440, height: 574)
         .background(Color(red: 0.055, green: 0.050, blue: 0.046))
-        if let popPNG = renderPNG(view: popView, size: CGSize(width: 428, height: 524)) {
+        if let popPNG = renderPNG(view: popView, size: CGSize(width: 440, height: 574)) {
             try popPNG.write(to: directory.appendingPathComponent("screenshot-menubar\(suffix).png"))
         }
     }

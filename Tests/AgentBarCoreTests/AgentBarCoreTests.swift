@@ -3,7 +3,7 @@ import SQLite3
 import Testing
 @testable import AgentBarCore
 
-@Suite("AgentBarCore Telemetry & Collector Tests")
+@Suite("AgentBarCore Telemetry & Collector Tests", .timeLimit(.minutes(1)))
 struct AgentBarCoreTests {
 
     @Test("Parses OpenCode JSON model string and plain fallback")
@@ -40,7 +40,8 @@ struct AgentBarCoreTests {
         #expect(sample.projectName == "demo-app")
         #expect(sample.model == "claude-opus-5-5")
         #expect(sample.totalTokens == 102_000)
-        #expect(sample.effectiveCostUSD > 0.40)
+        let cost = try #require(sample.effectiveCostUSD)
+        #expect(cost > 0.40)
     }
 
     @Test("Reads Codex & OpenCode SQLite databases in read-only mode")

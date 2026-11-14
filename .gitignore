@@ -4,4 +4,3 @@ build/
 DerivedData/
 *.xcodeproj
 .DS_Store
-reports/

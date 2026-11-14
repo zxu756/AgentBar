@@ -25,7 +25,7 @@ public struct DashboardView: View {
         @MainActor
         public func localizedTitle(_ localizer: AppLocalizer) -> String {
             switch self {
-            case .cost: return localizer.L("API-eq spend ($)", "API 等效开销 ($)")
+            case .cost: return localizer.L("API-eq ($)", "API 折算 ($)")
             case .tokens: return localizer.L("Tokens", "Token 用量")
             }
         }
@@ -38,21 +38,22 @@ public struct DashboardView: View {
     }
 
     private var snap: TelemetrySnapshot { monitor.snapshot }
+    private var lang: AppLanguage { localizer.language }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             topMasthead
-                .padding(.bottom, 16)
+                .padding(.bottom, 14)
 
             Rectangle().fill(AgentBarPalette.rule).frame(height: 1)
 
             ledgerStatStrip
-                .padding(.vertical, 16)
+                .padding(.vertical, 15)
 
             Rectangle().fill(AgentBarPalette.rule).frame(height: 1)
 
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .top, spacing: 22) {
+                VStack(alignment: .leading, spacing: 18) {
                     dailyVelocitySection
                     Rectangle().fill(AgentBarPalette.rule).frame(height: 1)
                     recentSessionsSection
@@ -63,26 +64,26 @@ public struct DashboardView: View {
                     .fill(AgentBarPalette.rule)
                     .frame(width: 1)
 
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 18) {
                     vendorBreakdownSection
                     Rectangle().fill(AgentBarPalette.rule).frame(height: 1)
                     relayInspectorSection
                 }
-                .frame(width: 332, alignment: .topLeading)
+                .frame(width: 356, alignment: .topLeading)
             }
-            .padding(.top, 20)
+            .padding(.top, 18)
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 20)
-        .frame(minWidth: 960, minHeight: 640, alignment: .top)
+        .padding(.vertical, 18)
+        .frame(minWidth: 960, minHeight: 650, alignment: .top)
         .background(AgentBarPalette.canvas)
         .environment(\.locale, localizer.language.locale)
         .preferredColorScheme(.dark)
     }
 
     private var topMasthead: some View {
-        HStack(alignment: .center, spacing: 12) {
-            HStack(spacing: 11) {
+        HStack(alignment: .center, spacing: 10) {
+            HStack(spacing: 10) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(AgentBarPalette.ink)
@@ -91,23 +92,38 @@ public struct DashboardView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(AgentBarPalette.canvas)
                 }
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text("AgentBar")
-                        .font(.system(size: 18, weight: .bold))
-                        .tracking(-0.4)
-                        .foregroundStyle(AgentBarPalette.ink)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text("AgentBar")
+                            .font(.system(size: 17.5, weight: .bold))
+                            .tracking(-0.4)
+                            .foregroundStyle(AgentBarPalette.ink)
+                        if snap.isDemoData {
+                            Text(localizer.L("DEMO", "DEMO · 演示数据"))
+                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(AgentBarPalette.copper.opacity(0.22))
+                                .foregroundStyle(AgentBarPalette.copper)
+                                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        Text(PriceCatalog.costDisclaimer(in: lang))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.muted)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                     Text(localizer.L(
-                        "Local read-only multi-CLI token & spend ledger",
-                        "本地只读 · 多智能体 CLI 用量与开销账本"
+                        "Read-only local telemetry · M0 session timestamps use last-updated for Codex/OpenCode",
+                        "本地只读遥测 · M0 阶段 Codex/OpenCode 按会话最后更新时间归桶"
                     ))
-                    .font(.system(size: 13))
+                    .font(.system(size: 11))
                     .foregroundStyle(AgentBarPalette.muted)
                     .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
                 }
             }
 
-            Spacer(minLength: 12)
+            Spacer(minLength: 8)
 
             HStack(spacing: 2) {
                 ForEach(ChartMetric.allCases) { m in
@@ -117,7 +133,7 @@ public struct DashboardView: View {
                         Text(m.localizedTitle(localizer))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(chartMetric == m ? AgentBarPalette.ink : AgentBarPalette.muted)
-                            .padding(.horizontal, 11)
+                            .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .fixedSize(horizontal: true, vertical: false)
                             .background(
@@ -146,12 +162,12 @@ public struct DashboardView: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .semibold))
                     Text(monitor.isRefreshing
-                         ? localizer.L("Scanning…", "扫描中…")
+                         ? localizer.L("Refreshing…", "刷新中…")
                          : localizer.L("Refresh", "刷新"))
                         .font(.system(size: 12, weight: .medium))
                 }
                 .foregroundStyle(AgentBarPalette.ink)
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 11)
                 .padding(.vertical, 6)
                 .fixedSize(horizontal: true, vertical: false)
                 .background(Color.clear)
@@ -165,44 +181,86 @@ public struct DashboardView: View {
     }
 
     private var ledgerStatStrip: some View {
-        HStack(alignment: .top, spacing: 0) {
+        let initialPending = !monitor.hasLoadedInitialSnapshot
+        let noAnyData = !initialPending && snap.activeVendorCount == 0
+
+        let todayVal: String = {
+            if initialPending { return localizer.L("Refreshing…", "刷新中…") }
+            if noAnyData || !snap.hasKnownTodayCost {
+                return noAnyData ? localizer.L("No data", "没有数据") : localizer.L("Unknown", "未知")
+            }
+            return TelemetryFormatter.usd(snap.todayTotalCostUSD)
+        }()
+
+        let fiveVal: String = {
+            if initialPending { return localizer.L("Refreshing…", "刷新中…") }
+            if noAnyData { return localizer.L("No data", "没有数据") }
+            return TelemetryFormatter.compactTokens(snap.fiveHourTotalTokens)
+        }()
+
+        let thirtyVal: String = {
+            if initialPending { return localizer.L("Refreshing…", "刷新中…") }
+            if noAnyData || !snap.hasKnownThirtyDayCost {
+                return noAnyData ? localizer.L("No data", "没有数据") : localizer.L("Unknown", "未知")
+            }
+            return TelemetryFormatter.usd(snap.thirtyDayTotalCostUSD)
+        }()
+
+        let thirtyDetail: String = {
+            if initialPending {
+                return localizer.L("Scanning local stores…", "正在扫描本地记录…")
+            }
+            if snap.unknownModelRecordCount30d > 0 {
+                return localizer.L(
+                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) tok · \(snap.unknownModelRecordCount30d) unpriced",
+                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token · \(snap.unknownModelRecordCount30d) 条未匹配价格"
+                )
+            }
+            return localizer.L(
+                "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) known tokens",
+                "已知总计 \(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token"
+            )
+        }()
+
+        return HStack(alignment: .top, spacing: 0) {
             statCell(
-                value: TelemetryFormatter.usd(snap.todayTotalCostUSD),
-                label: localizer.L("Today's API-eq spend", "今日 API 等效开销"),
-                detail: localizer.L(
-                    "\(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tokens today",
-                    "今日累计 \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
+                value: todayVal,
+                label: localizer.L(
+                    "Today API-eq (\(PriceCatalog.pricingVersion))",
+                    "今日按 API 价折算（\(PriceCatalog.pricingVersion)）"
                 ),
-                highlight: true,
-                isFirst: true
+                detail: initialPending
+                    ? localizer.L("Today window", "今日窗口")
+                    : localizer.L(
+                        "Today · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tok",
+                        "今日 · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
+                    ),
+                highlight: true
             )
             verticalHairline
             statCell(
-                value: TelemetryFormatter.compactTokens(snap.fiveHourTotalTokens),
+                value: fiveVal,
                 label: localizer.L("5-hour rolling burst", "5 小时滚动突发"),
                 detail: localizer.L(
-                    "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) across \(snap.activeVendorCount) harnesses",
-                    "跨 \(snap.activeVendorCount) 个 CLI · 折合 \(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD))"
+                    "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) priced across \(snap.activeVendorCount) CLIs",
+                    "\(snap.activeVendorCount) 个有数据 CLI · 已计价 \(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD))"
                 )
             )
             verticalHairline
             statCell(
-                value: TelemetryFormatter.usd(snap.thirtyDayTotalCostUSD),
-                label: localizer.L("30-day cumulative", "30 天累计开销"),
-                detail: localizer.L(
-                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) total tokens",
-                    "30 天总计 \(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token"
-                )
+                value: thirtyVal,
+                label: localizer.L("30-day API-eq estimate", "30 天按 API 价折算"),
+                detail: thirtyDetail
             )
             verticalHairline
             statCell(
-                value: "\(snap.activeVendorCount) / \(AgentVendor.allCases.count)",
-                label: localizer.L("Active local harnesses", "本地活跃 CLI 工具"),
+                value: initialPending ? "…" : "\(snap.activeVendorCount) / \(AgentVendor.allCases.count)",
+                label: localizer.L("CLIs with local records", "有本地记录的 CLI"),
                 detail: snap.rateLimitHits24h == 0
-                    ? localizer.L("Zero 429 hits in 24h", "24 小时内 0 次 429 限流")
+                    ? localizer.L("0 rate-limit markers (24h)", "24 小时内 0 条限流标记")
                     : localizer.L(
-                        "\(snap.rateLimitHits24h) rate-limit \(snap.rateLimitHits24h == 1 ? "hit" : "hits") in 24h",
-                        "24 小时内 \(snap.rateLimitHits24h) 次 429 限流"
+                        "\(snap.rateLimitHits24h) rate-limit markers (24h)",
+                        "24 小时内 \(snap.rateLimitHits24h) 条限流标记"
                     )
             )
         }
@@ -212,28 +270,28 @@ public struct DashboardView: View {
         Rectangle()
             .fill(AgentBarPalette.rule)
             .frame(width: 1, height: 54)
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 16)
     }
 
     private func statCell(
         value: String,
         label: String,
         detail: String,
-        highlight: Bool = false,
-        isFirst: Bool = false
+        highlight: Bool = false
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(value)
-                .font(.system(size: 27, weight: .bold))
-                .tracking(-0.7)
+                .font(.system(size: 24, weight: .bold))
+                .tracking(-0.6)
                 .monospacedDigit()
                 .foregroundStyle(highlight ? AgentBarPalette.copper : AgentBarPalette.ink)
+                .lineLimit(1)
             Text(label)
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(AgentBarPalette.ink.opacity(0.88))
                 .lineLimit(1)
             Text(detail)
-                .font(.system(size: 11.5, design: .monospaced))
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
                 .lineLimit(1)
         }
@@ -241,23 +299,26 @@ public struct DashboardView: View {
     }
 
     private var dailyVelocitySection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(localizer.L("14-day multi-CLI velocity", "14 天多 CLI 吞吐趋势"))
-                    .font(.system(size: 14, weight: .semibold))
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(localizer.L("14-day ledger (by session update)", "14 天多 CLI 趋势（按会话更新时间）"))
+                    .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
-                Spacer()
-                HStack(spacing: 12) {
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                HStack(spacing: 9) {
                     ForEach(AgentVendor.allCases) { v in
-                        HStack(spacing: 5) {
+                        HStack(spacing: 4) {
                             RoundedRectangle(cornerRadius: 2)
                                 .fill(v.color)
                                 .frame(width: 8, height: 8)
                             Text(v.shortLabel)
                                 .font(.system(size: 11))
                                 .foregroundStyle(AgentBarPalette.muted)
+                                .lineLimit(1)
                         }
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 }
             }
@@ -297,7 +358,7 @@ public struct DashboardView: View {
                     }
                 }
             }
-            .frame(height: 204)
+            .frame(height: 196)
         }
     }
 
@@ -314,28 +375,33 @@ public struct DashboardView: View {
     }
 
     private var recentSessionsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(localizer.L("Recent local sessions", "最近本地会话"))
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Text(localizer.L("metadata only, zero prompts read", "仅读取元数据 · 零提示词采集"))
-                    .font(.system(size: 11.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(AgentBarPalette.muted)
                 Spacer()
                 Text(localizer.L(
-                    "\(snap.recentSessions.count) active",
-                    "\(snap.recentSessions.count) 个活跃会话"
+                    "\(snap.recentSessions.count) sessions",
+                    "\(snap.recentSessions.count) 个会话"
                 ))
-                .font(.system(size: 11.5, design: .monospaced))
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
             }
 
-            if snap.recentSessions.isEmpty {
+            if !monitor.hasLoadedInitialSnapshot {
+                Text(localizer.L("Refreshing…", "刷新中…"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(AgentBarPalette.muted)
+                    .padding(.vertical, 8)
+            } else if snap.recentSessions.isEmpty {
                 Text(localizer.L(
-                    "No local CLI sessions detected in the last 30 days.",
-                    "近 30 天未检测到本地 CLI 会话记录。"
+                    "No data: no local CLI sessions detected in the last 30 days.",
+                    "没有数据：近 30 天未检测到本地 CLI 会话记录。"
                 ))
                 .font(.system(size: 12))
                 .foregroundStyle(AgentBarPalette.muted)
@@ -346,33 +412,36 @@ public struct DashboardView: View {
                         if idx > 0 {
                             Rectangle().fill(AgentBarPalette.rule.opacity(0.65)).frame(height: 1)
                         }
-                        HStack(spacing: 10) {
+                        let sessCompleteness: DataCompleteness = sess.origin == .relayLog
+                            ? .relayOnly
+                            : (sess.hasTokenBreakdown ? .complete : .totalOnly)
+                        HStack(spacing: 9) {
                             RoundedRectangle(cornerRadius: 2)
                                 .fill(sess.vendor.color)
                                 .frame(width: 8, height: 8)
                             Text(sess.vendor.shortLabel)
-                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.ink)
-                                .frame(width: 66, alignment: .leading)
+                                .frame(width: 60, alignment: .leading)
                             Text(sess.projectName)
-                                .font(.system(size: 12.5, weight: .medium))
+                                .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(AgentBarPalette.ink)
-                                .frame(width: 124, alignment: .leading)
+                                .frame(width: 118, alignment: .leading)
                                 .lineLimit(1)
-                            Text(sess.model)
-                                .font(.system(size: 11, design: .monospaced))
+                            Text(sess.model.isEmpty ? localizer.L("Unknown", "未知") : sess.model)
+                                .font(.system(size: 10.5, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
                                 .lineLimit(1)
                             Spacer()
-                            Text(TelemetryFormatter.compactTokens(sess.totalTokens))
-                                .font(.system(size: 11.5, design: .monospaced))
+                            Text(TelemetryFormatter.optionalTokens(sess.knownTotalTokens, completeness: sessCompleteness, language: lang))
+                                .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
-                            Text(TelemetryFormatter.usd(sess.effectiveCostUSD))
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(AgentBarPalette.ink)
-                                .frame(width: 60, alignment: .trailing)
+                            Text(TelemetryFormatter.optionalUSD(sess.effectiveCostUSD, completeness: sessCompleteness, language: lang))
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(sess.effectiveCostUSD != nil ? AgentBarPalette.ink : AgentBarPalette.muted)
+                                .frame(width: 66, alignment: .trailing)
                         }
-                        .padding(.vertical, 7)
+                        .padding(.vertical, 6.5)
                     }
                 }
             }
@@ -380,15 +449,15 @@ public struct DashboardView: View {
     }
 
     private var vendorBreakdownSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
-                Text(localizer.L("Harness share & cache hit", "各工具占比与缓存命中率"))
-                    .font(.system(size: 14, weight: .semibold))
+                Text(localizer.L("Source completeness & 30d ledger", "数据源完整度与 30 天账本"))
+                    .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
                 Text(localizer.L("30d / cache", "30天 / 缓存"))
-                    .font(.system(size: 11.5, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(AgentBarPalette.muted)
             }
 
@@ -397,57 +466,100 @@ public struct DashboardView: View {
                     if idx > 0 {
                         Rectangle().fill(AgentBarPalette.rule.opacity(0.65)).frame(height: 1)
                     }
+                    let w30 = item.metrics(for: .thirtyDays)
+                    let pending = !monitor.hasLoadedInitialSnapshot
                     VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 7) {
+                        HStack(spacing: 6) {
                             RoundedRectangle(cornerRadius: 2)
-                                .fill(item.vendor.color)
+                                .fill(item.completeness != .noData ? item.vendor.color : AgentBarPalette.muted.opacity(0.35))
                                 .frame(width: 8, height: 8)
                             Text(item.vendor.displayName)
-                                .font(.system(size: 12.5, weight: .semibold))
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(AgentBarPalette.ink)
-                            Spacer()
-                            Text(TelemetryFormatter.usd(item.thirtyDayCostUSD))
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(AgentBarPalette.ink)
-                            Text(TelemetryFormatter.percent(item.cacheHitRatio))
-                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                .padding(.horizontal, 6)
+                                .fixedSize(horizontal: true, vertical: false)
+                            completenessPill(pending ? nil : item.completeness)
+                            Spacer(minLength: 4)
+                            Text(pending
+                                 ? localizer.L("Refreshing…", "刷新中…")
+                                 : TelemetryFormatter.optionalUSD(w30.estimatedCostUSD, completeness: w30.completeness, language: lang))
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(w30.estimatedCostUSD != nil ? AgentBarPalette.ink : AgentBarPalette.muted)
+                                .fixedSize(horizontal: true, vertical: false)
+                            Text(pending
+                                 ? "…"
+                                 : TelemetryFormatter.optionalPercent(w30.cacheHitRate, completeness: w30.completeness, language: lang))
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .padding(.horizontal, 5.5)
                                 .padding(.vertical, 2)
                                 .background(AgentBarPalette.well)
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                                 .foregroundStyle(AgentBarPalette.muted)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         HStack {
-                            Text(item.activeModel)
-                                .font(.system(size: 10.5, design: .monospaced))
+                            Text(w30.unknownModelRecordCount > 0
+                                 ? localizer.L(
+                                     "\(item.activeModel) · \(w30.unknownModelRecordCount) unpriced",
+                                     "\(item.activeModel) · \(w30.unknownModelRecordCount) 条未匹配"
+                                 )
+                                 : item.activeModel)
+                                .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
                                 .lineLimit(1)
                             Spacer()
-                            Text(localizer.L(
-                                "\(item.sessionCount30d) sess · 5h \(TelemetryFormatter.compactTokens(item.fiveHourTokens))",
-                                "\(item.sessionCount30d) 次会话 · 5h \(TelemetryFormatter.compactTokens(item.fiveHourTokens))"
-                            ))
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(AgentBarPalette.muted)
+                            Text(pending
+                                 ? "…"
+                                 : localizer.L(
+                                     "30d \(TelemetryFormatter.optionalTokens(w30.totalTokens, completeness: w30.completeness, language: lang)) · \(w30.recordCount) rec",
+                                     "30天 \(TelemetryFormatter.optionalTokens(w30.totalTokens, completeness: w30.completeness, language: lang)) · \(w30.recordCount) 条"
+                                 ))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.muted)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                     }
-                    .padding(.vertical, 7)
+                    .padding(.vertical, 6.5)
                 }
             }
         }
     }
 
+    private func completenessPill(_ completeness: DataCompleteness?) -> some View {
+        let text: String
+        let tint: Color
+        if let completeness {
+            text = completeness.label(in: lang)
+            switch completeness {
+            case .complete: tint = AgentBarPalette.jade
+            case .totalOnly: tint = AgentBarPalette.copper
+            case .relayOnly: tint = Color(red: 0.848, green: 0.64, blue: 0.25)
+            case .noData: tint = AgentBarPalette.muted
+            }
+        } else {
+            text = localizer.L("Refreshing…", "刷新中…")
+            tint = AgentBarPalette.muted
+        }
+        return Text(text)
+            .font(.system(size: 9.5, weight: .semibold))
+            .padding(.horizontal, 5.5)
+            .padding(.vertical, 1.5)
+            .background(tint.opacity(0.16))
+            .foregroundStyle(tint)
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
     private var relayInspectorSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
                 Text(localizer.L("Cross-vendor relay batons", "跨厂商接力流水线"))
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
                 if let first = snap.relayRuns.first {
-                    Text(first.projectName)
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                    Text("\(first.projectName) (\(first.steps.count))")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundStyle(AgentBarPalette.copper)
                 }
             }
@@ -460,26 +572,28 @@ public struct DashboardView: View {
                         }
                         HStack(spacing: 8) {
                             RoundedRectangle(cornerRadius: 2)
-                                .fill(step.vendor?.color ?? AgentBarPalette.copper)
+                                .fill(step.vendor?.color ?? AgentBarPalette.muted)
                                 .frame(width: 7, height: 7)
                             Text(step.stepID)
-                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.ink)
                             Spacer()
-                            Text(localizer.L("\(step.durationSeconds)s", "\(step.durationSeconds)秒"))
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(AgentBarPalette.muted)
+                            if step.durationSeconds > 0 {
+                                Text(localizer.L("\(step.durationSeconds)s", "\(step.durationSeconds)秒"))
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(AgentBarPalette.muted)
+                            }
                             if let cost = step.costUSD {
                                 Text(TelemetryFormatter.usd(cost))
-                                    .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                     .foregroundStyle(AgentBarPalette.ink)
                             } else if let tok = step.tokens {
                                 Text(TelemetryFormatter.compactTokens(tok))
-                                    .font(.system(size: 11, design: .monospaced))
+                                    .font(.system(size: 10.5, design: .monospaced))
                                     .foregroundStyle(AgentBarPalette.muted)
                             }
                             Text(step.localizedStatus(localizer))
-                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .fixedSize(horizontal: true, vertical: false)
@@ -487,7 +601,7 @@ public struct DashboardView: View {
                                 .foregroundStyle(AgentBarPalette.jade)
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 5.5)
                     }
                 }
                 .padding(10)
