@@ -51,8 +51,8 @@ public struct SettingsView: View {
 
             Section(localizer.L("Pricing & Read-Only Privacy", "计价口径与只读隐私说明")) {
                 Text(localizer.L(
-                    "All estimated dollar amounts are API-equivalent conversions using the \(PriceCatalog.pricingVersion) pricing table; unrecognized models are counted separately instead of guessed. AgentBar opens SQLite files strictly with SQLITE_OPEN_READONLY, never reads prompt/reply text, and makes zero network requests.",
-                    "所有估算美元金额均按 API 价折算（价格表 \(PriceCatalog.pricingVersion)），未收录模型单独统计而不猜测单价。AgentBar 严格以 SQLITE_OPEN_READONLY 只读打开本地数据库，绝不读取提示词或回复正文，且发起零网络请求。"
+                    "All estimated dollar amounts are API-equivalent conversions using unverified local rates; each cost display states priced record counts vs excluded unknown-model records. AgentBar opens SQLite files strictly with SQLITE_OPEN_READONLY and reads local JSONL/log files into memory to parse JSON lines, extracting only token counts, model names, and timestamps—never storing, displaying, or uploading prompt or reply text, and making zero network requests.",
+                    "所有估算美元金额均按本地未核对单价作 API 等价折算，并在费用旁标明已计价条数与未计入的未知型号条数。AgentBar 严格以 SQLITE_OPEN_READONLY 只读打开本地数据库，并将本地 JSONL/日志文件读入内存解析 JSON 行，仅提取 Token 计数、模型名称与时间戳字段，不保存、不显示、不上传提示词或回复正文，且发起零网络请求。"
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)

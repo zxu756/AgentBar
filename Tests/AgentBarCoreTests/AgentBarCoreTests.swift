@@ -20,17 +20,17 @@ struct AgentBarCoreTests {
         #expect(abs(secDate.timeIntervalSince(msDate)) < 0.001)
     }
 
-    @Test("Reads Claude JSONL usage without reading prompt bodies")
+    @Test("Extracts Claude JSONL usage counters without persisting or emitting prompt bodies")
     func claudeJSONLCollector() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-claude-\(UUID().uuidString)")
-        let projDir = tmp.appendingPathComponent("-Users-alice-Projects-demo-app")
+        let projDir = tmp.appendingPathComponent("-tmp-workspace-Projects-demo-app")
         try FileManager.default.createDirectory(at: projDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         let nowISO = ISO8601DateFormatter().string(from: Date())
         let jsonl = """
         {"type":"user","timestamp":"\(nowISO)","sessionId":"s-1","message":{"content":"DO NOT READ SECRET PROMPT"}}
-        {"type":"assistant","timestamp":"\(nowISO)","sessionId":"s-1","cwd":"/Users/alice/Projects/demo-app","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10000,"output_tokens":2000,"cache_read_input_tokens":90000,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"\(nowISO)","sessionId":"s-1","cwd":"/tmp/workspace/Projects/demo-app","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10000,"output_tokens":2000,"cache_read_input_tokens":90000,"cache_creation_input_tokens":0}}}
         """
         try jsonl.write(to: projDir.appendingPathComponent("s-1.jsonl"), atomically: true, encoding: .utf8)
 
@@ -119,13 +119,14 @@ struct AgentBarCoreTests {
     @MainActor
     func rendersRetinaScreenshots() throws {
         let monitor = TelemetryMonitor.preview
+        let localizer = AppLocalizer(fixedLanguage: .en)
         let dashData = ScreenshotExporter.renderPNG(
-            view: DashboardView(monitor: monitor),
+            view: DashboardView(monitor: monitor, localizer: localizer),
             size: CGSize(width: 980, height: 640),
             scale: 2.0
         )
         let popData = ScreenshotExporter.renderPNG(
-            view: MenuBarPopoverView(monitor: monitor, onOpenDashboard: {}, onOpenSettings: {}),
+            view: MenuBarPopoverView(monitor: monitor, localizer: localizer, onOpenDashboard: {}, onOpenSettings: {}),
             size: CGSize(width: 396, height: 500),
             scale: 2.0
         )
@@ -133,17 +134,15 @@ struct AgentBarCoreTests {
         #expect((popData?.count ?? 0) > 10_000)
     }
 
-    @Test("Toggles live between zh-Hans and en and persists to UserDefaults")
+    @Test("Toggles live between zh-Hans and en and persists to PreferenceStore")
     @MainActor
     func languageToggleAndPersistence() throws {
-        let suiteName = "agentbar.i18n.toggle.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = InMemoryPreferenceStore()
 
         let key = "local.xu.AgentBar.language"
         let localizer = AppLocalizer(
             arguments: ["AgentBar"],
-            userDefaults: defaults,
+            preferenceStore: defaults,
             preferenceKey: key,
             preferredLanguages: ["en-US"]
         )
@@ -162,17 +161,15 @@ struct AgentBarCoreTests {
         #expect(defaults.string(forKey: key) == "en")
     }
 
-    @Test("Auto-detects Simplified Chinese system locale and respects UserDefaults override")
+    @Test("Auto-detects Simplified Chinese system locale and respects PreferenceStore override")
     @MainActor
     func chineseLocaleAutoDetection() throws {
-        let suiteName = "agentbar.i18n.locale.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = InMemoryPreferenceStore()
 
         let key = "local.xu.AgentBar.language"
         let zhDetected = AppLocalizer(
             arguments: ["AgentBar"],
-            userDefaults: defaults,
+            preferenceStore: defaults,
             preferenceKey: key,
             preferredLanguages: ["zh-Hans-CN", "en-US"]
         )
@@ -181,7 +178,7 @@ struct AgentBarCoreTests {
         defaults.set("en", forKey: key)
         let savedOverride = AppLocalizer(
             arguments: ["AgentBar"],
-            userDefaults: defaults,
+            preferenceStore: defaults,
             preferenceKey: key,
             preferredLanguages: ["zh-Hans-CN"]
         )
@@ -191,16 +188,14 @@ struct AgentBarCoreTests {
     @Test("CLI --lang flag takes highest precedence and exports -zh screenshots cleanly")
     @MainActor
     func cliLangFlagAndChineseScreenshotExport() throws {
-        let suiteName = "agentbar.i18n.cli.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = InMemoryPreferenceStore()
 
         let key = "local.xu.AgentBar.language"
         defaults.set("en", forKey: key)
 
         let cliZH = AppLocalizer(
             arguments: ["AgentBar", "--lang", "zh"],
-            userDefaults: defaults,
+            preferenceStore: defaults,
             preferenceKey: key,
             preferredLanguages: ["en-US"]
         )
@@ -208,7 +203,7 @@ struct AgentBarCoreTests {
 
         let cliEN = AppLocalizer(
             arguments: ["AgentBar", "--lang=en"],
-            userDefaults: defaults,
+            preferenceStore: defaults,
             preferenceKey: key,
             preferredLanguages: ["zh-Hans-CN"]
         )

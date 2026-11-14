@@ -38,6 +38,51 @@ public enum AppLanguage: String, CaseIterable, Codable, Identifiable, Sendable {
     }
 }
 
+public protocol PreferenceStore: AnyObject {
+    func string(forKey defaultName: String) -> String?
+    func integer(forKey defaultName: String) -> Int
+    func set(_ value: Any?, forKey defaultName: String)
+}
+
+extension UserDefaults: PreferenceStore {}
+
+public final class InMemoryPreferenceStore: PreferenceStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String: Any] = [:]
+
+    public init(initialValues: [String: Any] = [:]) {
+        self.storage = initialValues
+    }
+
+    public func string(forKey defaultName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[defaultName] as? String
+    }
+
+    public func integer(forKey defaultName: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if let intVal = storage[defaultName] as? Int {
+            return intVal
+        }
+        if let num = storage[defaultName] as? NSNumber {
+            return num.intValue
+        }
+        return 0
+    }
+
+    public func set(_ value: Any?, forKey defaultName: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let value {
+            storage[defaultName] = value
+        } else {
+            storage.removeValue(forKey: defaultName)
+        }
+    }
+}
+
 @MainActor
 public final class AppLocalizer: ObservableObject {
     nonisolated public static let defaultPreferenceKey = "local.xu.AgentBar.language"
@@ -46,22 +91,22 @@ public final class AppLocalizer: ObservableObject {
     @Published public var language: AppLanguage {
         didSet {
             guard persistChanges else { return }
-            userDefaults.set(language.rawValue, forKey: preferenceKey)
+            preferenceStore.set(language.rawValue, forKey: preferenceKey)
         }
     }
 
     public let preferenceKey: String
-    private let userDefaults: UserDefaults
+    private let preferenceStore: PreferenceStore
     private var persistChanges: Bool
 
     public init(
         arguments: [String] = CommandLine.arguments,
-        userDefaults: UserDefaults = .standard,
+        preferenceStore: PreferenceStore = UserDefaults.standard,
         preferenceKey: String = AppLocalizer.defaultPreferenceKey,
         preferredLanguages: [String] = Locale.preferredLanguages,
         persistCLI: Bool = false
     ) {
-        self.userDefaults = userDefaults
+        self.preferenceStore = preferenceStore
         self.preferenceKey = preferenceKey
         self.persistChanges = true
 
@@ -69,7 +114,7 @@ public final class AppLocalizer: ObservableObject {
             self.persistChanges = persistCLI
             self.language = cliLang
             self.persistChanges = true
-        } else if let saved = userDefaults.string(forKey: preferenceKey),
+        } else if let saved = preferenceStore.string(forKey: preferenceKey),
                   let parsed = AppLanguage(rawValue: saved) ?? AppLanguage.parseCLI(saved) {
             self.language = parsed
         } else if let firstPreferred = preferredLanguages.first,
@@ -80,8 +125,24 @@ public final class AppLocalizer: ObservableObject {
         }
     }
 
+    public convenience init(
+        arguments: [String] = CommandLine.arguments,
+        userDefaults: UserDefaults,
+        preferenceKey: String = AppLocalizer.defaultPreferenceKey,
+        preferredLanguages: [String] = Locale.preferredLanguages,
+        persistCLI: Bool = false
+    ) {
+        self.init(
+            arguments: arguments,
+            preferenceStore: userDefaults,
+            preferenceKey: preferenceKey,
+            preferredLanguages: preferredLanguages,
+            persistCLI: persistCLI
+        )
+    }
+
     public init(fixedLanguage: AppLanguage) {
-        self.userDefaults = .standard
+        self.preferenceStore = InMemoryPreferenceStore()
         self.preferenceKey = Self.defaultPreferenceKey
         self.persistChanges = false
         self.language = fixedLanguage

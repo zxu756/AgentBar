@@ -45,7 +45,7 @@ public enum AgentVendor: String, CaseIterable, Codable, Identifiable, Sendable {
         case .claudeCode: return Color(red: 0.88, green: 0.48, blue: 0.28)    // Burnished Copper
         case .codex: return Color(red: 0.29, green: 0.62, blue: 0.51)         // Mineral Jade
         case .openCode: return Color(red: 0.36, green: 0.55, blue: 0.75)      // Steel Cerulean
-        case .mistralVibe: return Color(red: 0.848, green: 0.64, blue: 0.25)  // Ochre Gold
+        case .mistralVibe: return Color(red: 0.85, green: 0.64, blue: 0.25)   // Ochre Gold
         case .antigravity: return Color(red: 0.61, green: 0.49, blue: 0.78)   // Muted Iris
         }
     }
@@ -64,6 +64,7 @@ public enum AgentVendor: String, CaseIterable, Codable, Identifiable, Sendable {
 
 public enum DataCompleteness: String, CaseIterable, Codable, Sendable, Equatable {
     case complete = "complete"
+    case mismatch = "mismatch"
     case totalOnly = "totalOnly"
     case relayOnly = "relayOnly"
     case noData = "noData"
@@ -72,6 +73,8 @@ public enum DataCompleteness: String, CaseIterable, Codable, Sendable, Equatable
         switch self {
         case .complete:
             return language == .zhHans ? "完整" : "Complete"
+        case .mismatch:
+            return language == .zhHans ? "总量不一致" : "Total mismatch"
         case .totalOnly:
             return language == .zhHans ? "只有总量" : "Total only"
         case .relayOnly:
@@ -105,11 +108,15 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
     public var cacheWriteTokens: Int?
     public var totalTokens: Int?
     public var recordCount: Int
+    public var pricedRecordCount: Int
     public var estimatedCostUSD: Double?
     public var unknownModelRecordCount: Int
     public var cacheHitRate: Double?
     public var dataSource: String
     public var completeness: DataCompleteness
+    public var hasRolloutMismatch: Bool
+    public var rolloutMismatchCount: Int
+    public var mismatchDetails: [String]
 
     public init(
         inputTokens: Int?,
@@ -118,11 +125,15 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
         cacheWriteTokens: Int?,
         totalTokens: Int?,
         recordCount: Int,
+        pricedRecordCount: Int = 0,
         estimatedCostUSD: Double?,
         unknownModelRecordCount: Int,
         cacheHitRate: Double?,
         dataSource: String,
-        completeness: DataCompleteness
+        completeness: DataCompleteness,
+        hasRolloutMismatch: Bool = false,
+        rolloutMismatchCount: Int = 0,
+        mismatchDetails: [String] = []
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -130,11 +141,35 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
         self.cacheWriteTokens = cacheWriteTokens
         self.totalTokens = totalTokens
         self.recordCount = recordCount
+        self.pricedRecordCount = pricedRecordCount
         self.estimatedCostUSD = estimatedCostUSD
         self.unknownModelRecordCount = unknownModelRecordCount
         self.cacheHitRate = cacheHitRate
         self.dataSource = dataSource
         self.completeness = completeness
+        self.hasRolloutMismatch = hasRolloutMismatch
+        self.rolloutMismatchCount = rolloutMismatchCount
+        self.mismatchDetails = mismatchDetails
+    }
+
+    public func costNote(in language: AppLanguage) -> String? {
+        guard pricedRecordCount > 0 || unknownModelRecordCount > 0 else {
+            return nil
+        }
+        return TelemetryFormatter.costCoverageNote(
+            pricedCount: pricedRecordCount,
+            unmatchedCount: unknownModelRecordCount,
+            in: language
+        )
+    }
+
+    public func mismatchNote(in language: AppLanguage) -> String? {
+        guard hasRolloutMismatch else { return nil }
+        let joined = mismatchDetails.joined(separator: "; ")
+        if joined.isEmpty {
+            return language == .zhHans ? "rollout 与 SQLite 总量不一致" : "rollout vs SQLite total mismatch"
+        }
+        return language == .zhHans ? "总量不一致（\(joined)）" : "Total mismatch (\(joined))"
     }
 
     public static func empty(dataSource: String, completeness: DataCompleteness = .noData) -> VendorWindowMetrics {
@@ -145,6 +180,7 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
             cacheWriteTokens: nil,
             totalTokens: nil,
             recordCount: 0,
+            pricedRecordCount: 0,
             estimatedCostUSD: nil,
             unknownModelRecordCount: 0,
             cacheHitRate: nil,
@@ -180,37 +216,121 @@ public enum MenuBarLabelMode: String, CaseIterable, Codable, Identifiable, Senda
 }
 
 public enum PriceCatalog {
-    /// Pricing snapshot version (YYYY-MM) for API-equivalent USD conversion.
-    public static let pricingVersion = "2026-11"
+    /// Verification status of the embedded local API-equivalent rate table.
+    /// Inherited rates have not been live-verified in offline runs and are marked `"unverified"` (`"未核对"`).
+    public static let pricingVersion = "unverified"
 
-    public struct ModelRates: Sendable, Equatable {
+    public static func localizedPricingVersion(in language: AppLanguage) -> String {
+        pricingVersion == "unverified" ? (language == .zhHans ? "未核对" : "unverified") : pricingVersion
+    }
+
+    public enum MatchKind: String, Sendable, Equatable, Codable {
+        case prefix
+        case exactOrHyphenPrefix
+    }
+
+    public struct ModelRates: Sendable, Equatable, Codable {
+        public let modelPrefix: String
+        public let matchKind: MatchKind
         public let family: String
         public let inputPerMillion: Double
-        public let outputPerMillion: Double
-        public let cacheReadPerMillion: Double
+        public let cachedInputPerMillion: Double
         public let cacheWritePerMillion: Double
+        public let outputPerMillion: Double
+        public let sourceURL: String
+        public let verifiedAt: String
+
+        public var cacheReadPerMillion: Double { cachedInputPerMillion }
 
         public init(
+            modelPrefix: String,
+            matchKind: MatchKind = .prefix,
             family: String,
             inputPerMillion: Double,
+            cachedInputPerMillion: Double,
+            cacheWritePerMillion: Double,
             outputPerMillion: Double,
-            cacheReadPerMillion: Double,
-            cacheWritePerMillion: Double
+            sourceURL: String,
+            verifiedAt: String = "unverified"
         ) {
+            self.modelPrefix = modelPrefix
+            self.matchKind = matchKind
             self.family = family
             self.inputPerMillion = inputPerMillion
-            self.outputPerMillion = outputPerMillion
-            self.cacheReadPerMillion = cacheReadPerMillion
+            self.cachedInputPerMillion = cachedInputPerMillion
             self.cacheWritePerMillion = cacheWritePerMillion
+            self.outputPerMillion = outputPerMillion
+            self.sourceURL = sourceURL
+            self.verifiedAt = verifiedAt
+        }
+
+        public func localizedVerifiedAt(in language: AppLanguage) -> String {
+            if verifiedAt == "unverified" {
+                return language == .zhHans ? "未核对" : "unverified"
+            }
+            return verifiedAt
+        }
+
+        public func matches(normalizedModelID m: String) -> Bool {
+            switch matchKind {
+            case .prefix:
+                return m.hasPrefix(modelPrefix)
+            case .exactOrHyphenPrefix:
+                return m == modelPrefix || m.hasPrefix(modelPrefix + "-")
+            }
         }
     }
+
+    private static let anthropicPricingURL = "https://docs.anthropic.com/en/docs/about-claude/pricing"
+    private static let openAIPricingURL = "https://platform.openai.com/docs/pricing"
+    private static let deepSeekPricingURL = "https://api-docs.deepseek.com/quick_start/pricing"
+    private static let googleGeminiPricingURL = "https://ai.google.dev/gemini-api/docs/pricing"
+
+    /// Per-model-prefix rate table: one row per model prefix with unit rates, official source URL, and verification status.
+    public static let entries: [ModelRates] = [
+        // Anthropic Claude Opus
+        ModelRates(modelPrefix: "claude-opus", family: "claude-opus", inputPerMillion: 15.0, cachedInputPerMillion: 1.50, cacheWritePerMillion: 18.75, outputPerMillion: 75.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-3-opus", family: "claude-opus", inputPerMillion: 15.0, cachedInputPerMillion: 1.50, cacheWritePerMillion: 18.75, outputPerMillion: 75.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-4-opus", family: "claude-opus", inputPerMillion: 15.0, cachedInputPerMillion: 1.50, cacheWritePerMillion: 18.75, outputPerMillion: 75.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        // Anthropic Claude Sonnet
+        ModelRates(modelPrefix: "claude-sonnet", family: "claude-sonnet", inputPerMillion: 3.0, cachedInputPerMillion: 0.30, cacheWritePerMillion: 3.75, outputPerMillion: 15.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-3-5-sonnet", family: "claude-sonnet", inputPerMillion: 3.0, cachedInputPerMillion: 0.30, cacheWritePerMillion: 3.75, outputPerMillion: 15.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-3-7-sonnet", family: "claude-sonnet", inputPerMillion: 3.0, cachedInputPerMillion: 0.30, cacheWritePerMillion: 3.75, outputPerMillion: 15.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-4-sonnet", family: "claude-sonnet", inputPerMillion: 3.0, cachedInputPerMillion: 0.30, cacheWritePerMillion: 3.75, outputPerMillion: 15.0, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        // Anthropic Claude Haiku
+        ModelRates(modelPrefix: "claude-haiku", family: "claude-haiku", inputPerMillion: 0.80, cachedInputPerMillion: 0.08, cacheWritePerMillion: 1.00, outputPerMillion: 4.00, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-3-haiku", family: "claude-haiku", inputPerMillion: 0.80, cachedInputPerMillion: 0.08, cacheWritePerMillion: 1.00, outputPerMillion: 4.00, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-3-5-haiku", family: "claude-haiku", inputPerMillion: 0.80, cachedInputPerMillion: 0.08, cacheWritePerMillion: 1.00, outputPerMillion: 4.00, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "claude-4-haiku", family: "claude-haiku", inputPerMillion: 0.80, cachedInputPerMillion: 0.08, cacheWritePerMillion: 1.00, outputPerMillion: 4.00, sourceURL: anthropicPricingURL, verifiedAt: "unverified"),
+        // OpenAI GPT / Codex / o-series
+        ModelRates(modelPrefix: "gpt-6", family: "openai-gpt-codex", inputPerMillion: 2.00, cachedInputPerMillion: 0.50, cacheWritePerMillion: 2.00, outputPerMillion: 8.00, sourceURL: openAIPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gpt-5", family: "openai-gpt-codex", inputPerMillion: 2.00, cachedInputPerMillion: 0.50, cacheWritePerMillion: 2.00, outputPerMillion: 8.00, sourceURL: openAIPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "codex-mini", family: "openai-gpt-codex", inputPerMillion: 2.00, cachedInputPerMillion: 0.50, cacheWritePerMillion: 2.00, outputPerMillion: 8.00, sourceURL: openAIPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "o3", matchKind: .exactOrHyphenPrefix, family: "openai-gpt-codex", inputPerMillion: 2.00, cachedInputPerMillion: 0.50, cacheWritePerMillion: 2.00, outputPerMillion: 8.00, sourceURL: openAIPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "o4-mini", family: "openai-gpt-codex", inputPerMillion: 2.00, cachedInputPerMillion: 0.50, cacheWritePerMillion: 2.00, outputPerMillion: 8.00, sourceURL: openAIPricingURL, verifiedAt: "unverified"),
+        // DeepSeek
+        ModelRates(modelPrefix: "deepseek-v4", family: "deepseek", inputPerMillion: 0.30, cachedInputPerMillion: 0.007, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: deepSeekPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "deepseek-v3", family: "deepseek", inputPerMillion: 0.30, cachedInputPerMillion: 0.007, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: deepSeekPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "deepseek-chat", family: "deepseek", inputPerMillion: 0.30, cachedInputPerMillion: 0.007, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: deepSeekPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "deepseek-reasoner", family: "deepseek", inputPerMillion: 0.30, cachedInputPerMillion: 0.007, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: deepSeekPricingURL, verifiedAt: "unverified"),
+        // Google Gemini Pro / Carbon & Flash / Argon
+        ModelRates(modelPrefix: "gemini-4-carbon", family: "gemini-pro-carbon", inputPerMillion: 1.25, cachedInputPerMillion: 0.30, cacheWritePerMillion: 1.25, outputPerMillion: 5.00, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini 4 carbon", family: "gemini-pro-carbon", inputPerMillion: 1.25, cachedInputPerMillion: 0.30, cacheWritePerMillion: 1.25, outputPerMillion: 5.00, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-2.5-pro", family: "gemini-pro-carbon", inputPerMillion: 1.25, cachedInputPerMillion: 0.30, cacheWritePerMillion: 1.25, outputPerMillion: 5.00, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-3-pro", family: "gemini-pro-carbon", inputPerMillion: 1.25, cachedInputPerMillion: 0.30, cacheWritePerMillion: 1.25, outputPerMillion: 5.00, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-4-argon", family: "gemini-flash-argon", inputPerMillion: 0.30, cachedInputPerMillion: 0.075, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini 4 argon", family: "gemini-flash-argon", inputPerMillion: 0.30, cachedInputPerMillion: 0.075, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-2.0-flash", family: "gemini-flash-argon", inputPerMillion: 0.30, cachedInputPerMillion: 0.075, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-2.5-flash", family: "gemini-flash-argon", inputPerMillion: 0.30, cachedInputPerMillion: 0.075, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified"),
+        ModelRates(modelPrefix: "gemini-3-flash", family: "gemini-flash-argon", inputPerMillion: 0.30, cachedInputPerMillion: 0.075, cacheWritePerMillion: 0.30, outputPerMillion: 1.20, sourceURL: googleGeminiPricingURL, verifiedAt: "unverified")
+    ]
 
     public static func costDisclaimer(in language: AppLanguage) -> String {
         switch language {
         case .zhHans:
-            return "按 API 价折算（价格表 \(pricingVersion)）"
+            return "按 API 价折算（单价未核对；只含已计价记录，未知型号未计入）"
         case .en:
-            return "API-equivalent estimate (pricing \(pricingVersion))"
+            return "API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)"
         }
     }
 
@@ -231,45 +351,15 @@ public enum PriceCatalog {
         return cleaned.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// Looks up published per-1M-token rates in the 2026-11 catalog.
+    /// Looks up per-1M-token rates in `PriceCatalog.entries` (marked `unverified` unless live-verified).
     /// Returns `nil` for unrecognized, empty, or unpublished internal model IDs — never falls back by vendor.
     public static func rates(for model: String) -> ModelRates? {
         let m = normalizeModelID(model)
         guard !m.isEmpty else { return nil }
-
-        // Anthropic Claude published tiers (Opus / Sonnet / Haiku)
-        if m.hasPrefix("claude-opus") || m.hasPrefix("claude-3-opus") || m.hasPrefix("claude-4-opus") {
-            return ModelRates(family: "claude-opus", inputPerMillion: 15.0, outputPerMillion: 75.0, cacheReadPerMillion: 1.50, cacheWritePerMillion: 18.75)
-        }
-        if m.hasPrefix("claude-sonnet") || m.hasPrefix("claude-3-5-sonnet") || m.hasPrefix("claude-3-7-sonnet") || m.hasPrefix("claude-4-sonnet") {
-            return ModelRates(family: "claude-sonnet", inputPerMillion: 3.0, outputPerMillion: 15.0, cacheReadPerMillion: 0.30, cacheWritePerMillion: 3.75)
-        }
-        if m.hasPrefix("claude-haiku") || m.hasPrefix("claude-3-haiku") || m.hasPrefix("claude-3-5-haiku") || m.hasPrefix("claude-4-haiku") {
-            return ModelRates(family: "claude-haiku", inputPerMillion: 0.80, outputPerMillion: 4.00, cacheReadPerMillion: 0.08, cacheWritePerMillion: 1.00)
-        }
-
-        // OpenAI GPT-5 / GPT-6 / Codex / o-series published tiers
-        if m.hasPrefix("gpt-6") || m.hasPrefix("gpt-5") || m.hasPrefix("codex-mini") || m == "o3" || m.hasPrefix("o3-") || m.hasPrefix("o4-mini") {
-            return ModelRates(family: "openai-gpt-codex", inputPerMillion: 2.00, outputPerMillion: 8.00, cacheReadPerMillion: 0.50, cacheWritePerMillion: 2.00)
-        }
-
-        // DeepSeek V3 / V4 / Chat / Reasoner published tiers
-        if m.hasPrefix("deepseek-v4") || m.hasPrefix("deepseek-v3") || m.hasPrefix("deepseek-chat") || m.hasPrefix("deepseek-reasoner") {
-            return ModelRates(family: "deepseek", inputPerMillion: 0.30, outputPerMillion: 1.20, cacheReadPerMillion: 0.007, cacheWritePerMillion: 0.30)
-        }
-
-        // Google Gemini Pro / Carbon & Flash / Argon tiers
-        if m.hasPrefix("gemini-4-carbon") || m.hasPrefix("gemini 4 carbon") || m.hasPrefix("gemini-2.5-pro") || m.hasPrefix("gemini-3-pro") {
-            return ModelRates(family: "gemini-pro-carbon", inputPerMillion: 1.25, outputPerMillion: 5.00, cacheReadPerMillion: 0.30, cacheWritePerMillion: 1.25)
-        }
-        if m.hasPrefix("gemini-4-argon") || m.hasPrefix("gemini 4 argon") || m.hasPrefix("gemini-2.5-flash") || m.hasPrefix("gemini-2.0-flash") || m.hasPrefix("gemini-3-flash") {
-            return ModelRates(family: "gemini-flash-argon", inputPerMillion: 0.30, outputPerMillion: 1.20, cacheReadPerMillion: 0.075, cacheWritePerMillion: 0.30)
-        }
-
-        return nil
+        return entries.first(where: { $0.matches(normalizedModelID: m) })
     }
 
-    /// Estimates API-equivalent USD when token breakdown is known and the model is in the 2026-11 price catalog.
+    /// Estimates API-equivalent USD when token breakdown is known and the model is in `PriceCatalog.entries`.
     /// Returns `nil` when the model is unrecognized.
     public static func estimateUSD(
         model: String,
@@ -283,7 +373,7 @@ public enum PriceCatalog {
         let m = 1_000_000.0
         return (Double(max(0, input)) / m) * r.inputPerMillion
             + (Double(max(0, output)) / m) * r.outputPerMillion
-            + (Double(max(0, cacheRead)) / m) * r.cacheReadPerMillion
+            + (Double(max(0, cacheRead)) / m) * r.cachedInputPerMillion
             + (Double(max(0, cacheWrite)) / m) * r.cacheWritePerMillion
     }
 }
@@ -311,6 +401,9 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
     public var estimatedAPICostUSD: Double?
     public var unmatchedModelCount: Int
     public var isRateLimited: Bool
+    public var hasRolloutMismatch: Bool
+    public var expectedTotalTokens: Int?
+    public var mismatchNote: String?
 
     public init(
         id: String,
@@ -325,7 +418,10 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         cacheReadTokens: Int = 0,
         cacheWriteTokens: Int = 0,
         recordedCostUSD: Double? = nil,
-        isRateLimited: Bool = false
+        isRateLimited: Bool = false,
+        hasRolloutMismatch: Bool = false,
+        expectedTotalTokens: Int? = nil,
+        mismatchNote: String? = nil
     ) {
         self.id = id
         self.vendor = vendor
@@ -354,6 +450,9 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         let hasValidRecordedCost = (recordedCostUSD ?? 0) > 0
         self.unmatchedModelCount = (!hasValidRecordedCost && est == nil) ? 1 : 0
         self.isRateLimited = isRateLimited
+        self.hasRolloutMismatch = hasRolloutMismatch
+        self.expectedTotalTokens = expectedTotalTokens
+        self.mismatchNote = mismatchNote
     }
 
     public init(
@@ -388,6 +487,9 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         let hasValidRecordedCost = (recordedCostUSD ?? 0) > 0
         self.unmatchedModelCount = (!hasValidRecordedCost && hasExplicitModel && PriceCatalog.rates(for: trimmedModel) == nil) ? 1 : 0
         self.isRateLimited = isRateLimited
+        self.hasRolloutMismatch = false
+        self.expectedTotalTokens = nil
+        self.mismatchNote = nil
     }
 
     public init(
@@ -407,7 +509,10 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         recordedCostUSD: Double?,
         estimatedAPICostUSD: Double?,
         unmatchedModelCount: Int,
-        isRateLimited: Bool
+        isRateLimited: Bool,
+        hasRolloutMismatch: Bool = false,
+        expectedTotalTokens: Int? = nil,
+        mismatchNote: String? = nil
     ) {
         self.id = id
         self.vendor = vendor
@@ -426,6 +531,9 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         self.estimatedAPICostUSD = estimatedAPICostUSD
         self.unmatchedModelCount = unmatchedModelCount
         self.isRateLimited = isRateLimited
+        self.hasRolloutMismatch = hasRolloutMismatch
+        self.expectedTotalTokens = expectedTotalTokens
+        self.mismatchNote = mismatchNote
     }
 
     public var effectiveCostUSD: Double? {
@@ -642,8 +750,38 @@ public struct TelemetrySnapshot: Codable, Sendable, Equatable {
         vendorSummaries.compactMap(\.thirtyDayTokens).reduce(0, +)
     }
 
+    public var pricedRecordCountToday: Int {
+        vendorSummaries.map { $0.metrics(for: .today).pricedRecordCount }.reduce(0, +)
+    }
+
+    public var unknownModelRecordCountToday: Int {
+        vendorSummaries.map { $0.metrics(for: .today).unknownModelRecordCount }.reduce(0, +)
+    }
+
+    public func todayCostNote(in language: AppLanguage) -> String? {
+        guard pricedRecordCountToday > 0 || unknownModelRecordCountToday > 0 else { return nil }
+        return TelemetryFormatter.costCoverageNote(
+            pricedCount: pricedRecordCountToday,
+            unmatchedCount: unknownModelRecordCountToday,
+            in: language
+        )
+    }
+
+    public var pricedRecordCount30d: Int {
+        vendorSummaries.map { $0.metrics(for: .thirtyDays).pricedRecordCount }.reduce(0, +)
+    }
+
     public var unknownModelRecordCount30d: Int {
         vendorSummaries.map(\.unknownModelRecordCount30d).reduce(0, +)
+    }
+
+    public func thirtyDayCostNote(in language: AppLanguage) -> String? {
+        guard pricedRecordCount30d > 0 || unknownModelRecordCount30d > 0 else { return nil }
+        return TelemetryFormatter.costCoverageNote(
+            pricedCount: pricedRecordCount30d,
+            unmatchedCount: unknownModelRecordCount30d,
+            in: language
+        )
     }
 
     public var rateLimitHits24h: Int {
@@ -715,5 +853,21 @@ public enum TelemetryFormatter {
             return language == .zhHans ? "没有数据" : "No data"
         }
         return language == .zhHans ? "未知" : "Unknown"
+    }
+
+    public static func costCoverageNote(
+        pricedCount: Int,
+        unmatchedCount: Int,
+        in language: AppLanguage
+    ) -> String {
+        switch language {
+        case .zhHans:
+            if unmatchedCount > 0 {
+                return "只含已计价的 \(pricedCount) 条，另有 \(unmatchedCount) 条未知型号未计入"
+            }
+            return "含已计价的 \(pricedCount) 条，0 条未知型号未计入"
+        case .en:
+            return "Covers \(pricedCount) priced records only; \(unmatchedCount) unknown-model records excluded"
+        }
     }
 }

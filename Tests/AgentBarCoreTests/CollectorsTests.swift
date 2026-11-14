@@ -9,7 +9,7 @@ struct CollectorsTests {
     @Test("Deduplicates multi-block streaming Claude JSONL lines sharing (message.id, requestId) and takes max usage")
     func claudeStreamingDeduplication() throws {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-claude-dedup-\(UUID().uuidString)")
-        let projDir = tmp.appendingPathComponent("-Users-dev-Projects-synth-repo")
+        let projDir = tmp.appendingPathComponent("-tmp-dev-Projects-synth-repo")
         try FileManager.default.createDirectory(at: projDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
@@ -23,11 +23,11 @@ struct CollectorsTests {
         // Output tokens grow from 120 -> 450 -> 800 across streaming chunks; must count ONCE with max=800.
         // Turn 2: 2 content-block lines with msg_02 and missing requestId (fallback to message.id).
         let jsonl = """
-        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/Users/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":120,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
-        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/Users/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":450,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
-        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/Users/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":800,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
-        {"type":"assistant","timestamp":"\(t2)","sessionId":"sess-a","cwd":"/Users/dev/Projects/synth-repo","message":{"id":"msg_02","model":"claude-sonnet-5-5","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500}}}
-        {"type":"assistant","timestamp":"\(t2)","sessionId":"sess-a","cwd":"/Users/dev/Projects/synth-repo","message":{"id":"msg_02","model":"claude-sonnet-5-5","usage":{"input_tokens":100,"output_tokens":300,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500}}}
+        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/tmp/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":120,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
+        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/tmp/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":450,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
+        {"type":"assistant","timestamp":"\(t1)","sessionId":"sess-a","requestId":"req_01","cwd":"/tmp/dev/Projects/synth-repo","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":200,"output_tokens":800,"cache_read_input_tokens":8000,"cache_creation_input_tokens":1000}}}
+        {"type":"assistant","timestamp":"\(t2)","sessionId":"sess-a","cwd":"/tmp/dev/Projects/synth-repo","message":{"id":"msg_02","model":"claude-sonnet-5-5","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500}}}
+        {"type":"assistant","timestamp":"\(t2)","sessionId":"sess-a","cwd":"/tmp/dev/Projects/synth-repo","message":{"id":"msg_02","model":"claude-sonnet-5-5","usage":{"input_tokens":100,"output_tokens":300,"cache_read_input_tokens":4000,"cache_creation_input_tokens":500}}}
         """
         try jsonl.write(to: projDir.appendingPathComponent("sess-a.jsonl"), atomically: true, encoding: .utf8)
 
@@ -142,25 +142,100 @@ struct CollectorsTests {
         #expect(TelemetryFormatter.optionalUSD(w30.estimatedCostUSD, completeness: w30.completeness, language: .zhHans) == "未知")
     }
 
-    @Test("Sources/ contains zero fixed-ratio 0.85 or 0.15 literals")
+    @Test("Codex rollout total_token_usage mismatch against threads.tokens_used is flagged and downgrades completeness from complete")
+    func codexRolloutTotalMismatchFlagsAndDowngradesCompleteness() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-codex-mismatch-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let rolloutURL = tmp.appendingPathComponent("rollout-th-mis.jsonl")
+        // Rollout sums to 12_000 tokens (input_tokens=10_000 including cached=8_000 -> uncached=2_000, output=2_000),
+        // while state_5.sqlite threads.tokens_used records 50_000.
+        let rolloutContent = """
+        {"timestamp":"2026-11-14T02:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+        {"timestamp":"2026-11-14T02:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"reasoning_output_tokens":300,"total_tokens":12000}}}}
+        """
+        try rolloutContent.write(to: rolloutURL, atomically: true, encoding: .utf8)
+
+        let codexDB = tmp.appendingPathComponent("state_5.sqlite")
+        let now = Date(timeIntervalSince1970: 1_794_600_000)
+        let nowSec = Int64(now.timeIntervalSince1970)
+        try execSQL(at: codexDB, sql: """
+        CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT);
+        INSERT INTO threads VALUES ('th-mis', '/tmp/proj-mismatch', 50000, \(nowSec), 'gpt-6.1-sol', '\(rolloutURL.path)');
+        """)
+
+        let samples = LocalTelemetryCollector.collectCodexSamples(dbURL: codexDB, since: now.addingTimeInterval(-3600), now: now)
+        #expect(samples.count == 1)
+        let sample = try #require(samples.first)
+        #expect(sample.hasRolloutMismatch == true)
+        #expect(sample.expectedTotalTokens == 50_000)
+        #expect(sample.mismatchNote == "th-mis: rollout=12000 vs sqlite=50000")
+
+        let snap = LocalTelemetryCollector.buildSnapshot(
+            samples: samples,
+            relayRuns: [],
+            availability: [.codex: true],
+            now: now
+        )
+        let codexSummary = try #require(snap.vendorSummaries.first(where: { $0.vendor == .codex }))
+        #expect(codexSummary.completeness == .mismatch)
+        #expect(codexSummary.completeness != .complete)
+        #expect(codexSummary.completeness.label(in: .en) == "Total mismatch")
+        #expect(codexSummary.completeness.label(in: .zhHans) == "总量不一致")
+
+        let w30 = codexSummary.metrics(for: .thirtyDays)
+        #expect(w30.completeness == .mismatch)
+        #expect(w30.completeness != .complete)
+        #expect(w30.hasRolloutMismatch == true)
+        #expect(w30.rolloutMismatchCount == 1)
+        #expect(w30.mismatchDetails == ["th-mis: rollout=12000 vs sqlite=50000"])
+        #expect(w30.mismatchNote(in: .en)?.contains("rollout=12000 vs sqlite=50000") == true)
+        #expect(w30.mismatchNote(in: .zhHans)?.contains("rollout=12000 vs sqlite=50000") == true)
+    }
+
+    @Test("Collector and estimation code contains zero 0.85/0.15 split literals while mistralVibe UI color stays 0.85")
     func zeroFixedRatiosInSources() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let sourcesDir = repoRoot.appendingPathComponent("Sources")
-        let enumerator = try #require(FileManager.default.enumerator(at: sourcesDir, includingPropertiesForKeys: nil))
+        let collectorsDir = repoRoot.appendingPathComponent("Sources/AgentBarCore/Collectors")
+        let cliDir = repoRoot.appendingPathComponent("Sources/AgentBarCore/CLI")
+        let modelsFile = repoRoot.appendingPathComponent("Sources/AgentBarCore/Models/TelemetryModels.swift")
         let forbidden = try NSRegularExpression(pattern: #"\b0\.(?:85|15)\b"#)
 
         var hits: [String] = []
-        for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
-            let content = try String(contentsOf: fileURL, encoding: .utf8)
-            let ns = content as NSString
-            if forbidden.firstMatch(in: content, range: NSRange(location: 0, length: ns.length)) != nil {
-                hits.append(fileURL.lastPathComponent)
+        for dir in [collectorsDir, cliDir] {
+            let enumerator = try #require(FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil))
+            for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
+                let content = try String(contentsOf: fileURL, encoding: .utf8)
+                let ns = content as NSString
+                if forbidden.firstMatch(in: content, range: NSRange(location: 0, length: ns.length)) != nil {
+                    hits.append(fileURL.lastPathComponent)
+                }
             }
         }
-        #expect(hits.isEmpty, "Found forbidden 0.85/0.15 literals in: \(hits)")
+
+        // Check non-UI lines in TelemetryModels.swift (pricing & sample models) for 0.85/0.15
+        let modelsContent = try String(contentsOf: modelsFile, encoding: .utf8)
+        for (idx, line) in modelsContent.components(separatedBy: .newlines).enumerated() {
+            if line.contains("Color(red:") { continue }
+            let ns = line as NSString
+            if forbidden.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) != nil {
+                hits.append("TelemetryModels.swift:\(idx + 1)")
+            }
+        }
+        #expect(hits.isEmpty, "Found forbidden 0.85/0.15 literals in collector/pricing code: \(hits)")
+
+        // W4: mistralVibe UI color must use its natural 0.85 red component, never artificial 0.848
+        #expect(modelsContent.contains("Color(red: 0.85, green: 0.64, blue: 0.25)"))
+        let dashboardContent = try String(
+            contentsOf: repoRoot.appendingPathComponent("Sources/AgentBarCore/Views/DashboardView.swift"),
+            encoding: .utf8
+        )
+        #expect(!modelsContent.contains("0.848"))
+        #expect(!dashboardContent.contains("0.848"))
     }
 
     @Test("Cache hit ratio formula strictly divides cache_read by (input + cache_read + cache_write)")
@@ -245,11 +320,9 @@ struct CollectorsTests {
     @Test("Distinguishes initial Refreshing state from post-scan No data state without touching standard UserDefaults")
     @MainActor
     func monitorDistinguishesRefreshingFromNoData() throws {
-        let suiteName = "agentbar.monitor.state.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = InMemoryPreferenceStore()
 
-        let pendingMonitor = TelemetryMonitor(previewSnapshot: nil, startImmediately: false, userDefaults: defaults)
+        let pendingMonitor = TelemetryMonitor(previewSnapshot: nil, startImmediately: false, preferenceStore: defaults)
         #expect(pendingMonitor.hasLoadedInitialSnapshot == false)
         #expect(pendingMonitor.statusSummaryLabel(in: .en) == "Refreshing…")
         #expect(pendingMonitor.statusSummaryLabel(in: .zhHans) == "刷新中…")
@@ -261,7 +334,7 @@ struct CollectorsTests {
             availability: [:],
             now: Date(timeIntervalSince1970: 1_794_600_000)
         )
-        let loadedEmptyMonitor = TelemetryMonitor(previewSnapshot: emptySnap, startImmediately: false, userDefaults: defaults)
+        let loadedEmptyMonitor = TelemetryMonitor(previewSnapshot: emptySnap, startImmediately: false, preferenceStore: defaults)
         #expect(loadedEmptyMonitor.hasLoadedInitialSnapshot == true)
         #expect(loadedEmptyMonitor.statusSummaryLabel(in: .en) == "No data")
         #expect(loadedEmptyMonitor.statusSummaryLabel(in: .zhHans) == "没有数据")

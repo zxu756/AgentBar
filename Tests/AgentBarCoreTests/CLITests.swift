@@ -11,7 +11,7 @@ struct CLITests {
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-cli-\(UUID().uuidString)")
         let homeDir = tmp.appendingPathComponent("home")
         let wsDir = tmp.appendingPathComponent("workspace")
-        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-Users-test-Projects-app")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-test-Projects-app")
         let codexDir = homeDir.appendingPathComponent(".codex")
         let relayDir = wsDir.appendingPathComponent("pipe/.relay")
 
@@ -28,8 +28,8 @@ struct CLITests {
         let secretSentinel = "SUPER_SECRET_CONVERSATION_BODY_DO_NOT_LEAK_99182"
         let claudeJSONL = """
         {"type":"user","timestamp":"2026-11-14T00:50:00Z","sessionId":"s1","message":{"content":"\(secretSentinel)"}}
-        {"type":"assistant","timestamp":"2026-11-14T00:55:00Z","sessionId":"s1","requestId":"req_a","cwd":"/Users/test/Projects/app","message":{"id":"msg_a","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":3000,"cache_creation_input_tokens":1000}}}
-        {"type":"assistant","timestamp":"2026-11-14T00:55:01Z","sessionId":"s1","requestId":"req_a","cwd":"/Users/test/Projects/app","message":{"id":"msg_a","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":3000,"cache_creation_input_tokens":1000}}}
+        {"type":"assistant","timestamp":"2026-11-14T00:55:00Z","sessionId":"s1","requestId":"req_a","cwd":"/tmp/test/Projects/app","message":{"id":"msg_a","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":3000,"cache_creation_input_tokens":1000}}}
+        {"type":"assistant","timestamp":"2026-11-14T00:55:01Z","sessionId":"s1","requestId":"req_a","cwd":"/tmp/test/Projects/app","message":{"id":"msg_a","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":3000,"cache_creation_input_tokens":1000}}}
         """
         try claudeJSONL.write(to: claudeProj.appendingPathComponent("s1.jsonl"), atomically: true, encoding: .utf8)
 
@@ -68,15 +68,17 @@ struct CLITests {
 
         let enData = try #require(enRes.stdout.data(using: .utf8))
         let enRoot = try #require(try JSONSerialization.jsonObject(with: enData) as? [String: Any])
-        #expect(enRoot["pricingVersion"] as? String == "2026-11")
-        #expect(enRoot["costDisclaimer"] as? String == "API-equivalent estimate (pricing 2026-11)")
+        #expect(enRoot["pricingVersion"] as? String == "unverified")
+        #expect(enRoot["costDisclaimer"] as? String == "API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)")
         #expect(enRoot["isDemoData"] as? Bool == false)
 
         let vendors = try #require(enRoot["vendors"] as? [String: Any])
         let requiredWindowKeys: Set<String> = [
             "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
-            "totalTokens", "recordCount", "estimatedCostUSD", "unknownModelRecordCount",
-            "cacheHitRate", "dataSource", "completeness", "completenessLabel"
+            "totalTokens", "recordCount", "pricedRecordCount", "estimatedCostUSD",
+            "unknownModelRecordCount", "unmatchedModelCount", "costNote",
+            "cacheHitRate", "dataSource", "completeness", "completenessLabel",
+            "hasRolloutMismatch", "rolloutMismatchCount", "mismatchNote"
         ]
 
         // Verify Claude 30d window
@@ -86,6 +88,9 @@ struct CLITests {
         let claude30 = try #require(claudeWins["thirtyDays"] as? [String: Any])
         #expect(requiredWindowKeys.isSubset(of: Set(claude30.keys)))
         #expect(claude30["recordCount"] as? Int == 1)
+        #expect(claude30["pricedRecordCount"] as? Int == 1)
+        #expect(claude30["unmatchedModelCount"] as? Int == 0)
+        #expect(claude30["costNote"] as? String == "Covers 1 priced records only; 0 unknown-model records excluded")
         #expect(claude30["inputTokens"] as? Int == 1_000)
         #expect(claude30["outputTokens"] as? Int == 500)
         #expect(claude30["cacheReadTokens"] as? Int == 3_000)
@@ -107,6 +112,8 @@ struct CLITests {
         #expect(codex30["cacheWriteTokens"] is NSNull)
         #expect(codex30["estimatedCostUSD"] is NSNull)
         #expect(codex30["cacheHitRate"] is NSNull)
+        #expect(codex30["costNote"] is NSNull)
+        #expect(codex30["mismatchNote"] is NSNull)
 
         // Verify Vibe & Antigravity completeness != "complete"
         let vibeObj = try #require(vendors["vibe"] as? [String: Any])
@@ -126,19 +133,22 @@ struct CLITests {
         #expect(zhRes.exitCode == 0)
         let zhData = try #require(zhRes.stdout.data(using: .utf8))
         let zhRoot = try #require(try JSONSerialization.jsonObject(with: zhData) as? [String: Any])
-        #expect(zhRoot["costDisclaimer"] as? String == "按 API 价折算（价格表 2026-11）")
+        #expect(zhRoot["costDisclaimer"] as? String == "按 API 价折算（单价未核对；只含已计价记录，未知型号未计入）")
         let zhVendors = try #require(zhRoot["vendors"] as? [String: Any])
         #expect((zhVendors["claude"] as? [String: Any])?["completenessLabel"] as? String == "完整")
         #expect((zhVendors["codex"] as? [String: Any])?["completenessLabel"] as? String == "只有总量")
         #expect((zhVendors["vibe"] as? [String: Any])?["completenessLabel"] as? String == "只有接力里的部分")
         #expect((zhVendors["opencode"] as? [String: Any])?["completenessLabel"] as? String == "没有数据")
+        #expect((zhVendors["vibe"] as? [String: Any])?["dataSource"] as? String == "~/Projects/*/.relay/LOG.md（meta.json 无 Token 统计）")
+        #expect((zhVendors["agy"] as? [String: Any])?["dataSource"] as? String == "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）")
+        #expect((zhVendors["opencode"] as? [String: Any])?["dataSource"] as? String == "~/.local/share/opencode/opencode.db（session_v2 表）")
 
         let humanEN = CLIRunner.execute(arguments: [
             "AgentBar", "--cli", "snapshot", "--lang", "en",
             "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
         ])
         #expect(humanEN.exitCode == 0)
-        #expect(humanEN.stdout.contains("API-equivalent estimate (pricing 2026-11)"))
+        #expect(humanEN.stdout.contains("API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)"))
         #expect(humanEN.stdout.contains("Total only"))
         #expect(humanEN.stdout.contains("Relay logs only"))
         #expect(humanEN.stdout.contains("No data"))
@@ -149,14 +159,132 @@ struct CLITests {
             "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
         ])
         #expect(humanZH.exitCode == 0)
-        #expect(humanZH.stdout.contains("按 API 价折算（价格表 2026-11）"))
+        #expect(humanZH.stdout.contains("按 API 价折算（单价未核对；只含已计价记录，未知型号未计入）"))
         #expect(humanZH.stdout.contains("只有总量"))
         #expect(humanZH.stdout.contains("只有接力里的部分"))
         #expect(humanZH.stdout.contains("没有数据"))
+        #expect(humanZH.stdout.contains("meta.json 无 Token 统计"))
+        #expect(humanZH.stdout.contains("cli-*.log 无 Token 统计"))
+        #expect(!humanZH.stdout.contains("lacks token stats"))
         #expect(!humanZH.stdout.contains(secretSentinel))
 
         let mtimeAfter = (try? FileManager.default.attributesOfItem(atPath: plistURL.path)[.modificationDate] as? Date)?.timeIntervalSince1970
         #expect(mtimeBefore == mtimeAfter)
+    }
+
+    @Test("Exits non-zero with stderr message when explicit --home or --workspace path does not exist or is not a directory")
+    func nonexistentHomeOrWorkspaceExitsNonZeroWithError() throws {
+        let missingPath = "/nonexistent_agentbar_path_\(UUID().uuidString)"
+        let rMissingHomeEN = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--lang", "en", "--home", missingPath])
+        #expect(rMissingHomeEN.exitCode == 2)
+        #expect(rMissingHomeEN.stdout.isEmpty)
+        #expect(rMissingHomeEN.stderr.contains("--home"))
+        #expect(rMissingHomeEN.stderr.contains(missingPath))
+
+        let rMissingHomeZH = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--lang", "zh", "--home", missingPath])
+        #expect(rMissingHomeZH.exitCode == 2)
+        #expect(rMissingHomeZH.stdout.isEmpty)
+        #expect(rMissingHomeZH.stderr.contains("--home"))
+        #expect(rMissingHomeZH.stderr.contains("不存在"))
+
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-b16-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let rMissingWS = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "en",
+            "--home", tmp.path, "--workspace", missingPath
+        ])
+        #expect(rMissingWS.exitCode == 2)
+        #expect(rMissingWS.stdout.isEmpty)
+        #expect(rMissingWS.stderr.contains("--workspace"))
+
+        // Passing a regular file instead of a directory must also fail with exit code 2
+        let regularFile = tmp.appendingPathComponent("not-a-dir.txt")
+        try "hello".write(to: regularFile, atomically: true, encoding: .utf8)
+        let rFileAsHome = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--home", regularFile.path])
+        #expect(rFileAsHome.exitCode == 2)
+        #expect(!rFileAsHome.stderr.isEmpty)
+
+        // Existing empty directory still exits 0 and shows No data / 没有数据
+        let rEmptyDir = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--lang", "zh", "--home", tmp.path, "--workspace", tmp.path])
+        #expect(rEmptyDir.exitCode == 0)
+        #expect(rEmptyDir.stdout.contains("没有数据"))
+    }
+
+    @Test("Formats explicit priced N vs excluded unknown-model M beside cost and surfaces Codex rollout mismatch in EN/ZH CLI")
+    func costCoverageNoteAndCodexMismatchInCLI() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-b14-b15-\(UUID().uuidString)")
+        let homeDir = tmp.appendingPathComponent("home")
+        let wsDir = tmp.appendingPathComponent("ws")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-app")
+        let codexDir = homeDir.appendingPathComponent(".codex")
+        try FileManager.default.createDirectory(at: claudeProj, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: codexDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: wsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // 1 priced Sonnet turn ($4.50) + 2 unknown-model turns
+        let claudeJSONL = """
+        {"type":"assistant","timestamp":"2026-11-14T00:50:00Z","sessionId":"s-mix","requestId":"r1","cwd":"/tmp/app","message":{"id":"m1","model":"claude-sonnet-5-5","usage":{"input_tokens":1000000,"output_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"2026-11-14T00:51:00Z","sessionId":"s-mix","requestId":"r2","cwd":"/tmp/app","message":{"id":"m2","model":"claude-fable-5-1","usage":{"input_tokens":500000,"output_tokens":50000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"2026-11-14T00:52:00Z","sessionId":"s-mix","requestId":"r3","cwd":"/tmp/app","message":{"id":"m3","model":"custom-local-llm","usage":{"input_tokens":200000,"output_tokens":20000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        """
+        try claudeJSONL.write(to: claudeProj.appendingPathComponent("mix.jsonl"), atomically: true, encoding: .utf8)
+
+        // Codex mismatch: sqlite tokens_used = 50000, rollout total = 12000
+        let rolloutURL = codexDir.appendingPathComponent("rollout-mis.jsonl")
+        let rolloutJSONL = """
+        {"timestamp":"2026-11-14T00:40:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+        {"timestamp":"2026-11-14T00:42:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}
+        """
+        try rolloutJSONL.write(to: rolloutURL, atomically: true, encoding: .utf8)
+        let codexDB = codexDir.appendingPathComponent("state_5.sqlite")
+        try execSQL(at: codexDB, sql: """
+        CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT);
+        INSERT INTO threads VALUES ('th-mis', '/tmp/app', 50000, 1794617000, 'gpt-6.1-sol', '\(rolloutURL.path)');
+        """)
+
+        let nowStr = "2026-11-14T01:00:00Z"
+
+        let zhHuman = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "zh",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(zhHuman.exitCode == 0)
+        #expect(zhHuman.stdout.contains("$4.50（只含已计价的 1 条，另有 2 条未知型号未计入）"))
+        #expect(zhHuman.stdout.contains("[Codex CLI] (总量不一致)"))
+        #expect(zhHuman.stdout.contains("rollout=12000 vs sqlite=50000"))
+        #expect(!zhHuman.stdout.contains("lacks token stats"))
+
+        let enHuman = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "en",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(enHuman.exitCode == 0)
+        #expect(enHuman.stdout.contains("$4.50 (Covers 1 priced records only; 2 unknown-model records excluded)"))
+        #expect(enHuman.stdout.contains("[Codex CLI] (Total mismatch)"))
+        #expect(enHuman.stdout.contains("rollout=12000 vs sqlite=50000"))
+
+        let zhJSONRes = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--json", "--lang", "zh",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        let zhObj = try #require(try JSONSerialization.jsonObject(with: Data(zhJSONRes.stdout.utf8)) as? [String: Any])
+        let zhVendors = try #require(zhObj["vendors"] as? [String: Any])
+        let claude30 = try #require(((zhVendors["claude"] as? [String: Any])?["windows"] as? [String: Any])?["thirtyDays"] as? [String: Any])
+        #expect(claude30["pricedRecordCount"] as? Int == 1)
+        #expect(claude30["unmatchedModelCount"] as? Int == 2)
+        #expect(claude30["costNote"] as? String == "只含已计价的 1 条，另有 2 条未知型号未计入")
+
+        let codexVendor = try #require(zhVendors["codex"] as? [String: Any])
+        #expect(codexVendor["completeness"] as? String == "mismatch")
+        #expect(codexVendor["completeness"] as? String != "complete")
+        #expect(codexVendor["completenessLabel"] as? String == "总量不一致")
+        let codex30 = try #require((codexVendor["windows"] as? [String: Any])?["thirtyDays"] as? [String: Any])
+        #expect(codex30["hasRolloutMismatch"] as? Bool == true)
+        #expect(codex30["rolloutMismatchCount"] as? Int == 1)
+        #expect((codex30["mismatchNote"] as? String)?.contains("rollout=12000 vs sqlite=50000") == true)
     }
 
     @Test("Exits with code 2 on unknown subcommands, missing subcommand, or unknown flags; marks --demo explicitly")
@@ -181,6 +309,9 @@ struct CLITests {
         let rDemoZH = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--demo", "--lang", "zh"])
         #expect(rDemoZH.exitCode == 0)
         #expect(rDemoZH.stdout.contains("[DEMO / 演示数据]"))
+        #expect(rDemoZH.stdout.contains("meta.json 无 Token 统计"))
+        #expect(rDemoZH.stdout.contains("cli-*.log 无 Token 统计"))
+        #expect(!rDemoZH.stdout.contains("lacks token stats"))
     }
 
     private func execSQL(at url: URL, sql: String) throws {

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-AgentBar M0 Independent Acceptance Verifier (Strictly Read-Only, Aggregate Metadata Only).
+AgentBar M0 Independent Acceptance Verifier (Strictly Read-Only, Aggregate Counts Only).
 
-Verifies all 6 rows of flagship-acceptance/tools/agentbar.md's M0 acceptance table:
-  Row 1: Claude Code 30d deduplicated (message.id, requestId) tokens & record count (< 1% diff).
-  Row 2: Codex rollout real breakdown + cacheHitRate > 0; missing-rollout -> totalOnly & null breakdown/cost.
+Verifies all 6 rows of flagship-acceptance/tools/agentbar.md's M0 acceptance table plus B11-B16 & W1-W6:
+  Row 1: Claude Code 30d deduplicated (message.id, requestId) tokens & record count (< 1% diff; synthetic + live if present).
+  Row 2: Codex rollout real breakdown + cacheHitRate > 0; missing-rollout -> totalOnly & null breakdown/cost; B15 mismatch -> != complete.
   Row 3: 126-step .relay/LOG.md parser (zero dropped steps, zero bleed, strict heading-only vendor).
-  Row 4: Zero 0.85 / 0.15 fixed-ratio literals in Sources/.
-  Row 5: Scoped unit tests for streaming deduplication & 3-term cache hit denominator pass cleanly.
-  Row 6: Vibe & Antigravity completeness != "complete" in both --lang en and --lang zh (+ OpenCode parity).
+  Row 4: Zero 0.85 / 0.15 fixed-ratio literals in collector/pricing/CLI code; mistralVibe UI color == 0.85 (W4).
+  Row 5: Scripted mutations in an isolated temp copy compile, run, and fail the named unit test, then restore cleanly (W1).
+  Row 6: Vibe & Antigravity completeness != "complete" in EN & ZH, B11-B16 checks, and OpenCode parity.
 
 Privacy & Safety Invariants:
   - Opens local SQLite files strictly with ?mode=ro (immutable read-only URI).
-  - Never reads, stores, or prints any conversation/prompt/message text.
+  - Extracts only numeric token counters, model IDs, timestamps, and costs; never stores or prints conversation text.
   - Verifies ~/Library/Preferences/local.xu.AgentBar.plist modification time is untouched.
 """
 
@@ -24,6 +24,7 @@ import json
 import math
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import sqlite3
@@ -35,8 +36,9 @@ from typing import Any
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-HOME_DIR = pathlib.Path.home()
-PLIST_PATH = HOME_DIR / "Library" / "Preferences" / "local.xu.AgentBar.plist"
+EFFECTIVE_HOME = pathlib.Path(os.environ.get("HOME") or str(pathlib.Path.home()))
+REAL_USER_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+PLIST_PATH = REAL_USER_HOME / "Library" / "Preferences" / "local.xu.AgentBar.plist"
 
 
 def plist_mtime() -> float | None:
@@ -79,7 +81,6 @@ def parse_iso_epoch(ts_str: str) -> float | None:
 
 
 def independent_claude_30d(claude_dir: pathlib.Path, now_epoch: int) -> dict[str, int]:
-    """Independent port of claude_ind.py: deduplicate by (message.id, requestId) taking max per usage field."""
     cutoff = now_epoch - 30 * 86400
     raw_lines = 0
     dedup: dict[tuple[str, str], tuple[float, list[int]]] = {}
@@ -163,7 +164,7 @@ def independent_claude_30d(claude_dir: pathlib.Path, now_epoch: int) -> dict[str
     }
 
 
-def read_last_codex_rollout_usage(rollout_path: str) -> tuple[int, int, int, int] | None:
+def read_last_codex_rollout_usage(rollout_path: str) -> tuple[int, int, int, int, int | None] | None:
     p = pathlib.Path(rollout_path)
     lines: list[str] = []
     if p.is_file():
@@ -209,16 +210,17 @@ def read_last_codex_rollout_usage(rollout_path: str) -> tuple[int, int, int, int
     cached = max(0, int(last_total.get("cached_input_tokens") or 0))
     cw = max(0, int(last_total.get("cache_write_input_tokens") or 0))
     out = max(0, int(last_total.get("output_tokens") or 0))
+    rep_tot = int(last_total["total_tokens"]) if "total_tokens" in last_total and last_total["total_tokens"] is not None else None
     uncached = max(0, raw_in - cached)
     if (uncached + cached + cw + out) <= 0:
         return None
-    return (uncached, cached, cw, out)
+    return (uncached, cached, cw, out, rep_tot)
 
 
 def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, Any]:
     cutoff = now_epoch - 30 * 86400
     if not db_path.is_file():
-        return {"records": 0, "missing_rollout": 0, "in": 0, "cr": 0, "cw": 0, "out": 0, "total": 0}
+        return {"records": 0, "missing_rollout": 0, "mismatches": 0, "in": 0, "cr": 0, "cw": 0, "out": 0, "total": 0}
 
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
@@ -230,6 +232,7 @@ def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, An
 
     rec = 0
     missing = 0
+    mismatches = 0
     s_in = s_cr = s_cw = s_out = s_tot = 0
     for _tid, tok_used, updated_at, rpath in rows:
         ts = updated_at / 1000.0 if updated_at > 10_000_000_000 else float(updated_at)
@@ -241,16 +244,20 @@ def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, An
             missing += 1
             s_tot += int(tok_used)
         else:
-            u_in, u_cr, u_cw, u_out = usage
+            u_in, u_cr, u_cw, u_out, rep_tot = usage
+            rtot = u_in + u_cr + u_cw + u_out
+            if rtot != int(tok_used) or (rep_tot is not None and rep_tot != int(tok_used)):
+                mismatches += 1
             s_in += u_in
             s_cr += u_cr
             s_cw += u_cw
             s_out += u_out
-            s_tot += (u_in + u_cr + u_cw + u_out)
+            s_tot += rtot
 
     return {
         "records": rec,
         "missing_rollout": missing,
+        "mismatches": mismatches,
         "in": s_in,
         "cr": s_cr,
         "cw": s_cw,
@@ -382,6 +389,108 @@ def build_synthetic_126_relay(md_path: pathlib.Path) -> None:
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def run_scripted_mutations() -> tuple[bool, str]:
+    """W1: Copy Package.swift + Sources + Tests to an isolated temp dir, run 5 targeted mutations, verify each fails its named test."""
+    mutations = [
+        (
+            "M1-claude-dedup",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            'dedupKey = "mr:\\(msgID)::\\(reqID)"',
+            'dedupKey = "line:\\(fileURL.path)::\\(lineIdx)"',
+            "AgentBarCoreTests.CollectorsTests/claudeStreamingDeduplication",
+            "Deduplicates multi-block streaming Claude JSONL lines",
+        ),
+        (
+            "M2-cache-hit-denom",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "let denom = inp + cr + cw",
+            "let denom = inp + cr",
+            "AgentBarCoreTests.CollectorsTests/cacheHitRateFormulaIncludesAllThreeDenominatorTerms",
+            "Cache hit ratio formula strictly divides cache_read",
+        ),
+        (
+            "M3-relay-heading-bleed",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "if line.hasPrefix(\"#\") {\n                flushStep()",
+            "if line.hasPrefix(\"#\") {",
+            "AgentBarCoreTests.RelayLogTests/parses126StepsWithZeroBleedAndStrictHeadingVendors",
+            "Parses all 126 realistic .relay/LOG.md steps",
+        ),
+        (
+            "M4-codex-missing-rollout-split",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "UsageSample(\n                        unsplitID: \"codex-\\(id)\",\n                        vendor: .codex,\n                        origin: .standalone,\n                        timestamp: ts,\n                        sessionID: id,\n                        projectName: proj,\n                        model: dbModel,\n                        rawTotalTokens: totalTok\n                    )",
+            "UsageSample(\n                        id: \"codex-\\(id)\",\n                        vendor: .codex,\n                        origin: .standalone,\n                        timestamp: ts,\n                        sessionID: id,\n                        projectName: proj,\n                        model: dbModel,\n                        inputTokens: totalTok / 2,\n                        outputTokens: totalTok - (totalTok / 2)\n                    )",
+            "AgentBarCoreTests.CollectorsTests/codexMissingRolloutReportsTotalOnlyAndNilBreakdown",
+            "Codex thread without rollout file reports totalOnly",
+        ),
+        (
+            "M5-codex-mismatch-ignored",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "let isMismatch = (rolloutTotal != totalTok)\n                    || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)",
+            "let isMismatch = false && (rolloutTotal != totalTok || breakdown.reportedTotalTokens != nil)",
+            "AgentBarCoreTests.CollectorsTests/codexRolloutTotalMismatchFlagsAndDowngradesCompleteness",
+            "Codex rollout total_token_usage mismatch against threads.tokens_used",
+        ),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m0-mutations-") as tmpdir:
+        mut_root = pathlib.Path(tmpdir) / "repo"
+        mut_root.mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "Package.swift", mut_root / "Package.swift")
+        shutil.copytree(REPO_ROOT / "Sources", mut_root / "Sources")
+        shutil.copytree(REPO_ROOT / "Tests", mut_root / "Tests")
+
+        details: list[str] = []
+        for label, rel_file, target, replacement, test_filter, test_display in mutations:
+            fpath = mut_root / rel_file
+            original = fpath.read_text(encoding="utf-8")
+            if target not in original:
+                return (False, f"{label}: target snippet not found in {rel_file}")
+            fpath.write_text(original.replace(target, replacement, 1), encoding="utf-8")
+            try:
+                proc = subprocess.run(
+                    ["swift", "test", "--no-parallel", "--filter", test_filter],
+                    cwd=str(mut_root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                compiled = "Build complete!" in combined
+                ran = "Test run started" in combined
+                named_failed = (test_display in combined) and ("✘ Test" in combined or "recorded an issue" in combined or "failed" in combined)
+                if proc.returncode == 0 or not compiled or not ran or not named_failed:
+                    return (
+                        False,
+                        f"{label} did not fail cleanly (rc={proc.returncode}, compiled={compiled}, ran={ran}, named_failed={named_failed})",
+                    )
+                details.append(f"{label}=RED(rc={proc.returncode})")
+            finally:
+                fpath.write_text(original, encoding="utf-8")
+
+        # Confirm clean restoration passes in the isolated workspace
+        clean_proc = subprocess.run(
+            [
+                "swift",
+                "test",
+                "--no-parallel",
+                "--filter",
+                "AgentBarCoreTests.CollectorsTests",
+                "--filter",
+                "AgentBarCoreTests.RelayLogTests",
+            ],
+            cwd=str(mut_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if clean_proc.returncode != 0:
+            return (False, f"restored workspace failed (rc={clean_proc.returncode})")
+        details.append("restored=GREEN(rc=0)")
+        return (True, ", ".join(details))
+
+
 def main() -> int:
     mtime_start = plist_mtime()
     bin_path = resolve_agentbar_bin()
@@ -401,70 +510,139 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Row 1: Claude Code 30d deduplicated tokens & recordCount (< 1% diff)
     # ------------------------------------------------------------------
-    claude_ref = independent_claude_30d(HOME_DIR / ".claude" / "projects", now_epoch)
-    claude_cli = snap_en["vendors"]["claude"]["windows"]["thirtyDays"]
-    cli_claude_tok = int(claude_cli["totalTokens"] or 0)
-    cli_claude_rec = int(claude_cli["recordCount"])
-    ref_claude_tok = claude_ref["total"]
-    ref_claude_rec = claude_ref["records"]
-    tok_rel_diff = 0.0 if ref_claude_tok == 0 else abs(cli_claude_tok - ref_claude_tok) / ref_claude_tok
-    rec_rel_diff = 0.0 if ref_claude_rec == 0 else abs(cli_claude_rec - ref_claude_rec) / ref_claude_rec
-    row1_ok = (
-        tok_rel_diff < 0.01
-        and rec_rel_diff < 0.01
-        and int(claude_cli["inputTokens"] or 0) == claude_ref["in"]
-        and int(claude_cli["outputTokens"] or 0) == claude_ref["out"]
-        and int(claude_cli["cacheReadTokens"] or 0) == claude_ref["cr"]
-        and int(claude_cli["cacheWriteTokens"] or 0) == claude_ref["cw"]
-    )
-    if not row1_ok:
-        failures.append("Row 1 (Claude 30d deduplication)")
-    print(
-        f"[Row 1] {'PASS' if row1_ok else 'FAIL'} | Claude 30d: "
-        f"raw_lines={claude_ref['raw_lines_30d']} -> dedup_records={cli_claude_rec} (ref={ref_claude_rec}, diff={rec_rel_diff:.4%}), "
-        f"totalTokens={cli_claude_tok:,} (ref={ref_claude_tok:,}, diff={tok_rel_diff:.4%}), "
-        f"in={claude_cli['inputTokens']:,}, out={claude_cli['outputTokens']:,}, "
-        f"cacheRead={claude_cli['cacheReadTokens']:,}, cacheWrite={claude_cli['cacheWriteTokens']:,}, "
-        f"hitRate={claude_cli['cacheHitRate']:.4f}, estCostUSD=${claude_cli['estimatedCostUSD']:.2f}, "
-        f"unmatchedModels={claude_cli['unknownModelRecordCount']}"
-    )
-
-    # ------------------------------------------------------------------
-    # Row 2: Codex rollout breakdown + missing-rollout totalOnly check
-    # ------------------------------------------------------------------
-    codex_ref = independent_codex_30d(HOME_DIR / ".codex" / "state_5.sqlite", now_epoch)
-    codex_cli = snap_en["vendors"]["codex"]["windows"]["thirtyDays"]
-    with_rollout_ok = (
-        codex_ref["missing_rollout"] == 0
-        and codex_cli["completeness"] == "complete"
-        and codex_cli["inputTokens"] == codex_ref["in"]
-        and codex_cli["cacheReadTokens"] == codex_ref["cr"]
-        and codex_cli["cacheWriteTokens"] == codex_ref["cw"]
-        and codex_cli["outputTokens"] == codex_ref["out"]
-        and codex_cli["totalTokens"] == codex_ref["total"]
-        and (codex_cli["cacheHitRate"] or 0.0) > 0.0
-    )
-
-    # Verify missing-rollout behavior in an isolated temp --home fixture (EN & ZH)
-    with tempfile.TemporaryDirectory(prefix="agentbar-m0-norollout-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="agentbar-m0-claude-") as tmpdir:
         thome = pathlib.Path(tmpdir) / "home"
         tws = pathlib.Path(tmpdir) / "ws"
-        (thome / ".codex").mkdir(parents=True)
+        cproj = thome / ".claude" / "projects" / "-tmp-synth"
+        cproj.mkdir(parents=True)
         tws.mkdir(parents=True)
-        tdb = thome / ".codex" / "state_5.sqlite"
-        conn = sqlite3.connect(str(tdb))
-        conn.execute(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)"
+        ts_iso = dt.datetime.fromtimestamp(now_epoch - 120, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (cproj / "s1.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": ts_iso,
+                            "sessionId": "s1",
+                            "requestId": "rq1",
+                            "message": {
+                                "id": "m1",
+                                "model": "claude-sonnet-5-5",
+                                "usage": {
+                                    "input_tokens": 1000,
+                                    "output_tokens": 120,
+                                    "cache_read_input_tokens": 4000,
+                                    "cache_creation_input_tokens": 500,
+                                },
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": ts_iso,
+                            "sessionId": "s1",
+                            "requestId": "rq1",
+                            "message": {
+                                "id": "m1",
+                                "model": "claude-sonnet-5-5",
+                                "usage": {
+                                    "input_tokens": 1000,
+                                    "output_tokens": 400,
+                                    "cache_read_input_tokens": 4000,
+                                    "cache_creation_input_tokens": 500,
+                                },
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        conn.execute(
-            "INSERT INTO threads VALUES ('th-missing', '/tmp/p', 420000, ?, 'gpt-6.1-sol', '/no/such/rollout.jsonl')",
-            (now_epoch - 60,),
+        synth_c_json = run_cli_json(bin_path, ["--lang", "en", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
+        synth_cw = synth_c_json["vendors"]["claude"]["windows"]["thirtyDays"]
+        synth_claude_ok = synth_cw["recordCount"] == 1 and synth_cw["totalTokens"] == 5900
+
+    claude_ref = independent_claude_30d(EFFECTIVE_HOME / ".claude" / "projects", now_epoch)
+    claude_cli = snap_en["vendors"]["claude"]["windows"]["thirtyDays"]
+    if claude_ref["records"] > 0:
+        cli_claude_tok = int(claude_cli["totalTokens"] or 0)
+        cli_claude_rec = int(claude_cli["recordCount"])
+        ref_claude_tok = claude_ref["total"]
+        ref_claude_rec = claude_ref["records"]
+        tok_rel_diff = abs(cli_claude_tok - ref_claude_tok) / ref_claude_tok
+        rec_rel_diff = abs(cli_claude_rec - ref_claude_rec) / ref_claude_rec
+        live_claude_ok = (
+            tok_rel_diff < 0.01
+            and rec_rel_diff < 0.01
+            and int(claude_cli["inputTokens"] or 0) == claude_ref["in"]
+            and int(claude_cli["outputTokens"] or 0) == claude_ref["out"]
+            and int(claude_cli["cacheReadTokens"] or 0) == claude_ref["cr"]
+            and int(claude_cli["cacheWriteTokens"] or 0) == claude_ref["cw"]
         )
+        row1_desc = (
+            f"live raw_lines={claude_ref['raw_lines_30d']} -> dedup_records={cli_claude_rec} (ref={ref_claude_rec}, diff={rec_rel_diff:.4%}), "
+            f"totalTokens={cli_claude_tok:,} (ref={ref_claude_tok:,}, diff={tok_rel_diff:.4%}), "
+            f"priced={claude_cli['pricedRecordCount']}, unmatchedModels={claude_cli['unmatchedModelCount']}; "
+            f"synthetic 2->1 dedup=5,900 tok"
+        )
+    else:
+        live_claude_ok = claude_cli["recordCount"] == 0 and claude_cli["completeness"] == "noData"
+        row1_desc = "empty HOME -> completeness=noData; synthetic 2->1 streaming dedup=5,900 tok verified"
+
+    row1_ok = synth_claude_ok and live_claude_ok
+    if not row1_ok:
+        failures.append("Row 1 (Claude 30d deduplication)")
+    print(f"[Row 1] {'PASS' if row1_ok else 'FAIL'} | Claude 30d: {row1_desc}")
+
+    # ------------------------------------------------------------------
+    # Row 2: Codex rollout breakdown + missing-rollout totalOnly + B15 mismatch
+    # ------------------------------------------------------------------
+    with tempfile.TemporaryDirectory(prefix="agentbar-m0-codex-") as tmpdir:
+        # 2a. Synthetic Codex WITH rollout
+        thome_ok = pathlib.Path(tmpdir) / "home_ok"
+        tws = pathlib.Path(tmpdir) / "ws"
+        (thome_ok / ".codex").mkdir(parents=True)
+        tws.mkdir(parents=True)
+        roll_ok = thome_ok / ".codex" / "rollout-ok.jsonl"
+        roll_ok.write_text(
+            "\n".join(
+                [
+                    '{"timestamp":"2026-11-14T01:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-14T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500000,"cached_input_tokens":480000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":505000}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        conn = sqlite3.connect(str(thome_ok / ".codex" / "state_5.sqlite"))
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        conn.execute("INSERT INTO threads VALUES ('th-ok', '/tmp/p', 505000, ?, 'gpt-6.1-sol', ?)", (now_epoch - 60, str(roll_ok)))
         conn.commit()
         conn.close()
+        ok_en = run_cli_json(bin_path, ["--lang", "en", "--home", str(thome_ok), "--workspace", str(tws), "--now", str(now_epoch)])
+        cw_ok = ok_en["vendors"]["codex"]["windows"]["thirtyDays"]
+        synth_with_rollout_ok = (
+            cw_ok["completeness"] == "complete"
+            and cw_ok["inputTokens"] == 20000
+            and cw_ok["cacheReadTokens"] == 480000
+            and cw_ok["outputTokens"] == 5000
+            and cw_ok["totalTokens"] == 505000
+            and (cw_ok["cacheHitRate"] or 0.0) > 0.0
+        )
 
-        no_roll_en = run_cli_json(bin_path, ["--lang", "en", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
-        no_roll_zh = run_cli_json(bin_path, ["--lang", "zh", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
+        # 2b. Synthetic Codex WITHOUT rollout -> totalOnly + null breakdown/cost
+        thome_no = pathlib.Path(tmpdir) / "home_no"
+        (thome_no / ".codex").mkdir(parents=True)
+        conn = sqlite3.connect(str(thome_no / ".codex" / "state_5.sqlite"))
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        conn.execute("INSERT INTO threads VALUES ('th-missing', '/tmp/p', 420000, ?, 'gpt-6.1-sol', '/no/such/rollout.jsonl')", (now_epoch - 60,))
+        conn.commit()
+        conn.close()
+        no_roll_en = run_cli_json(bin_path, ["--lang", "en", "--home", str(thome_no), "--workspace", str(tws), "--now", str(now_epoch)])
+        no_roll_zh = run_cli_json(bin_path, ["--lang", "zh", "--home", str(thome_no), "--workspace", str(tws), "--now", str(now_epoch)])
         cw_en = no_roll_en["vendors"]["codex"]["windows"]["thirtyDays"]
         cw_zh = no_roll_zh["vendors"]["codex"]["windows"]["thirtyDays"]
         without_rollout_ok = (
@@ -480,15 +658,59 @@ def main() -> int:
             and cw_en["cacheHitRate"] is None
         )
 
-    row2_ok = with_rollout_ok and without_rollout_ok
+        # 2c. Synthetic B15 mismatch (sqlite=50000 vs rollout=12000) -> completeness != complete
+        thome_mis = pathlib.Path(tmpdir) / "home_mis"
+        (thome_mis / ".codex").mkdir(parents=True)
+        roll_mis = thome_mis / ".codex" / "rollout-mis.jsonl"
+        roll_mis.write_text(
+            '{"timestamp":"2026-11-14T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}\n',
+            encoding="utf-8",
+        )
+        conn = sqlite3.connect(str(thome_mis / ".codex" / "state_5.sqlite"))
+        conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        conn.execute("INSERT INTO threads VALUES ('th-mis', '/tmp/p', 50000, ?, 'gpt-6.1-sol', ?)", (now_epoch - 60, str(roll_mis)))
+        conn.commit()
+        conn.close()
+        mis_zh = run_cli_json(bin_path, ["--lang", "zh", "--home", str(thome_mis), "--workspace", str(tws), "--now", str(now_epoch)])
+        cw_mis = mis_zh["vendors"]["codex"]["windows"]["thirtyDays"]
+        mismatch_ok = (
+            cw_mis["completeness"] == "mismatch"
+            and cw_mis["completeness"] != "complete"
+            and cw_mis["completenessLabel"] == "总量不一致"
+            and cw_mis["hasRolloutMismatch"] is True
+            and "rollout=12000 vs sqlite=50000" in (cw_mis["mismatchNote"] or "")
+        )
+
+    codex_ref = independent_codex_30d(EFFECTIVE_HOME / ".codex" / "state_5.sqlite", now_epoch)
+    codex_cli = snap_en["vendors"]["codex"]["windows"]["thirtyDays"]
+    if codex_ref["records"] > 0 and codex_ref["missing_rollout"] == 0 and codex_ref["mismatches"] == 0:
+        live_codex_ok = (
+            codex_cli["completeness"] == "complete"
+            and codex_cli["inputTokens"] == codex_ref["in"]
+            and codex_cli["cacheReadTokens"] == codex_ref["cr"]
+            and codex_cli["cacheWriteTokens"] == codex_ref["cw"]
+            and codex_cli["outputTokens"] == codex_ref["out"]
+            and codex_cli["totalTokens"] == codex_ref["total"]
+            and (codex_cli["cacheHitRate"] or 0.0) > 0.0
+        )
+        row2_live_desc = (
+            f"live {codex_ref['records']} rollouts: in={codex_cli['inputTokens']:,}, "
+            f"cacheRead={codex_cli['cacheReadTokens']:,}, out={codex_cli['outputTokens']:,}, "
+            f"hitRate={codex_cli['cacheHitRate']:.4f}; "
+        )
+    elif codex_ref["records"] == 0:
+        live_codex_ok = codex_cli["completeness"] == "noData"
+        row2_live_desc = "empty HOME -> noData; "
+    else:
+        live_codex_ok = codex_cli["totalTokens"] == codex_ref["total"]
+        row2_live_desc = f"live {codex_ref['records']} threads (missing={codex_ref['missing_rollout']}, mis={codex_ref['mismatches']}); "
+
+    row2_ok = synth_with_rollout_ok and without_rollout_ok and mismatch_ok and live_codex_ok
     if not row2_ok:
-        failures.append("Row 2 (Codex rollout breakdown & missing-rollout totalOnly)")
+        failures.append("Row 2 (Codex rollout breakdown, missing-rollout totalOnly & B15 mismatch)")
     print(
-        f"[Row 2] {'PASS' if row2_ok else 'FAIL'} | Codex 30d (live {codex_ref['records']}/{codex_ref['records']} rollouts): "
-        f"in={codex_cli['inputTokens']:,}, cacheRead={codex_cli['cacheReadTokens']:,}, "
-        f"out={codex_cli['outputTokens']:,}, total={codex_cli['totalTokens']:,}, "
-        f"hitRate={codex_cli['cacheHitRate']:.4f}, estCostUSD=${codex_cli['estimatedCostUSD']:.2f}; "
-        f"missing-rollout fixture -> completeness=totalOnly ('Total only'/'只有总量'), breakdown=null, cost=null"
+        f"[Row 2] {'PASS' if row2_ok else 'FAIL'} | Codex 30d: {row2_live_desc}"
+        f"synth rollout=complete(hitRate=0.9600), missing-rollout=totalOnly(nulls), mismatch(12000!=50000)=mismatch('总量不一致')"
     )
 
     # ------------------------------------------------------------------
@@ -516,7 +738,7 @@ def main() -> int:
                     synth_ok = False
                     break
 
-    live_relay_md = HOME_DIR / "Projects" / "rea-lol" / ".relay" / "LOG.md"
+    live_relay_md = EFFECTIVE_HOME / "Projects" / "rea-lol" / ".relay" / "LOG.md"
     live_relay_ok = True
     live_relay_desc = "synthetic 126/126 verified"
     if live_relay_md.is_file():
@@ -551,56 +773,117 @@ def main() -> int:
     print(f"[Row 3] {'PASS' if row3_ok else 'FAIL'} | .relay/LOG.md: {live_relay_desc}")
 
     # ------------------------------------------------------------------
-    # Row 4: rg '0\.85|0\.15' in Sources/ == 0 matches
+    # Row 4: Zero 0.85/0.15 in collector/pricing/CLI code; mistralVibe UI color == 0.85 (W4)
     # ------------------------------------------------------------------
-    ratio_re = re.compile(r"0\.(?:85|15)")
+    ratio_re = re.compile(r"\b0\.(?:85|15)\b")
     ratio_hits: list[str] = []
-    for swift_file in sorted((REPO_ROOT / "Sources").rglob("*.swift")):
-        txt = swift_file.read_text(encoding="utf-8")
-        if ratio_re.search(txt):
-            ratio_hits.append(str(swift_file.relative_to(REPO_ROOT)))
-    row4_ok = len(ratio_hits) == 0
+    for sub in ("Sources/AgentBarCore/Collectors", "Sources/AgentBarCore/CLI"):
+        for swift_file in sorted((REPO_ROOT / sub).rglob("*.swift")):
+            if ratio_re.search(swift_file.read_text(encoding="utf-8")):
+                ratio_hits.append(str(swift_file.relative_to(REPO_ROOT)))
+
+    models_path = REPO_ROOT / "Sources" / "AgentBarCore" / "Models" / "TelemetryModels.swift"
+    models_txt = models_path.read_text(encoding="utf-8")
+    for lineno, line in enumerate(models_txt.splitlines(), start=1):
+        if "Color(red:" in line:
+            continue
+        if ratio_re.search(line):
+            ratio_hits.append(f"Sources/AgentBarCore/Models/TelemetryModels.swift:{lineno}")
+
+    dodge_hits = [
+        str(p.relative_to(REPO_ROOT))
+        for p in sorted((REPO_ROOT / "Sources").rglob("*.swift"))
+        if "0.848" in p.read_text(encoding="utf-8")
+    ]
+    ui_color_ok = "Color(red: 0.85, green: 0.64, blue: 0.25)" in models_txt and len(dodge_hits) == 0
+    row4_ok = len(ratio_hits) == 0 and ui_color_ok
     if not row4_ok:
-        failures.append(f"Row 4 (found 0.85/0.15 in {ratio_hits})")
-    print(f"[Row 4] {'PASS' if row4_ok else 'FAIL'} | Sources/ scan for 0.85|0.15: {len(ratio_hits)} matches")
-
-    # ------------------------------------------------------------------
-    # Row 5: Unit tests for Claude streaming dedup & cache hit denominator
-    # ------------------------------------------------------------------
-    collectors_test_file = (REPO_ROOT / "Tests" / "AgentBarCoreTests" / "CollectorsTests.swift").read_text(encoding="utf-8")
-    has_both_tests = (
-        "func claudeStreamingDeduplication()" in collectors_test_file
-        and "func cacheHitRateFormulaIncludesAllThreeDenominatorTerms()" in collectors_test_file
-    )
-    scoped_run = subprocess.run(
-        ["bash", str(REPO_ROOT / "Scripts" / "test.sh"), "scope", "Collectors"],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    row5_ok = has_both_tests and scoped_run.returncode == 0
-    if not row5_ok:
-        failures.append("Row 5 (Collectors unit tests)")
+        failures.append(f"Row 4 (ratio_hits={ratio_hits}, dodge_hits={dodge_hits}, ui_color_ok={ui_color_ok})")
     print(
-        f"[Row 5] {'PASS' if row5_ok else 'FAIL'} | Scoped Collectors tests exit={scoped_run.returncode} "
-        f"(claudeStreamingDeduplication + cacheHitRateFormulaIncludesAllThreeDenominatorTerms present)"
+        f"[Row 4] {'PASS' if row4_ok else 'FAIL'} | Collector/pricing scan for 0.85|0.15: {len(ratio_hits)} matches; "
+        f"mistralVibe UI color=0.85 (0.848 hits={len(dodge_hits)})"
     )
 
     # ------------------------------------------------------------------
-    # Row 6: Vibe & Antigravity completeness != "complete" in EN & ZH (+ OpenCode parity)
+    # Row 5: Scripted mutations in isolated temp workspace (W1)
+    # ------------------------------------------------------------------
+    mut_ok, mut_summary = run_scripted_mutations()
+    if not mut_ok:
+        failures.append(f"Row 5 ({mut_summary})")
+    print(f"[Row 5] {'PASS' if mut_ok else 'FAIL'} | Scripted isolated mutations: {mut_summary}")
+
+    # ------------------------------------------------------------------
+    # Row 6: Vibe & Antigravity completeness != "complete" + B11-B16 + OpenCode parity
     # ------------------------------------------------------------------
     vibe_en = snap_en["vendors"]["vibe"]
     agy_en = snap_en["vendors"]["agy"]
     vibe_zh = snap_zh["vendors"]["vibe"]
     agy_zh = snap_zh["vendors"]["agy"]
-    oc_ref = independent_opencode_30d(HOME_DIR / ".local" / "share" / "opencode" / "opencode.db", now_epoch)
+    oc_ref = independent_opencode_30d(EFFECTIVE_HOME / ".local" / "share" / "opencode" / "opencode.db", now_epoch)
     oc_cli = snap_en["vendors"]["opencode"]["windows"]["thirtyDays"]
-    oc_ok = (
-        oc_cli["recordCount"] == oc_ref["records"]
-        and int(oc_cli["totalTokens"] or 0) == oc_ref["total"]
+    oc_ok = oc_cli["recordCount"] == oc_ref["records"] and int(oc_cli["totalTokens"] or 0) == oc_ref["total"]
+
+    # B11 check: zero "never read" / "绝不读取" across README.md, README.zh-CN.md, Sources/, docs/
+    b11_re = re.compile(r"never read|绝不读取", re.IGNORECASE)
+    b11_hits: list[str] = []
+    for rel_target in ("README.md", "README.zh-CN.md", "Sources", "docs"):
+        target_p = REPO_ROOT / rel_target
+        files = [target_p] if target_p.is_file() else sorted(target_p.rglob("*"))
+        for fp in files:
+            if fp.is_file() and fp.suffix in {".md", ".swift"}:
+                if b11_re.search(fp.read_text(encoding="utf-8")):
+                    b11_hits.append(str(fp.relative_to(REPO_ROOT)))
+
+    # B13 check: localized Chinese dataSource strings
+    b13_ok = (
+        "meta.json 无 Token 统计" in vibe_zh["dataSource"]
+        and "cli-*.log 无 Token 统计" in agy_zh["dataSource"]
+        and "lacks token stats" not in vibe_zh["dataSource"]
+        and "lacks token stats" not in agy_zh["dataSource"]
     )
+
+    # B14 check: 1 priced + 2 unknown-model records -> explicit costNote beside dollar figure
+    with tempfile.TemporaryDirectory(prefix="agentbar-m0-b14-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        cdir = thome / ".claude" / "projects" / "-tmp-b14"
+        cdir.mkdir(parents=True)
+        tws.mkdir(parents=True)
+        ts_iso = dt.datetime.fromtimestamp(now_epoch - 60, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        (cdir / "mix.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "assistant", "timestamp": ts_iso, "sessionId": "s", "requestId": "r1", "message": {"id": "m1", "model": "claude-sonnet-5-5", "usage": {"input_tokens": 1000000, "output_tokens": 100000}}}),
+                    json.dumps({"type": "assistant", "timestamp": ts_iso, "sessionId": "s", "requestId": "r2", "message": {"id": "m2", "model": "claude-fable-5-1", "usage": {"input_tokens": 50000, "output_tokens": 5000}}}),
+                    json.dumps({"type": "assistant", "timestamp": ts_iso, "sessionId": "s", "requestId": "r3", "message": {"id": "m3", "model": "custom-local-llm", "usage": {"input_tokens": 50000, "output_tokens": 5000}}}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        b14_zh = subprocess.run(
+            [str(bin_path), "--cli", "snapshot", "--lang", "zh", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        b14_en = subprocess.run(
+            [str(bin_path), "--cli", "snapshot", "--lang", "en", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        b14_ok = (
+            b14_zh.returncode == 0
+            and "$4.50（只含已计价的 1 条，另有 2 条未知型号未计入）" in b14_zh.stdout
+            and b14_en.returncode == 0
+            and "$4.50 (Covers 1 priced records only; 2 unknown-model records excluded)" in b14_en.stdout
+        )
+
+    # B16 check: explicit nonexistent --home exits 2 with stderr
     bad_sub = subprocess.run([str(bin_path), "--cli", "invalid-subcmd"], capture_output=True, text=True, check=False)
+    bad_home = subprocess.run([str(bin_path), "--cli", "snapshot", "--home", "/nonexistent_agentbar_m0_check"], capture_output=True, text=True, check=False)
+    b16_ok = bad_sub.returncode == 2 and bad_home.returncode == 2 and bool(bad_home.stderr.strip())
 
     row6_ok = (
         vibe_en["completeness"] != "complete"
@@ -611,19 +894,24 @@ def main() -> int:
         and agy_en["completenessLabel"] != "Complete"
         and vibe_zh["completenessLabel"] != "完整"
         and agy_zh["completenessLabel"] != "完整"
-        and snap_en["costDisclaimer"] == "API-equivalent estimate (pricing 2026-11)"
-        and snap_zh["costDisclaimer"] == "按 API 价折算（价格表 2026-11）"
+        and snap_en["pricingVersion"] == "unverified"
+        and snap_en["costDisclaimer"] == "API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)"
+        and snap_zh["costDisclaimer"] == "按 API 价折算（单价未核对；只含已计价记录，未知型号未计入）"
+        and len(b11_hits) == 0
+        and b13_ok
+        and b14_ok
+        and b16_ok
         and oc_ok
-        and bad_sub.returncode == 2
     )
     if not row6_ok:
-        failures.append("Row 6 (Vibe/AGY completeness & bilingual disclaimers)")
+        failures.append("Row 6 (Vibe/AGY completeness, B11-B16 & OpenCode parity)")
+    oc_tok_disp = f"{oc_cli['totalTokens']:,}" if oc_cli["totalTokens"] is not None else "null"
     print(
         f"[Row 6] {'PASS' if row6_ok else 'FAIL'} | "
         f"vibe={vibe_en['completeness']} ('{vibe_en['completenessLabel']}'/'{vibe_zh['completenessLabel']}'), "
         f"agy={agy_en['completeness']} ('{agy_en['completenessLabel']}'/'{agy_zh['completenessLabel']}'), "
-        f"opencode_30d_tokens={oc_cli['totalTokens']:,} (records={oc_cli['recordCount']}), "
-        f"invalid_subcmd_exit={bad_sub.returncode}"
+        f"pricingVersion={snap_en['pricingVersion']}, b11_hits={len(b11_hits)}, b13_zh_source=ok, b14_note=ok, "
+        f"b16_bad_home_exit={bad_home.returncode}, opencode_30d_tokens={oc_tok_disp} (records={oc_cli['recordCount']})"
     )
 
     mtime_end = plist_mtime()
@@ -634,7 +922,7 @@ def main() -> int:
     if failures:
         print(f"RESULT: FAILED ({len(failures)} check(s): {', '.join(failures)})")
         return 1
-    print("RESULT: ALL 6 M0 ACCEPTANCE ROWS PASSED (EN + zh-Hans, read-only verified).")
+    print("RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B16 + W1/W4 PASSED (read-only verified).")
     return 0
 
 

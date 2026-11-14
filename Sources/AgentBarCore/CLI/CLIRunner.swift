@@ -19,12 +19,18 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
     public let cacheWriteTokens: Int?
     public let totalTokens: Int?
     public let recordCount: Int
+    public let pricedRecordCount: Int
     public let estimatedCostUSD: Double?
     public let unknownModelRecordCount: Int
+    public let unmatchedModelCount: Int
+    public let costNote: String?
     public let cacheHitRate: Double?
     public let dataSource: String
     public let completeness: String
     public let completenessLabel: String
+    public let hasRolloutMismatch: Bool
+    public let rolloutMismatchCount: Int
+    public let mismatchNote: String?
 
     enum CodingKeys: String, CodingKey {
         case inputTokens
@@ -33,27 +39,39 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         case cacheWriteTokens
         case totalTokens
         case recordCount
+        case pricedRecordCount
         case estimatedCostUSD
         case unknownModelRecordCount
+        case unmatchedModelCount
+        case costNote
         case cacheHitRate
         case dataSource
         case completeness
         case completenessLabel
+        case hasRolloutMismatch
+        case rolloutMismatchCount
+        case mismatchNote
     }
 
-    public init(metrics: VendorWindowMetrics, language: AppLanguage) {
+    public init(metrics: VendorWindowMetrics, vendor: AgentVendor, language: AppLanguage) {
         self.inputTokens = metrics.inputTokens
         self.outputTokens = metrics.outputTokens
         self.cacheReadTokens = metrics.cacheReadTokens
         self.cacheWriteTokens = metrics.cacheWriteTokens
         self.totalTokens = metrics.totalTokens
         self.recordCount = metrics.recordCount
+        self.pricedRecordCount = metrics.pricedRecordCount
         self.estimatedCostUSD = metrics.estimatedCostUSD
         self.unknownModelRecordCount = metrics.unknownModelRecordCount
+        self.unmatchedModelCount = metrics.unknownModelRecordCount
+        self.costNote = metrics.costNote(in: language)
         self.cacheHitRate = metrics.cacheHitRate
-        self.dataSource = metrics.dataSource
+        self.dataSource = LocalTelemetryCollector.defaultDataSourceDescription(for: vendor, language: language)
         self.completeness = metrics.completeness.rawValue
         self.completenessLabel = metrics.completeness.label(in: language)
+        self.hasRolloutMismatch = metrics.hasRolloutMismatch
+        self.rolloutMismatchCount = metrics.rolloutMismatchCount
+        self.mismatchNote = metrics.mismatchNote(in: language)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -64,12 +82,18 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         try encodeOptional(cacheWriteTokens, forKey: .cacheWriteTokens, in: &c)
         try encodeOptional(totalTokens, forKey: .totalTokens, in: &c)
         try c.encode(recordCount, forKey: .recordCount)
+        try c.encode(pricedRecordCount, forKey: .pricedRecordCount)
         try encodeOptional(estimatedCostUSD, forKey: .estimatedCostUSD, in: &c)
         try c.encode(unknownModelRecordCount, forKey: .unknownModelRecordCount)
+        try c.encode(unmatchedModelCount, forKey: .unmatchedModelCount)
+        try encodeOptional(costNote, forKey: .costNote, in: &c)
         try encodeOptional(cacheHitRate, forKey: .cacheHitRate, in: &c)
         try c.encode(dataSource, forKey: .dataSource)
         try c.encode(completeness, forKey: .completeness)
         try c.encode(completenessLabel, forKey: .completenessLabel)
+        try c.encode(hasRolloutMismatch, forKey: .hasRolloutMismatch)
+        try c.encode(rolloutMismatchCount, forKey: .rolloutMismatchCount)
+        try encodeOptional(mismatchNote, forKey: .mismatchNote, in: &c)
     }
 }
 
@@ -81,7 +105,12 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
     public let completenessLabel: String
     public let activeModel: String?
     public let sessionCount30d: Int
+    public let pricedRecordCount30d: Int
     public let unknownModelRecordCount30d: Int
+    public let unmatchedModelCount30d: Int
+    public let costNote30d: String?
+    public let hasRolloutMismatch30d: Bool
+    public let mismatchNote30d: String?
     public let rateLimitHits24h: Int
     public let windows: [String: CLIWindowPayload]
 
@@ -93,25 +122,36 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         case completenessLabel
         case activeModel
         case sessionCount30d
+        case pricedRecordCount30d
         case unknownModelRecordCount30d
+        case unmatchedModelCount30d
+        case costNote30d
+        case hasRolloutMismatch30d
+        case mismatchNote30d
         case rateLimitHits24h
         case windows
     }
 
     public init(summary: VendorSummary, language: AppLanguage) {
+        let w30 = summary.metrics(for: .thirtyDays)
         self.vendor = summary.vendor.rawValue
         self.displayName = summary.vendor.displayName
-        self.dataSource = summary.dataSource
+        self.dataSource = LocalTelemetryCollector.defaultDataSourceDescription(for: summary.vendor, language: language)
         self.completeness = summary.completeness.rawValue
         self.completenessLabel = summary.completeness.label(in: language)
         self.activeModel = (summary.activeModel.isEmpty || summary.activeModel == "—") ? nil : summary.activeModel
         self.sessionCount30d = summary.sessionCount30d
+        self.pricedRecordCount30d = w30.pricedRecordCount
         self.unknownModelRecordCount30d = summary.unknownModelRecordCount30d
+        self.unmatchedModelCount30d = summary.unknownModelRecordCount30d
+        self.costNote30d = w30.costNote(in: language)
+        self.hasRolloutMismatch30d = w30.hasRolloutMismatch
+        self.mismatchNote30d = w30.mismatchNote(in: language)
         self.rateLimitHits24h = summary.rateLimitHits24h
 
         var winMap: [String: CLIWindowPayload] = [:]
         for w in TelemetryWindow.allCases {
-            winMap[w.rawValue] = CLIWindowPayload(metrics: summary.metrics(for: w), language: language)
+            winMap[w.rawValue] = CLIWindowPayload(metrics: summary.metrics(for: w), vendor: summary.vendor, language: language)
         }
         self.windows = winMap
     }
@@ -125,7 +165,12 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         try c.encode(completenessLabel, forKey: .completenessLabel)
         try encodeOptional(activeModel, forKey: .activeModel, in: &c)
         try c.encode(sessionCount30d, forKey: .sessionCount30d)
+        try c.encode(pricedRecordCount30d, forKey: .pricedRecordCount30d)
         try c.encode(unknownModelRecordCount30d, forKey: .unknownModelRecordCount30d)
+        try c.encode(unmatchedModelCount30d, forKey: .unmatchedModelCount30d)
+        try encodeOptional(costNote30d, forKey: .costNote30d, in: &c)
+        try c.encode(hasRolloutMismatch30d, forKey: .hasRolloutMismatch30d)
+        try encodeOptional(mismatchNote30d, forKey: .mismatchNote30d, in: &c)
         try c.encode(rateLimitHits24h, forKey: .rateLimitHits24h)
         try c.encode(windows, forKey: .windows)
     }
@@ -414,7 +459,26 @@ public enum CLIRunner {
         if useDemo {
             snapshot = DemoSnapshotFactory.makePreviewSnapshot()
         } else {
-            let homeURL = homeOverride ?? FileManager.default.homeDirectoryForCurrentUser
+            let fm = FileManager.default
+            if let explicitHome = homeOverride {
+                var isDir: ObjCBool = false
+                if !fm.fileExists(atPath: explicitHome.path, isDirectory: &isDir) || !isDir.boolValue {
+                    let msg = language == .zhHans
+                        ? "错误：--home 指定的目录不存在或不是目录：'\(explicitHome.path)'。\n"
+                        : "Error: --home directory does not exist or is not a directory: '\(explicitHome.path)'.\n"
+                    return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg)
+                }
+            }
+            if let explicitWorkspace = workspaceOverride {
+                var isDir: ObjCBool = false
+                if !fm.fileExists(atPath: explicitWorkspace.path, isDirectory: &isDir) || !isDir.boolValue {
+                    let msg = language == .zhHans
+                        ? "错误：--workspace 指定的目录不存在或不是目录：'\(explicitWorkspace.path)'。\n"
+                        : "Error: --workspace directory does not exist or is not a directory: '\(explicitWorkspace.path)'.\n"
+                    return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg)
+                }
+            }
+            let homeURL = homeOverride ?? CollectorPaths.resolveDefaultHomeDirectory()
             let paths = CollectorPaths.liveDefault(home: homeURL, workspaceRoot: workspaceOverride)
             let evalNow = nowOverride ?? Date()
             snapshot = LocalTelemetryCollector.collectSnapshot(
@@ -482,26 +546,39 @@ public enum CLIRunner {
 
         for item in snapshot.vendorSummaries {
             let compLabel = item.completeness.label(in: language)
+            let localizedSource = LocalTelemetryCollector.defaultDataSourceDescription(for: item.vendor, language: language)
             let wToday = item.metrics(for: .today)
             let w30 = item.metrics(for: .thirtyDays)
 
             let todayTokStr = TelemetryFormatter.optionalTokens(wToday.totalTokens, completeness: wToday.completeness, language: language)
-            let todayCostStr = TelemetryFormatter.optionalUSD(wToday.estimatedCostUSD, completeness: wToday.completeness, language: language)
+            let todayCostBase = TelemetryFormatter.optionalUSD(wToday.estimatedCostUSD, completeness: wToday.completeness, language: language)
+            let todayCostStr: String = {
+                if let note = wToday.costNote(in: language), wToday.estimatedCostUSD != nil {
+                    return isZH ? "\(todayCostBase)（\(note)）" : "\(todayCostBase) (\(note))"
+                }
+                return todayCostBase
+            }()
             let tok30Str = TelemetryFormatter.optionalTokens(w30.totalTokens, completeness: w30.completeness, language: language)
-            let cost30Str = TelemetryFormatter.optionalUSD(w30.estimatedCostUSD, completeness: w30.completeness, language: language)
+            let cost30Base = TelemetryFormatter.optionalUSD(w30.estimatedCostUSD, completeness: w30.completeness, language: language)
+            let cost30Str: String = {
+                if let note = w30.costNote(in: language) {
+                    return isZH ? "\(cost30Base)（\(note)）" : "\(cost30Base) (\(note))"
+                }
+                return cost30Base
+            }()
             let hit30Str = TelemetryFormatter.optionalPercent(w30.cacheHitRate, completeness: w30.completeness, language: language)
 
-            lines.append("[\(item.vendor.displayName)] (\(compLabel)) — \(item.dataSource)")
+            lines.append("[\(item.vendor.displayName)] (\(compLabel)) — \(localizedSource)")
             if isZH {
                 var row = "  今天: Token \(todayTokStr), 折算 \(todayCostStr) | 30天: Token \(tok30Str), 折算 \(cost30Str), 缓存命中率 \(hit30Str), 记录数 \(w30.recordCount)"
-                if w30.unknownModelRecordCount > 0 {
-                    row += ", 未匹配模型记录 \(w30.unknownModelRecordCount) 条"
+                if let mis = w30.mismatchNote(in: language) {
+                    row += ", \(mis)"
                 }
                 lines.append(row)
             } else {
                 var row = "  Today: tokens \(todayTokStr), cost \(todayCostStr) | 30d: tokens \(tok30Str), cost \(cost30Str), cache hit \(hit30Str), records \(w30.recordCount)"
-                if w30.unknownModelRecordCount > 0 {
-                    row += ", unmatched-model records \(w30.unknownModelRecordCount)"
+                if let mis = w30.mismatchNote(in: language) {
+                    row += ", \(mis)"
                 }
                 lines.append(row)
             }

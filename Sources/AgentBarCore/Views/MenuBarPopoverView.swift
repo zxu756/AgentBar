@@ -73,9 +73,10 @@ public struct MenuBarPopoverView: View {
             }
 
             Text(PriceCatalog.costDisclaimer(in: lang))
-                .font(.system(size: 10.5, design: .monospaced))
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(alignment: .bottom) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -132,6 +133,13 @@ public struct MenuBarPopoverView: View {
                             .fixedSize(horizontal: true, vertical: false)
                     }
                 }
+            }
+
+            if !pending && !noAnyData, let todayNote = snap.todayCostNote(in: lang) {
+                Text(todayNote)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(AgentBarPalette.muted)
+                    .lineLimit(1)
             }
         }
     }
@@ -288,7 +296,7 @@ public struct MenuBarPopoverView: View {
 
             Spacer()
 
-            Text(localizer.L("Pricing \(PriceCatalog.pricingVersion)", "价格表 \(PriceCatalog.pricingVersion)"))
+            Text(localizer.L("Rates: \(PriceCatalog.localizedPricingVersion(in: .en))", "单价：\(PriceCatalog.localizedPricingVersion(in: .zhHans))"))
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
                 .fixedSize(horizontal: true, vertical: false)

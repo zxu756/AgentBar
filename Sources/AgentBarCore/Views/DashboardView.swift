@@ -69,7 +69,7 @@ public struct DashboardView: View {
                     Rectangle().fill(AgentBarPalette.rule).frame(height: 1)
                     relayInspectorSection
                 }
-                .frame(width: 356, alignment: .topLeading)
+                .frame(width: 388, alignment: .topLeading)
             }
             .padding(.top, 18)
         }
@@ -108,16 +108,19 @@ public struct DashboardView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                                 .fixedSize(horizontal: true, vertical: false)
                         }
-                        Text(PriceCatalog.costDisclaimer(in: lang))
+                        Text(localizer.L(
+                            "API-eq · rates \(PriceCatalog.localizedPricingVersion(in: .en))",
+                            "按 API 价折算 · 单价\(PriceCatalog.localizedPricingVersion(in: .zhHans))"
+                        ))
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundStyle(AgentBarPalette.muted)
                             .fixedSize(horizontal: true, vertical: false)
                     }
                     Text(localizer.L(
-                        "Read-only local telemetry · M0 session timestamps use last-updated for Codex/OpenCode",
-                        "本地只读遥测 · M0 阶段 Codex/OpenCode 按会话最后更新时间归桶"
+                        "Read-only local telemetry · priced records only (unknown models excluded) · M0 session last-updated",
+                        "本地只读遥测 · 费用只含已计价记录（未知型号未计入）· M0 阶段 Codex/OpenCode 按会话最后更新时间归桶"
                     ))
-                    .font(.system(size: 11))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(AgentBarPalette.muted)
                     .lineLimit(1)
                 }
@@ -210,11 +213,8 @@ public struct DashboardView: View {
             if initialPending {
                 return localizer.L("Scanning local stores…", "正在扫描本地记录…")
             }
-            if snap.unknownModelRecordCount30d > 0 {
-                return localizer.L(
-                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) tok · \(snap.unknownModelRecordCount30d) unpriced",
-                    "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token · \(snap.unknownModelRecordCount30d) 条未匹配价格"
-                )
+            if let note30 = snap.thirtyDayCostNote(in: lang) {
+                return note30
             }
             return localizer.L(
                 "\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) known tokens",
@@ -222,19 +222,27 @@ public struct DashboardView: View {
             )
         }()
 
+        let todayDetail: String = {
+            if initialPending {
+                return localizer.L("Today window", "今日窗口")
+            }
+            if let noteToday = snap.todayCostNote(in: lang) {
+                return noteToday
+            }
+            return localizer.L(
+                "Today · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tok",
+                "今日 · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
+            )
+        }()
+
         return HStack(alignment: .top, spacing: 0) {
             statCell(
                 value: todayVal,
                 label: localizer.L(
-                    "Today API-eq (\(PriceCatalog.pricingVersion))",
-                    "今日按 API 价折算（\(PriceCatalog.pricingVersion)）"
+                    "Today API-eq (rates \(PriceCatalog.localizedPricingVersion(in: .en)))",
+                    "今日按 API 价折算（单价\(PriceCatalog.localizedPricingVersion(in: .zhHans))）"
                 ),
-                detail: initialPending
-                    ? localizer.L("Today window", "今日窗口")
-                    : localizer.L(
-                        "Today · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) tok",
-                        "今日 · \(TelemetryFormatter.compactTokens(snap.todayTotalTokens)) Token"
-                    ),
+                detail: todayDetail,
                 highlight: true
             )
             verticalHairline
@@ -249,7 +257,10 @@ public struct DashboardView: View {
             verticalHairline
             statCell(
                 value: thirtyVal,
-                label: localizer.L("30-day API-eq estimate", "30 天按 API 价折算"),
+                label: localizer.L(
+                    "30-day API-eq (\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) tok)",
+                    "30 天按 API 价折算（\(TelemetryFormatter.compactTokens(snap.thirtyDayTotalTokens)) Token）"
+                ),
                 detail: thirtyDetail
             )
             verticalHairline
@@ -291,9 +302,10 @@ public struct DashboardView: View {
                 .foregroundStyle(AgentBarPalette.ink.opacity(0.88))
                 .lineLimit(1)
             Text(detail)
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(AgentBarPalette.muted)
-                .lineLimit(1)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -381,7 +393,7 @@ public struct DashboardView: View {
                     .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)
-                Text(localizer.L("metadata only, zero prompts read", "仅读取元数据 · 零提示词采集"))
+                Text(localizer.L("parsed in memory · prompts never stored or shown", "读入内存解析计数 · 不保存不显示正文"))
                     .font(.system(size: 11))
                     .foregroundStyle(AgentBarPalette.muted)
                 Spacer()
@@ -414,7 +426,7 @@ public struct DashboardView: View {
                         }
                         let sessCompleteness: DataCompleteness = sess.origin == .relayLog
                             ? .relayOnly
-                            : (sess.hasTokenBreakdown ? .complete : .totalOnly)
+                            : (sess.hasRolloutMismatch ? .mismatch : (sess.hasTokenBreakdown ? .complete : .totalOnly))
                         HStack(spacing: 9) {
                             RoundedRectangle(cornerRadius: 2)
                                 .fill(sess.vendor.color)
@@ -497,12 +509,7 @@ public struct DashboardView: View {
                                 .fixedSize(horizontal: true, vertical: false)
                         }
                         HStack {
-                            Text(w30.unknownModelRecordCount > 0
-                                 ? localizer.L(
-                                     "\(item.activeModel) · \(w30.unknownModelRecordCount) unpriced",
-                                     "\(item.activeModel) · \(w30.unknownModelRecordCount) 条未匹配"
-                                 )
-                                 : item.activeModel)
+                            Text(item.activeModel)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
                                 .lineLimit(1)
@@ -516,6 +523,13 @@ public struct DashboardView: View {
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(AgentBarPalette.muted)
                                 .fixedSize(horizontal: true, vertical: false)
+                        }
+                        if !pending, let subNote = w30.mismatchNote(in: lang) ?? w30.costNote(in: lang) {
+                            Text(subNote)
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(w30.hasRolloutMismatch ? AgentBarPalette.copper : AgentBarPalette.muted.opacity(0.9))
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .padding(.vertical, 6.5)
@@ -531,8 +545,9 @@ public struct DashboardView: View {
             text = completeness.label(in: lang)
             switch completeness {
             case .complete: tint = AgentBarPalette.jade
+            case .mismatch: tint = Color(red: 0.89, green: 0.36, blue: 0.33)
             case .totalOnly: tint = AgentBarPalette.copper
-            case .relayOnly: tint = Color(red: 0.848, green: 0.64, blue: 0.25)
+            case .relayOnly: tint = Color(red: 0.85, green: 0.64, blue: 0.25)
             case .noData: tint = AgentBarPalette.muted
             }
         } else {

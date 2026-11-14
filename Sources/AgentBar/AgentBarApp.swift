@@ -22,7 +22,7 @@ public struct AgentBarApp: App {
         Window(localizer.L("AgentBar — Local Multi-CLI Ledger", "AgentBar — 本地多智能体用量账本"), id: "dashboard") {
             DashboardView(monitor: monitor, localizer: localizer)
         }
-        .defaultSize(width: 980, height: 660)
+        .defaultSize(width: 1020, height: 720)
         .commands {
             CommandMenu(localizer.L("Language", "语言")) {
                 Button("切换语言 / Toggle Language") {

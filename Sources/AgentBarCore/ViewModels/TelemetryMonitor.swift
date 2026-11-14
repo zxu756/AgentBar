@@ -22,6 +22,9 @@ public enum DemoSnapshotFactory {
             let cr30 = Int(Double(tok30d) * hit * 0.92)
             let out30 = max(1_000, Int(Double(tok30d) * 0.04))
             let inp30 = max(1_000, tok30d - cr30 - out30)
+            let rec5h = max(1, rec30d / 12)
+            let recToday = max(1, rec30d / 8)
+            let rec7d = max(1, rec30d / 3)
             return [
                 .fiveHours: VendorWindowMetrics(
                     inputTokens: max(0, tok5h / 10),
@@ -29,7 +32,8 @@ public enum DemoSnapshotFactory {
                     cacheReadTokens: max(0, tok5h - (tok5h / 10) - (tok5h / 20)),
                     cacheWriteTokens: 0,
                     totalTokens: tok5h,
-                    recordCount: max(1, rec30d / 12),
+                    recordCount: rec5h,
+                    pricedRecordCount: rec5h,
                     estimatedCostUSD: cost5h,
                     unknownModelRecordCount: 0,
                     cacheHitRate: hit,
@@ -42,7 +46,8 @@ public enum DemoSnapshotFactory {
                     cacheReadTokens: max(0, tokToday - (tokToday / 10) - (tokToday / 20)),
                     cacheWriteTokens: 0,
                     totalTokens: tokToday,
-                    recordCount: max(1, rec30d / 8),
+                    recordCount: recToday,
+                    pricedRecordCount: recToday,
                     estimatedCostUSD: costToday,
                     unknownModelRecordCount: 0,
                     cacheHitRate: hit,
@@ -55,7 +60,8 @@ public enum DemoSnapshotFactory {
                     cacheReadTokens: max(0, tok7d - (tok7d / 10) - (tok7d / 20)),
                     cacheWriteTokens: 0,
                     totalTokens: tok7d,
-                    recordCount: max(1, rec30d / 3),
+                    recordCount: rec7d,
+                    pricedRecordCount: max(0, rec7d - unknownModels),
                     estimatedCostUSD: cost7d,
                     unknownModelRecordCount: unknownModels,
                     cacheHitRate: hit,
@@ -69,6 +75,7 @@ public enum DemoSnapshotFactory {
                     cacheWriteTokens: 0,
                     totalTokens: tok30d,
                     recordCount: rec30d,
+                    pricedRecordCount: max(0, rec30d - unknownModels),
                     estimatedCostUSD: cost30d,
                     unknownModelRecordCount: unknownModels,
                     cacheHitRate: hit,
@@ -148,17 +155,17 @@ public enum DemoSnapshotFactory {
                     .fiveHours: .empty(dataSource: vibeSource, completeness: .noData),
                     .today: VendorWindowMetrics(
                         inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 2, estimatedCostUSD: 0.31, unknownModelRecordCount: 0,
+                        totalTokens: nil, recordCount: 2, pricedRecordCount: 2, estimatedCostUSD: 0.31, unknownModelRecordCount: 0,
                         cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
                     ),
                     .sevenDays: VendorWindowMetrics(
                         inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
+                        totalTokens: nil, recordCount: 8, pricedRecordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
                         cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
                     ),
                     .thirtyDays: VendorWindowMetrics(
                         inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
+                        totalTokens: nil, recordCount: 8, pricedRecordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
                         cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
                     )
                 ],
@@ -276,39 +283,40 @@ public final class TelemetryMonitor: ObservableObject {
     @Published public var labelMode: MenuBarLabelMode {
         didSet {
             guard !isPreviewInstance else { return }
-            userDefaults.set(labelMode.rawValue, forKey: "agentbar.labelMode")
+            preferenceStore.set(labelMode.rawValue, forKey: "agentbar.labelMode")
         }
     }
     @Published public var refreshIntervalSeconds: Int {
         didSet {
             guard !isPreviewInstance else { return }
-            userDefaults.set(refreshIntervalSeconds, forKey: "agentbar.refreshSeconds")
+            preferenceStore.set(refreshIntervalSeconds, forKey: "agentbar.refreshSeconds")
             scheduleTimer()
         }
     }
     @Published public var workspacePath: String {
         didSet {
             guard !isPreviewInstance else { return }
-            userDefaults.set(workspacePath, forKey: "agentbar.workspacePath")
+            preferenceStore.set(workspacePath, forKey: "agentbar.workspacePath")
         }
     }
 
     private let isPreviewInstance: Bool
-    private let userDefaults: UserDefaults
+    private let preferenceStore: PreferenceStore
     private var timer: Timer?
 
     public init(
         previewSnapshot: TelemetrySnapshot? = nil,
         startImmediately: Bool = true,
-        userDefaults: UserDefaults = .standard
+        preferenceStore: PreferenceStore? = nil
     ) {
-        self.userDefaults = userDefaults
-        let savedMode = userDefaults.string(forKey: "agentbar.labelMode")
+        let resolvedStore: PreferenceStore = preferenceStore ?? (previewSnapshot != nil ? InMemoryPreferenceStore() : UserDefaults.standard)
+        self.preferenceStore = resolvedStore
+        let savedMode = resolvedStore.string(forKey: "agentbar.labelMode")
             .flatMap(MenuBarLabelMode.init(rawValue:)) ?? .todayCost
-        let savedRefresh = userDefaults.integer(forKey: "agentbar.refreshSeconds")
-        let defaultWorkspace = FileManager.default.homeDirectoryForCurrentUser
+        let savedRefresh = resolvedStore.integer(forKey: "agentbar.refreshSeconds")
+        let defaultWorkspace = CollectorPaths.resolveDefaultHomeDirectory()
             .appendingPathComponent("Projects").path
-        let savedWorkspace = userDefaults.string(forKey: "agentbar.workspacePath") ?? defaultWorkspace
+        let savedWorkspace = resolvedStore.string(forKey: "agentbar.workspacePath") ?? defaultWorkspace
 
         self.labelMode = savedMode
         self.refreshIntervalSeconds = savedRefresh > 0 ? savedRefresh : 30
@@ -464,7 +472,7 @@ public enum ScreenshotExporter {
         let dashView = DashboardView(monitor: monitor, localizer: localizer)
             .environment(\.locale, language.locale)
             .background(AgentBarPalette.canvas)
-        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 980, height: 690)) {
+        if let dashPNG = renderPNG(view: dashView, size: CGSize(width: 1020, height: 748)) {
             try dashPNG.write(to: directory.appendingPathComponent("screenshot-dashboard\(suffix).png"))
         }
 
@@ -482,9 +490,9 @@ public enum ScreenshotExporter {
                 .strokeBorder(AgentBarPalette.rule, lineWidth: 1)
         )
         .padding(16)
-        .frame(width: 440, height: 574)
+        .frame(width: 440, height: 590)
         .background(Color(red: 0.055, green: 0.050, blue: 0.046))
-        if let popPNG = renderPNG(view: popView, size: CGSize(width: 440, height: 574)) {
+        if let popPNG = renderPNG(view: popView, size: CGSize(width: 440, height: 590)) {
             try popPNG.write(to: directory.appendingPathComponent("screenshot-menubar\(suffix).png"))
         }
     }

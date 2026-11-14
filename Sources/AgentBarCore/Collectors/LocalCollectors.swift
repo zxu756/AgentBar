@@ -25,8 +25,18 @@ public struct CollectorPaths: Sendable, Equatable {
         self.workspaceRootDir = workspaceRootDir
     }
 
+    public static func resolveDefaultHomeDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let envHome = environment["HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !envHome.isEmpty {
+            return URL(fileURLWithPath: envHome)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }
+
     public static func liveDefault(
-        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        home: URL = CollectorPaths.resolveDefaultHomeDirectory(),
         workspaceRoot: URL? = nil
     ) -> CollectorPaths {
         CollectorPaths(
@@ -55,7 +65,12 @@ private final class CodexRolloutCache: @unchecked Sendable {
         let cachedInput: Int
         let cacheWrite: Int
         let output: Int
+        let reportedTotalTokens: Int?
         let model: String?
+
+        var rolloutTotalTokens: Int {
+            uncachedInput + cachedInput + cacheWrite + output
+        }
     }
 
     private let lock = NSLock()
@@ -76,18 +91,27 @@ private final class CodexRolloutCache: @unchecked Sendable {
 
 public enum LocalTelemetryCollector {
 
-    public static func defaultDataSourceDescription(for vendor: AgentVendor) -> String {
+    public static func defaultDataSourceDescription(
+        for vendor: AgentVendor,
+        language: AppLanguage = .en
+    ) -> String {
         switch vendor {
         case .claudeCode:
             return "~/.claude/projects/**/*.jsonl"
         case .codex:
             return "~/.codex/state_5.sqlite + rollout-*.jsonl"
         case .openCode:
-            return "~/.local/share/opencode/opencode.db (session_v2)"
+            return language == .zhHans
+                ? "~/.local/share/opencode/opencode.db（session_v2 表）"
+                : "~/.local/share/opencode/opencode.db (session_v2)"
         case .mistralVibe:
-            return "~/Projects/*/.relay/LOG.md (meta.json lacks token stats)"
+            return language == .zhHans
+                ? "~/Projects/*/.relay/LOG.md（meta.json 无 Token 统计）"
+                : "~/Projects/*/.relay/LOG.md (meta.json lacks token stats)"
         case .antigravity:
-            return "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"
+            return language == .zhHans
+                ? "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）"
+                : "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"
         }
     }
 
@@ -272,6 +296,19 @@ public enum LocalTelemetryCollector {
                     case (nil, nil): return nil
                     }
                 }()
+                let combinedMismatch = existing.hasRolloutMismatch || sample.hasRolloutMismatch
+                let combinedExpectedTokens: Int? = {
+                    switch (existing.expectedTotalTokens, sample.expectedTotalTokens) {
+                    case let (a?, b?): return a + b
+                    case let (a?, nil): return a
+                    case let (nil, b?): return b
+                    case (nil, nil): return nil
+                    }
+                }()
+                let combinedMismatchNote: String? = {
+                    let parts = [existing.mismatchNote, sample.mismatchNote].compactMap { $0 }.filter { !$0.isEmpty }
+                    return parts.isEmpty ? nil : parts.joined(separator: "; ")
+                }()
                 groupedSessions[key] = UsageSample(
                     aggregatedID: existing.id,
                     vendor: existing.vendor,
@@ -289,7 +326,10 @@ public enum LocalTelemetryCollector {
                     recordedCostUSD: combinedRecorded,
                     estimatedAPICostUSD: combinedEstimated,
                     unmatchedModelCount: existing.unmatchedModelCount + sample.unmatchedModelCount,
-                    isRateLimited: existing.isRateLimited || sample.isRateLimited
+                    isRateLimited: existing.isRateLimited || sample.isRateLimited,
+                    hasRolloutMismatch: combinedMismatch,
+                    expectedTotalTokens: combinedExpectedTokens,
+                    mismatchNote: combinedMismatchNote
                 )
             } else {
                 groupedSessions[key] = sample
@@ -327,6 +367,9 @@ public enum LocalTelemetryCollector {
             // Standalone meta.json lacks prompt cache breakdown and misses journal/*.jsonl sessions in M0.
             return .totalOnly
         case .claudeCode, .codex, .openCode:
+            if samples.contains(where: \.hasRolloutMismatch) {
+                return .mismatch
+            }
             if samples.allSatisfy(\.hasTokenBreakdown) {
                 return .complete
             }
@@ -355,6 +398,7 @@ public enum LocalTelemetryCollector {
                     cacheWriteTokens: 0,
                     totalTokens: 0,
                     recordCount: 0,
+                    pricedRecordCount: 0,
                     estimatedCostUSD: 0.0,
                     unknownModelRecordCount: 0,
                     cacheHitRate: nil,
@@ -369,18 +413,23 @@ public enum LocalTelemetryCollector {
                 cacheWriteTokens: nil,
                 totalTokens: 0,
                 recordCount: 0,
+                pricedRecordCount: 0,
                 estimatedCostUSD: nil,
                 unknownModelRecordCount: 0,
                 cacheHitRate: nil,
                 dataSource: dataSource,
-                completeness: .totalOnly
+                completeness: overallCompleteness == .mismatch ? .mismatch : .totalOnly
             )
         }
 
         let completeness = classifyVendorCompleteness(vendor: vendor, samples: slice)
         let unknownModels = slice.map(\.unmatchedModelCount).reduce(0, +)
+        let mismatchSamples = slice.filter(\.hasRolloutMismatch)
+        let hasMismatch = !mismatchSamples.isEmpty
+        let mismatchCount = mismatchSamples.count
+        let mismatchDetails = mismatchSamples.compactMap(\.mismatchNote)
 
-        if completeness == .complete {
+        if completeness == .complete || (completeness == .mismatch && slice.allSatisfy(\.hasTokenBreakdown)) {
             let inp = slice.map(\.inputTokens).reduce(0, +)
             let out = slice.map(\.outputTokens).reduce(0, +)
             let cr = slice.map(\.cacheReadTokens).reduce(0, +)
@@ -398,23 +447,28 @@ public enum LocalTelemetryCollector {
                 cacheWriteTokens: cw,
                 totalTokens: tot,
                 recordCount: slice.count,
+                pricedRecordCount: priced.count,
                 estimatedCostUSD: cost,
                 unknownModelRecordCount: unknownModels,
                 cacheHitRate: hitRate,
                 dataSource: dataSource,
-                completeness: .complete
+                completeness: completeness,
+                hasRolloutMismatch: hasMismatch,
+                rolloutMismatchCount: mismatchCount,
+                mismatchDetails: mismatchDetails
             )
         } else {
             let knownTots = slice.compactMap(\.knownTotalTokens)
             let tot: Int? = knownTots.isEmpty ? nil : knownTots.reduce(0, +)
-            let cost: Double? = {
-                if completeness == .totalOnly {
-                    // For totalOnly (e.g. Codex without rollout), cost is only known if explicitly recorded for all records.
+            let pricedAndCost: (count: Int, cost: Double?) = {
+                if completeness == .totalOnly || completeness == .mismatch {
+                    // Without breakdown across all records in the slice, cost is only known if explicitly recorded for all records.
                     let recs = slice.compactMap { ($0.recordedCostUSD ?? 0) > 0 ? $0.recordedCostUSD : nil }
-                    return (recs.count == slice.count && !recs.isEmpty) ? recs.reduce(0, +) : nil
+                    let known = (recs.count == slice.count && !recs.isEmpty) ? recs.reduce(0, +) : nil
+                    return (known != nil ? recs.count : 0, known)
                 }
                 let priced = slice.compactMap(\.effectiveCostUSD)
-                return priced.isEmpty ? nil : priced.reduce(0, +)
+                return (priced.count, priced.isEmpty ? nil : priced.reduce(0, +))
             }()
 
             return VendorWindowMetrics(
@@ -424,11 +478,15 @@ public enum LocalTelemetryCollector {
                 cacheWriteTokens: nil,
                 totalTokens: tot,
                 recordCount: slice.count,
-                estimatedCostUSD: cost,
+                pricedRecordCount: pricedAndCost.count,
+                estimatedCostUSD: pricedAndCost.cost,
                 unknownModelRecordCount: unknownModels,
                 cacheHitRate: nil,
                 dataSource: dataSource,
-                completeness: completeness
+                completeness: completeness,
+                hasRolloutMismatch: hasMismatch,
+                rolloutMismatchCount: mismatchCount,
+                mismatchDetails: mismatchDetails
             )
         }
     }
@@ -442,7 +500,7 @@ public enum LocalTelemetryCollector {
         }
     }
 
-    // MARK: - 1. Claude Code JSONL Reader (Read-Only, Metadata Keys Only, Deduplicated by message.id + requestId)
+    // MARK: - 1. Claude Code JSONL Reader (Read-Only, In-Memory Line Parsing Extracting Token/Model/Timestamp Fields Only, Deduplicated by message.id + requestId)
 
     public static func collectClaudeSamples(
         dir: URL,
@@ -642,6 +700,10 @@ public enum LocalTelemetryCollector {
                    allowZstd: allowZstd
                ) {
                 let effectiveModel = !dbModel.isEmpty ? dbModel : (breakdown.model ?? "")
+                let rolloutTotal = breakdown.rolloutTotalTokens
+                let isMismatch = (rolloutTotal != totalTok)
+                    || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)
+                let note: String? = isMismatch ? "\(id): rollout=\(rolloutTotal) vs sqlite=\(totalTok)" : nil
                 results.append(
                     UsageSample(
                         id: "codex-\(id)",
@@ -654,7 +716,10 @@ public enum LocalTelemetryCollector {
                         inputTokens: breakdown.uncachedInput,
                         outputTokens: breakdown.output,
                         cacheReadTokens: breakdown.cachedInput,
-                        cacheWriteTokens: breakdown.cacheWrite
+                        cacheWriteTokens: breakdown.cacheWrite,
+                        hasRolloutMismatch: isMismatch,
+                        expectedTotalTokens: totalTok,
+                        mismatchNote: note
                     )
                 )
             } else {
@@ -791,6 +856,7 @@ public enum LocalTelemetryCollector {
         let cacheWrite = max(0, intVal(usage["cache_write_input_tokens"]))
         let output = max(0, intVal(usage["output_tokens"]))
         let uncachedInput = max(0, rawInput - cachedInput)
+        let reportedTotal: Int? = usage["total_tokens"] != nil ? max(0, intVal(usage["total_tokens"])) : nil
         guard (uncachedInput + cachedInput + cacheWrite + output) > 0 else { return nil }
 
         return CodexRolloutCache.Entry(
@@ -798,6 +864,7 @@ public enum LocalTelemetryCollector {
             cachedInput: cachedInput,
             cacheWrite: cacheWrite,
             output: output,
+            reportedTotalTokens: reportedTotal,
             model: latestModel
         )
     }
