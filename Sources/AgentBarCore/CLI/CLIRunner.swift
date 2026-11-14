@@ -31,6 +31,7 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
     public let hasRolloutMismatch: Bool
     public let rolloutMismatchCount: Int
     public let mismatchNote: String?
+    public let rateLimit429Count: Int
 
     enum CodingKeys: String, CodingKey {
         case inputTokens
@@ -51,6 +52,7 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         case hasRolloutMismatch
         case rolloutMismatchCount
         case mismatchNote
+        case rateLimit429Count
     }
 
     public init(metrics: VendorWindowMetrics, vendor: AgentVendor, language: AppLanguage) {
@@ -72,6 +74,7 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         self.hasRolloutMismatch = metrics.hasRolloutMismatch
         self.rolloutMismatchCount = metrics.rolloutMismatchCount
         self.mismatchNote = metrics.mismatchNote(in: language)
+        self.rateLimit429Count = metrics.rateLimit429Count
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -94,6 +97,7 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         try c.encode(hasRolloutMismatch, forKey: .hasRolloutMismatch)
         try c.encode(rolloutMismatchCount, forKey: .rolloutMismatchCount)
         try encodeOptional(mismatchNote, forKey: .mismatchNote, in: &c)
+        try c.encode(rateLimit429Count, forKey: .rateLimit429Count)
     }
 }
 
@@ -176,6 +180,161 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
     }
 }
 
+public struct CLIDailyVendorPayload: Codable, Sendable, Equatable {
+    public let uncachedInputTokens: Int
+    public let cachedInputTokens: Int
+    public let cacheWriteTokens: Int
+    public let outputTokens: Int
+    public let totalTokens: Int
+    public let recordCount: Int
+    public let pricedRecordCount: Int
+    public let unmatchedModelCount: Int
+    public let estimatedCostUSD: Double?
+    public let costNote: String?
+    public let hasRolloutMismatch: Bool
+    public let rolloutMismatchCount: Int
+    public let mismatchNote: String?
+    public let rateLimit429Count: Int
+    public let completeness: String
+    public let completenessLabel: String
+
+    enum CodingKeys: String, CodingKey {
+        case uncachedInputTokens
+        case cachedInputTokens
+        case cacheWriteTokens
+        case outputTokens
+        case totalTokens
+        case recordCount
+        case pricedRecordCount
+        case unmatchedModelCount
+        case estimatedCostUSD
+        case costNote
+        case hasRolloutMismatch
+        case rolloutMismatchCount
+        case mismatchNote
+        case rateLimit429Count
+        case completeness
+        case completenessLabel
+    }
+
+    public init(metrics: DailyVendorMetrics, language: AppLanguage) {
+        self.uncachedInputTokens = metrics.uncachedInputTokens
+        self.cachedInputTokens = metrics.cachedInputTokens
+        self.cacheWriteTokens = metrics.cacheWriteTokens
+        self.outputTokens = metrics.outputTokens
+        self.totalTokens = metrics.totalTokens
+        self.recordCount = metrics.recordCount
+        self.pricedRecordCount = metrics.pricedRecordCount
+        self.unmatchedModelCount = metrics.unmatchedModelCount
+        self.estimatedCostUSD = metrics.estimatedCostUSD
+        self.costNote = metrics.costNote(in: language)
+        self.hasRolloutMismatch = metrics.hasRolloutMismatch
+        self.rolloutMismatchCount = metrics.rolloutMismatchCount
+        self.mismatchNote = metrics.mismatchNote(in: language)
+        self.rateLimit429Count = metrics.rateLimit429Count
+        self.completeness = metrics.completeness.rawValue
+        self.completenessLabel = metrics.completeness.label(in: language)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(uncachedInputTokens, forKey: .uncachedInputTokens)
+        try c.encode(cachedInputTokens, forKey: .cachedInputTokens)
+        try c.encode(cacheWriteTokens, forKey: .cacheWriteTokens)
+        try c.encode(outputTokens, forKey: .outputTokens)
+        try c.encode(totalTokens, forKey: .totalTokens)
+        try c.encode(recordCount, forKey: .recordCount)
+        try c.encode(pricedRecordCount, forKey: .pricedRecordCount)
+        try c.encode(unmatchedModelCount, forKey: .unmatchedModelCount)
+        try encodeOptional(estimatedCostUSD, forKey: .estimatedCostUSD, in: &c)
+        try encodeOptional(costNote, forKey: .costNote, in: &c)
+        try c.encode(hasRolloutMismatch, forKey: .hasRolloutMismatch)
+        try c.encode(rolloutMismatchCount, forKey: .rolloutMismatchCount)
+        try encodeOptional(mismatchNote, forKey: .mismatchNote, in: &c)
+        try c.encode(rateLimit429Count, forKey: .rateLimit429Count)
+        try c.encode(completeness, forKey: .completeness)
+        try c.encode(completenessLabel, forKey: .completenessLabel)
+    }
+}
+
+public struct CLIDailyEntryPayload: Codable, Sendable, Equatable {
+    public let date: String
+    public let uncachedInputTokens: Int
+    public let cachedInputTokens: Int
+    public let cacheWriteTokens: Int
+    public let outputTokens: Int
+    public let totalTokens: Int
+    public let recordCount: Int
+    public let pricedRecordCount: Int
+    public let unmatchedModelCount: Int
+    public let estimatedCostUSD: Double?
+    public let costNote: String?
+    public let hasCodexRolloutMismatch: Bool
+    public let codexMismatchNote: String?
+    public let rateLimit429Count: Int
+    public let vendors: [String: CLIDailyVendorPayload]
+
+    enum CodingKeys: String, CodingKey {
+        case date
+        case uncachedInputTokens
+        case cachedInputTokens
+        case cacheWriteTokens
+        case outputTokens
+        case totalTokens
+        case recordCount
+        case pricedRecordCount
+        case unmatchedModelCount
+        case estimatedCostUSD
+        case costNote
+        case hasCodexRolloutMismatch
+        case codexMismatchNote
+        case rateLimit429Count
+        case vendors
+    }
+
+    public init(day: DailyLedgerDay, language: AppLanguage) {
+        self.date = day.dateString
+        self.uncachedInputTokens = day.uncachedInputTokens
+        self.cachedInputTokens = day.cachedInputTokens
+        self.cacheWriteTokens = day.cacheWriteTokens
+        self.outputTokens = day.outputTokens
+        self.totalTokens = day.totalTokens
+        self.recordCount = day.recordCount
+        self.pricedRecordCount = day.pricedRecordCount
+        self.unmatchedModelCount = day.unmatchedModelCount
+        self.estimatedCostUSD = day.estimatedCostUSD
+        self.costNote = day.costNote(in: language)
+        self.hasCodexRolloutMismatch = day.hasCodexRolloutMismatch
+        self.codexMismatchNote = day.codexMismatchNote(in: language)
+        self.rateLimit429Count = day.rateLimit429Count
+
+        var vMap: [String: CLIDailyVendorPayload] = [:]
+        for v in AgentVendor.allCases {
+            vMap[v.rawValue] = CLIDailyVendorPayload(metrics: day.metrics(for: v), language: language)
+        }
+        self.vendors = vMap
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(date, forKey: .date)
+        try c.encode(uncachedInputTokens, forKey: .uncachedInputTokens)
+        try c.encode(cachedInputTokens, forKey: .cachedInputTokens)
+        try c.encode(cacheWriteTokens, forKey: .cacheWriteTokens)
+        try c.encode(outputTokens, forKey: .outputTokens)
+        try c.encode(totalTokens, forKey: .totalTokens)
+        try c.encode(recordCount, forKey: .recordCount)
+        try c.encode(pricedRecordCount, forKey: .pricedRecordCount)
+        try c.encode(unmatchedModelCount, forKey: .unmatchedModelCount)
+        try encodeOptional(estimatedCostUSD, forKey: .estimatedCostUSD, in: &c)
+        try encodeOptional(costNote, forKey: .costNote, in: &c)
+        try c.encode(hasCodexRolloutMismatch, forKey: .hasCodexRolloutMismatch)
+        try encodeOptional(codexMismatchNote, forKey: .codexMismatchNote, in: &c)
+        try c.encode(rateLimit429Count, forKey: .rateLimit429Count)
+        try c.encode(vendors, forKey: .vendors)
+    }
+}
+
 public struct CLIRelayStepPayload: Codable, Sendable, Equatable {
     public let stepID: String
     public let vendor: String?
@@ -238,32 +397,36 @@ public struct CLIRelayRunPayload: Codable, Sendable, Equatable {
 public struct CLISnapshotPayload: Codable, Sendable, Equatable {
     public let schemaVersion: String
     public let capturedAt: String
+    public let timeZone: String
     public let language: String
     public let isDemoData: Bool
     public let pricingVersion: String
     public let costDisclaimer: String
     public let timeAttributionNote: String
     public let vendors: [String: CLIVendorPayload]
+    public let dailyBreakdown: [CLIDailyEntryPayload]
     public let relayRuns: [CLIRelayRunPayload]
 
     public init(snapshot: TelemetrySnapshot, language: AppLanguage) {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
-        self.schemaVersion = "1.0"
+        self.schemaVersion = "1.1"
         self.capturedAt = iso.string(from: snapshot.capturedAt)
+        self.timeZone = snapshot.timeZoneIdentifier
         self.language = language.rawValue
         self.isDemoData = snapshot.isDemoData
         self.pricingVersion = PriceCatalog.pricingVersion
         self.costDisclaimer = PriceCatalog.costDisclaimer(in: language)
         self.timeAttributionNote = language == .zhHans
-            ? "M0 口径说明：Codex（threads.updated_at）与 OpenCode（session_v2.time_updated）当前按会话最后更新时间归桶，跨天长会话的逐事件时间归属排在 M1。"
-            : "M0 note: Codex (threads.updated_at) and OpenCode (session_v2.time_updated) currently attribute cumulative session totals to last-updated time; per-event timestamp bucketing is scheduled for M1."
+            ? "M1 时间归属：Claude、Codex（rollout token_count 增量）、OpenCode（session_message）与 Mistral Vibe（unified journal）均按单条事件时间戳归桶；仅缺细账时退回会话时间。"
+            : "M1 time attribution: Claude, Codex (rollout token_count deltas), OpenCode (session_message), and Mistral Vibe (unified journal) bucket by per-event timestamp, falling back to session time only when event logs are absent."
 
         var map: [String: CLIVendorPayload] = [:]
         for summary in snapshot.vendorSummaries {
             map[summary.vendor.rawValue] = CLIVendorPayload(summary: summary, language: language)
         }
         self.vendors = map
+        self.dailyBreakdown = snapshot.dailyBreakdown.map { CLIDailyEntryPayload(day: $0, language: language) }
         self.relayRuns = snapshot.relayRuns.map(CLIRelayRunPayload.init)
     }
 }
@@ -286,14 +449,16 @@ public enum CLIRunner {
         if language == .zhHans {
             return """
             用法:
-              AgentBar --cli snapshot [--json] [--lang en|zh] [--home <目录>] [--workspace <目录>] [--now <ISO8601|秒>] [--no-zstd] [--demo]
+              AgentBar --cli snapshot [--json] [--lang en|zh] [--tz <UTC|local|时区ID>] [--home <目录>] [--workspace <目录>] [--now <ISO8601|秒>] [--no-zstd] [--demo]
+              AgentBar --cli daily [--json] [--lang en|zh] [--tz <UTC|local|时区ID>] [--home <目录>] [--workspace <目录>] [--now <ISO8601|秒>] [--no-zstd] [--demo]
               AgentBar [--lang en|zh] [--demo]
               AgentBar --export-screenshots <输出目录> [--lang en|zh]
             """
         }
         return """
         Usage:
-          AgentBar --cli snapshot [--json] [--lang en|zh] [--home <dir>] [--workspace <dir>] [--now <ISO8601|epoch>] [--no-zstd] [--demo]
+          AgentBar --cli snapshot [--json] [--lang en|zh] [--tz <UTC|local|tzID>] [--home <dir>] [--workspace <dir>] [--now <ISO8601|epoch>] [--no-zstd] [--demo]
+          AgentBar --cli daily [--json] [--lang en|zh] [--tz <UTC|local|tzID>] [--home <dir>] [--workspace <dir>] [--now <ISO8601|epoch>] [--no-zstd] [--demo]
           AgentBar [--lang en|zh] [--demo]
           AgentBar --export-screenshots <dir> [--lang en|zh]
         """
@@ -333,6 +498,7 @@ public enum CLIRunner {
         var homeOverride: URL?
         var workspaceOverride: URL?
         var nowOverride: Date?
+        var timeZoneOverride: TimeZone?
         var language = defaultLang
 
         var idx = 0
@@ -371,6 +537,25 @@ public enum CLIRunner {
                     return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg + usageText(in: language) + "\n")
                 }
                 language = parsed
+                idx += 1
+            case "--tz":
+                guard idx + 1 < tokens.count, let parsedTZ = parseTimeZoneArgument(tokens[idx + 1]) else {
+                    let msg = language == .zhHans
+                        ? "错误：--tz 参数无效（支持 UTC、local 或有效 IANA 时区名）。\n"
+                        : "Error: invalid --tz value (expected UTC, local, or a valid IANA time zone identifier).\n"
+                    return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg)
+                }
+                timeZoneOverride = parsedTZ
+                idx += 2
+            case _ where arg.hasPrefix("--tz="):
+                let val = String(arg.dropFirst("--tz=".count))
+                guard let parsedTZ = parseTimeZoneArgument(val) else {
+                    let msg = language == .zhHans
+                        ? "错误：--tz 参数无效（支持 UTC、local 或有效 IANA 时区名）。\n"
+                        : "Error: invalid --tz value (expected UTC, local, or a valid IANA time zone identifier).\n"
+                    return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg)
+                }
+                timeZoneOverride = parsedTZ
                 idx += 1
             case "--home":
                 guard idx + 1 < tokens.count, !tokens[idx + 1].isEmpty else {
@@ -443,18 +628,19 @@ public enum CLIRunner {
 
         guard let subcommand else {
             let msg = language == .zhHans
-                ? "错误：缺少子命令（可用子命令：snapshot）。\n"
-                : "Error: missing subcommand (available: snapshot).\n"
+                ? "错误：缺少子命令（可用子命令：snapshot, daily）。\n"
+                : "Error: missing subcommand (available: snapshot, daily).\n"
             return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg + usageText(in: language) + "\n")
         }
 
-        guard subcommand == "snapshot" else {
+        guard subcommand == "snapshot" || subcommand == "daily" else {
             let msg = language == .zhHans
-                ? "错误：未知子命令 '\(subcommand)'（可用子命令：snapshot）。\n"
-                : "Error: unknown subcommand '\(subcommand)' (available: snapshot).\n"
+                ? "错误：未知子命令 '\(subcommand)'（可用子命令：snapshot, daily）。\n"
+                : "Error: unknown subcommand '\(subcommand)' (available: snapshot, daily).\n"
             return CLIExecutionResult(exitCode: 2, stdout: "", stderr: msg + usageText(in: language) + "\n")
         }
 
+        let evalTimeZone = timeZoneOverride ?? .current
         let snapshot: TelemetrySnapshot
         if useDemo {
             snapshot = DemoSnapshotFactory.makePreviewSnapshot()
@@ -485,7 +671,8 @@ public enum CLIRunner {
                 paths: paths,
                 now: evalNow,
                 lookbackDays: 30,
-                allowZstdRollout: allowZstd
+                allowZstdRollout: allowZstd,
+                timeZone: evalTimeZone
             )
         }
 
@@ -500,6 +687,9 @@ public enum CLIRunner {
             } catch {
                 return CLIExecutionResult(exitCode: 1, stdout: "", stderr: "Failed to encode JSON: \(error)\n")
             }
+        } else if subcommand == "daily" {
+            let formatted = formatDailyHumanReadable(snapshot: snapshot, language: language)
+            return CLIExecutionResult(exitCode: 0, stdout: formatted, stderr: "")
         } else {
             let formatted = formatHumanReadable(snapshot: snapshot, language: language)
             return CLIExecutionResult(exitCode: 0, stdout: formatted, stderr: "")
@@ -515,6 +705,19 @@ public enum CLIRunner {
             FileHandle.standardError.write(Data(res.stderr.utf8))
         }
         return res.exitCode
+    }
+
+    private static func parseTimeZoneArgument(_ raw: String) -> TimeZone? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lower = trimmed.lowercased()
+        if lower == "utc" || lower == "gmt" || lower == "z" {
+            return TimeZone(secondsFromGMT: 0)
+        }
+        if lower == "local" {
+            return TimeZone.current
+        }
+        return TimeZone(identifier: trimmed)
     }
 
     private static func parseNowArgument(_ raw: String) -> Date? {
@@ -540,8 +743,8 @@ public enum CLIRunner {
         lines.append("\(headerTitle)\(demoBanner)")
         lines.append("\(PriceCatalog.costDisclaimer(in: language))")
         lines.append(isZH
-            ? "M0 口径说明：Codex 与 OpenCode 按会话最后更新时间归桶；逐事件归属排在 M1。"
-            : "M0 note: Codex and OpenCode session totals are bucketed by last-updated timestamp; per-event attribution is scheduled for M1.")
+            ? "M1 时间归属：Claude、Codex、OpenCode 与 Mistral Vibe 均按单条事件时间戳归桶（时区：\(snapshot.timeZoneIdentifier)）。"
+            : "M1 time attribution: Claude, Codex, OpenCode, and Mistral Vibe bucket by per-event timestamp (tz: \(snapshot.timeZoneIdentifier)).")
         lines.append(String(repeating: "-", count: 78))
 
         for item in snapshot.vendorSummaries {
@@ -571,12 +774,18 @@ public enum CLIRunner {
             lines.append("[\(item.vendor.displayName)] (\(compLabel)) — \(localizedSource)")
             if isZH {
                 var row = "  今天: Token \(todayTokStr), 折算 \(todayCostStr) | 30天: Token \(tok30Str), 折算 \(cost30Str), 缓存命中率 \(hit30Str), 记录数 \(w30.recordCount)"
+                if item.rateLimitHits24h > 0 {
+                    row += ", 24h限流(429) \(item.rateLimitHits24h)"
+                }
                 if let mis = w30.mismatchNote(in: language) {
                     row += ", \(mis)"
                 }
                 lines.append(row)
             } else {
                 var row = "  Today: tokens \(todayTokStr), cost \(todayCostStr) | 30d: tokens \(tok30Str), cost \(cost30Str), cache hit \(hit30Str), records \(w30.recordCount)"
+                if item.rateLimitHits24h > 0 {
+                    row += ", 24h 429s \(item.rateLimitHits24h)"
+                }
                 if let mis = w30.mismatchNote(in: language) {
                     row += ", \(mis)"
                 }
@@ -592,6 +801,50 @@ public enum CLIRunner {
                 } else {
                     lines.append("Relay log (\(run.projectName)): \(run.steps.count) steps, recorded cost \(TelemetryFormatter.usd(run.totalCostUSD))")
                 }
+            }
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    public static func formatDailyHumanReadable(snapshot: TelemetrySnapshot, language: AppLanguage) -> String {
+        let isZH = (language == .zhHans)
+        var lines: [String] = []
+        let demoBanner = snapshot.isDemoData
+            ? (isZH ? " [DEMO / 演示数据]" : " [DEMO]")
+            : ""
+        let headerTitle = isZH
+            ? "AgentBar 14 天按日事件细账（时区：\(snapshot.timeZoneIdentifier)）"
+            : "AgentBar 14-Day Per-Event Daily Ledger (tz: \(snapshot.timeZoneIdentifier))"
+        lines.append("\(headerTitle)\(demoBanner)")
+        lines.append(PriceCatalog.costDisclaimer(in: language))
+        lines.append(String(repeating: "-", count: 78))
+
+        for day in snapshot.dailyBreakdown {
+            let tokStr = TelemetryFormatter.compactTokens(day.totalTokens)
+            let costStr: String = {
+                guard let c = day.estimatedCostUSD else {
+                    return isZH ? "未知" : "Unknown"
+                }
+                let base = TelemetryFormatter.usd(c)
+                if let note = day.costNote(in: language) {
+                    return isZH ? "\(base)（\(note)）" : "\(base) (\(note))"
+                }
+                return base
+            }()
+
+            if isZH {
+                var row = "\(day.dateString) | Token \(tokStr) | 折算 \(costStr) | 记录 \(day.recordCount) | 429限流 \(day.rateLimit429Count)"
+                if let mis = day.codexMismatchNote(in: language) {
+                    row += " | \(mis)"
+                }
+                lines.append(row)
+            } else {
+                var row = "\(day.dateString) | tokens \(tokStr) | cost \(costStr) | records \(day.recordCount) | 429s \(day.rateLimit429Count)"
+                if let mis = day.codexMismatchNote(in: language) {
+                    row += " | \(mis)"
+                }
+                lines.append(row)
             }
         }
 

@@ -139,9 +139,9 @@ struct CLITests {
         #expect((zhVendors["codex"] as? [String: Any])?["completenessLabel"] as? String == "只有总量")
         #expect((zhVendors["vibe"] as? [String: Any])?["completenessLabel"] as? String == "只有接力里的部分")
         #expect((zhVendors["opencode"] as? [String: Any])?["completenessLabel"] as? String == "没有数据")
-        #expect((zhVendors["vibe"] as? [String: Any])?["dataSource"] as? String == "~/Projects/*/.relay/LOG.md（meta.json 无 Token 统计）")
+        #expect((zhVendors["vibe"] as? [String: Any])?["dataSource"] as? String == "~/.vibe/logs/session/unified/*/journal/*.jsonl + .relay/LOG.md")
         #expect((zhVendors["agy"] as? [String: Any])?["dataSource"] as? String == "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）")
-        #expect((zhVendors["opencode"] as? [String: Any])?["dataSource"] as? String == "~/.local/share/opencode/opencode.db（session_v2 表）")
+        #expect((zhVendors["opencode"] as? [String: Any])?["dataSource"] as? String == "~/.local/share/opencode/opencode.db（session_message 逐事件 + session_v2 兜底）")
 
         let humanEN = CLIRunner.execute(arguments: [
             "AgentBar", "--cli", "snapshot", "--lang", "en",
@@ -163,7 +163,7 @@ struct CLITests {
         #expect(humanZH.stdout.contains("只有总量"))
         #expect(humanZH.stdout.contains("只有接力里的部分"))
         #expect(humanZH.stdout.contains("没有数据"))
-        #expect(humanZH.stdout.contains("meta.json 无 Token 统计"))
+        #expect(humanZH.stdout.contains("journal/*.jsonl"))
         #expect(humanZH.stdout.contains("cli-*.log 无 Token 统计"))
         #expect(!humanZH.stdout.contains("lacks token stats"))
         #expect(!humanZH.stdout.contains(secretSentinel))
@@ -309,9 +309,88 @@ struct CLITests {
         let rDemoZH = CLIRunner.execute(arguments: ["AgentBar", "--cli", "snapshot", "--demo", "--lang", "zh"])
         #expect(rDemoZH.exitCode == 0)
         #expect(rDemoZH.stdout.contains("[DEMO / 演示数据]"))
-        #expect(rDemoZH.stdout.contains("meta.json 无 Token 统计"))
-        #expect(rDemoZH.stdout.contains("cli-*.log 无 Token 统计"))
         #expect(!rDemoZH.stdout.contains("lacks token stats"))
+    }
+
+    @Test("M1 Part 2: Exposes 14-day dailyBreakdown in --cli snapshot and --cli daily with per-day B14 pricing counts, B15 Codex mismatch, B7 429s, and --tz UTC")
+    func dailyBreakdownCarriesPerDayB14PricingAndB15Mismatch() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-m1-cli-daily-\(UUID().uuidString)")
+        let homeDir = tmp.appendingPathComponent("home")
+        let wsDir = tmp.appendingPathComponent("ws")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-daily")
+        let codexDir = homeDir.appendingPathComponent(".codex")
+        try FileManager.default.createDirectory(at: claudeProj, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: codexDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: wsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // Day 2026-11-13: 1 priced Sonnet turn ($4.50) + 2 unknown-model turns; 0 rate limits, 0 Codex mismatch
+        try """
+        {"type":"assistant","timestamp":"2026-11-13T10:00:00Z","sessionId":"sd1","requestId":"r1","cwd":"/tmp/app","message":{"id":"m1","model":"claude-sonnet-5-5","usage":{"input_tokens":1000000,"output_tokens":100000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"2026-11-13T10:05:00Z","sessionId":"sd1","requestId":"r2","cwd":"/tmp/app","message":{"id":"m2","model":"claude-fable-5-1","usage":{"input_tokens":50000,"output_tokens":5000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"2026-11-13T10:10:00Z","sessionId":"sd1","requestId":"r3","cwd":"/tmp/app","message":{"id":"m3","model":"custom-local-llm","usage":{"input_tokens":50000,"output_tokens":5000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-11-14T08:30:00Z","sessionId":"sd2","requestId":"r429"}
+        """.write(to: claudeProj.appendingPathComponent("daily.jsonl"), atomically: true, encoding: .utf8)
+
+        // Day 2026-11-14: Codex rollout mismatch (12,000 vs sqlite 50,000)
+        let rolloutURL = codexDir.appendingPathComponent("rollout-d14.jsonl")
+        try """
+        {"timestamp":"2026-11-14T08:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+        {"timestamp":"2026-11-14T08:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}
+        """.write(to: rolloutURL, atomically: true, encoding: .utf8)
+        try execSQL(at: codexDir.appendingPathComponent("state_5.sqlite"), sql: """
+        CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT);
+        INSERT INTO threads VALUES ('th-d14', '/tmp/app', 50000, 1794645000, 'gpt-6.1-sol', '\(rolloutURL.path)');
+        """)
+
+        let nowStr = "2026-11-14T12:00:00Z"
+
+        let snapEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--json", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(snapEN.exitCode == 0)
+        let snapObj = try #require(try JSONSerialization.jsonObject(with: Data(snapEN.stdout.utf8)) as? [String: Any])
+        let dailyArr = try #require(snapObj["dailyBreakdown"] as? [[String: Any]])
+        #expect(dailyArr.count == 14)
+
+        let d13 = try #require(dailyArr.first(where: { $0["date"] as? String == "2026-11-13" }))
+        #expect(d13["pricedRecordCount"] as? Int == 1)
+        #expect(d13["unmatchedModelCount"] as? Int == 2)
+        #expect(d13["costNote"] as? String == "Covers 1 priced records only; 2 unknown-model records excluded")
+        #expect(d13["hasCodexRolloutMismatch"] as? Bool == false)
+        #expect(d13["codexMismatchNote"] is NSNull)
+        #expect(d13["rateLimit429Count"] as? Int == 0)
+
+        let d14 = try #require(dailyArr.first(where: { $0["date"] as? String == "2026-11-14" }))
+        #expect(d14["pricedRecordCount"] as? Int == 1)
+        #expect(d14["unmatchedModelCount"] as? Int == 0)
+        #expect(d14["hasCodexRolloutMismatch"] as? Bool == true)
+        #expect((d14["codexMismatchNote"] as? String)?.contains("th-d14: rollout=12000 vs sqlite=50000") == true)
+        #expect(d14["rateLimit429Count"] as? Int == 1)
+
+        // Verify `--cli daily --json --lang zh --tz UTC` and human-readable `--cli daily`
+        let dailyZH = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--json", "--lang", "zh", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(dailyZH.exitCode == 0)
+        let dailyZHObj = try #require(try JSONSerialization.jsonObject(with: Data(dailyZH.stdout.utf8)) as? [String: Any])
+        let zhDays = try #require(dailyZHObj["dailyBreakdown"] as? [[String: Any]])
+        let zhD13 = try #require(zhDays.first(where: { $0["date"] as? String == "2026-11-13" }))
+        #expect(zhD13["costNote"] as? String == "只含已计价的 1 条，另有 2 条未知型号未计入")
+        let zhD14 = try #require(zhDays.first(where: { $0["date"] as? String == "2026-11-14" }))
+        #expect((zhD14["codexMismatchNote"] as? String)?.contains("th-d14: rollout=12000 vs sqlite=50000") == true)
+
+        let dailyHumanZH = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--lang", "zh", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(dailyHumanZH.exitCode == 0)
+        #expect(dailyHumanZH.stdout.contains("2026-11-13"))
+        #expect(dailyHumanZH.stdout.contains("只含已计价的 1 条，另有 2 条未知型号未计入"))
+        #expect(dailyHumanZH.stdout.contains("2026-11-14"))
+        #expect(dailyHumanZH.stdout.contains("th-d14: rollout=12000 vs sqlite=50000"))
     }
 
     private func execSQL(at url: URL, sql: String) throws {

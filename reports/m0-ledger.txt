@@ -1,13 +1,13 @@
 ==============================================================================
-AgentBar M0 Independent Acceptance Ledger (measurement date: 2026-11-14)
+AgentBar M0 Independent Acceptance Ledger (measurement date: 2026-11-15)
 Binary: .build/debug/AgentBar
-Frozen evaluation epoch (--now): 1794646931
+Frozen evaluation epoch (--now): 1794655433
 ==============================================================================
-[Row 1] PASS | Claude 30d: live raw_lines=21888 -> dedup_records=9052 (ref=9052, diff=0.0000%), totalTokens=2,644,906,060 (ref=2,644,906,060, diff=0.0000%), priced=7487, unmatchedModels=1565; synthetic 2->1 dedup=5,900 tok
-[Row 2] PASS | Codex 30d: live 105 rollouts: in=19,617,608, cacheRead=849,549,824, out=2,001,037, hitRate=0.9774; synth rollout=complete(hitRate=0.9600), missing-rollout=totalOnly(nulls), mismatch(12000!=50000)=mismatch('总量不一致')
+[Row 1] PASS | Claude 30d: live raw_lines=21996 -> dedup_records=9104 (ref=9104, diff=0.0000%), totalTokens=2,672,515,682 (ref=2,672,515,682, diff=0.0000%), priced=7487, unmatchedModels=1617; synthetic 2->1 dedup=5,900 tok
+[Row 2] PASS | Codex 30d: live 4730 rollouts: in=19,617,608, cacheRead=849,549,824, out=2,001,037, hitRate=0.9774; synth rollout=complete(hitRate=0.9600), missing-rollout=totalOnly(nulls), mismatch(12000!=50000)=mismatch('总量不一致')
 [Row 3] PASS | .relay/LOG.md: live rea-lol 126/126 steps, 88-verify vendor=None, recordedCost=$5.4971; synthetic 126/126 verified
 [Row 4] PASS | Collector/pricing scan for 0.85|0.15: 0 matches; mistralVibe UI color=0.85 (0.848 hits=0)
 [Row 5] PASS | Scripted isolated mutations: M1-claude-dedup=RED(rc=1), M2-cache-hit-denom=RED(rc=1), M3-relay-heading-bleed=RED(rc=1), M4-codex-missing-rollout-split=RED(rc=1), M5-codex-mismatch-ignored=RED(rc=1), restored=GREEN(rc=0)
-[Row 6] PASS | vibe=relayOnly ('Relay logs only'/'只有接力里的部分'), agy=relayOnly ('Relay logs only'/'只有接力里的部分'), pricingVersion=unverified, b11_hits=0, b13_zh_source=ok, b14_note=ok, b16_bad_home_exit=2, opencode_30d_tokens=4,866,870,275 (records=240)
+[Row 6] PASS | vibe=complete ('Complete'/'完整'), agy=relayOnly ('Relay logs only'/'只有接力里的部分'), pricingVersion=unverified, b11_hits=0, b13_zh_source=ok, b14_note=ok, b16_bad_home_exit=2, opencode_30d_tokens=4,866,444,113 (records=20329)
 ==============================================================================
 RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B16 + W1/W4 PASSED (read-only verified).

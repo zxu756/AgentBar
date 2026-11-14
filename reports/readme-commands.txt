@@ -1,7 +1,7 @@
 ==============================================================================
 AgentBar README Command Replay (Extracted from README.md & README.zh-CN.md)
 ==============================================================================
-[PARITY] Verified 18/18 fenced bash commands match identically across README.md and README.zh-CN.md.
+[PARITY] Verified 21/21 fenced bash commands match identically across README.md and README.zh-CN.md.
 
 [SKIP] git clone https://github.com/zxu756/AgentBar.git — Reason: network git clone skipped in offline local verification.
 
@@ -26,16 +26,22 @@ AgentBar README Command Replay (Extracted from README.md & README.zh-CN.md)
   -> exit=0, verified Chinese usage output
 
 [RUN]  .build/debug/AgentBar --cli snapshot --lang en
-  -> exit=0, verified EN snapshot disclaimer, priced/excluded costNote, and Relay logs only
+  -> exit=0, verified EN snapshot disclaimer, priced/excluded costNote, Vibe Complete & Antigravity Relay logs only
 
 [RUN]  .build/debug/AgentBar --cli snapshot --lang zh
   -> exit=0, verified ZH snapshot disclaimer, priced/excluded costNote, and localized dataSource
 
-[RUN]  .build/debug/AgentBar --cli snapshot --json --lang en
-  -> exit=0, verified EN JSON schema, pricingVersion='unverified', priced=1, unmatched=2
+[RUN]  .build/debug/AgentBar --cli daily --tz UTC --lang en
+  -> exit=0, verified EN 14-day daily ledger (14 rows) & per-day B14 costNote
 
-[RUN]  .build/debug/AgentBar --cli snapshot --json --lang zh
-  -> exit=0, verified ZH JSON localized dataSource & costNote
+[RUN]  .build/debug/AgentBar --cli daily --tz UTC --lang zh
+  -> exit=0, verified ZH 14-day daily ledger (14 rows) & per-day B14 costNote
+
+[RUN]  .build/debug/AgentBar --cli snapshot --json --tz UTC --lang en
+  -> exit=0, verified EN JSON schemaVersion=1.1, 14-day dailyBreakdown, Vibe complete & AGY != complete
+
+[RUN]  .build/debug/AgentBar --cli snapshot --json --tz UTC --lang zh
+  -> exit=0, verified ZH JSON schemaVersion=1.1, 14-day dailyBreakdown & localized dataSource/costNote
 
 [RUN]  .build/debug/AgentBar --cli snapshot --demo --lang en
   -> exit=0, verified EN [DEMO] banner and costNote
@@ -49,9 +55,11 @@ AgentBar README Command Replay (Extracted from README.md & README.zh-CN.md)
 [RUN]  .build/debug/AgentBar --export-screenshots /tmp/agentbar-screenshots --lang zh
   -> exit=0, verified non-empty ZH Retina PNG files
 
-[SKIP] ./Scripts/test.sh milestone 0 — Reason: currently executing inside milestone 0 verification (prevents recursive invocation).
+[SKIP] ./Scripts/test.sh milestone 0 — Reason: milestone runner is orchestrated at top level (prevents recursive invocation).
+
+[SKIP] ./Scripts/test.sh milestone 1 — Reason: milestone runner is orchestrated at top level (prevents recursive invocation).
 
 [RUN]  .build/debug/AgentBar --cli snapshot --home /nonexistent_agentbar_readme_check (expect exit 2)
   -> exit=2, stderr verified: 错误：--home 指定的目录不存在或不是目录：'/nonexistent_agentbar_readme_check'。 
 
-RESULT: ALL 18 README COMMANDS VERIFIED (12 executed, 6 explicitly skipped; plist untouched).
+RESULT: ALL 21 README COMMANDS VERIFIED (14 executed, 7 explicitly skipped; plist untouched).

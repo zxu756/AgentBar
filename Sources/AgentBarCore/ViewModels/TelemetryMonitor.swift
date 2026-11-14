@@ -150,26 +150,16 @@ public enum DemoSnapshotFactory {
                 vendor: .mistralVibe,
                 sourceAvailable: true,
                 dataSource: vibeSource,
-                completeness: .relayOnly,
-                windows: [
-                    .fiveHours: .empty(dataSource: vibeSource, completeness: .noData),
-                    .today: VendorWindowMetrics(
-                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 2, pricedRecordCount: 2, estimatedCostUSD: 0.31, unknownModelRecordCount: 0,
-                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
-                    ),
-                    .sevenDays: VendorWindowMetrics(
-                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 8, pricedRecordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
-                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
-                    ),
-                    .thirtyDays: VendorWindowMetrics(
-                        inputTokens: nil, outputTokens: nil, cacheReadTokens: nil, cacheWriteTokens: nil,
-                        totalTokens: nil, recordCount: 8, pricedRecordCount: 8, estimatedCostUSD: 5.50, unknownModelRecordCount: 0,
-                        cacheHitRate: nil, dataSource: vibeSource, completeness: .relayOnly
-                    )
-                ],
-                sessionCount30d: 8,
+                completeness: .complete,
+                windows: fullWindows(
+                    source: vibeSource,
+                    tok5h: 520_000, cost5h: 0.14,
+                    tokToday: 1_180_000, costToday: 0.31,
+                    tok7d: 14_200_000, cost7d: 3.85,
+                    tok30d: 20_400_000, cost30d: 5.50,
+                    rec30d: 94, hit: 0.91, unknownModels: 3
+                ),
+                sessionCount30d: 21,
                 activeModel: "deepseek-v4-1-flash-1017",
                 lastActive: now.addingTimeInterval(-2_400),
                 rateLimitHits24h: 0
@@ -225,23 +215,69 @@ public enum DemoSnapshotFactory {
             (6.84, 0.89, 0.56, 0.31, 0.0)
         ]
 
+        let dayFormatter = DateFormatter()
+        dayFormatter.calendar = cal
+        dayFormatter.timeZone = TimeZone(secondsFromGMT: 0)!
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+
         var buckets: [DailyVendorBucket] = []
+        var demoDailyBreakdown: [DailyLedgerDay] = []
         for (idx, tuple) in dailyProfile.enumerated() {
             let dayDate = cal.date(byAdding: .day, value: idx - 13, to: startToday) ?? startToday
             let costs = [tuple.0, tuple.1, tuple.2, tuple.3, tuple.4]
+            var vMap: [AgentVendor: DailyVendorMetrics] = [:]
+            var dTot = 0
+            var dCost = 0.0
+            var dRec = 0
+            var dPriced = 0
             for (vIdx, vendor) in AgentVendor.allCases.enumerated() {
                 let c = costs[vIdx]
                 let tok = (vendor == .antigravity) ? (idx >= 10 ? 950_000 : 0) : Int(c * 240_000)
+                let sess = tok > 0 || c > 0 ? max(1, Int(c * 1.5)) : 0
                 buckets.append(
                     DailyVendorBucket(
                         date: dayDate,
                         vendor: vendor,
                         tokens: tok,
                         costUSD: c,
-                        sessions: tok > 0 || c > 0 ? max(1, Int(c * 1.5)) : 0
+                        sessions: sess
                     )
                 )
+                let pricedCnt = (vendor != .antigravity && c > 0) ? sess : 0
+                vMap[vendor] = DailyVendorMetrics(
+                    uncachedInputTokens: vendor == .antigravity ? 0 : tok / 10,
+                    cachedInputTokens: vendor == .antigravity ? 0 : (tok - tok / 10 - tok / 20),
+                    cacheWriteTokens: 0,
+                    outputTokens: vendor == .antigravity ? 0 : tok / 20,
+                    totalTokens: tok,
+                    recordCount: sess,
+                    pricedRecordCount: pricedCnt,
+                    unmatchedModelCount: 0,
+                    estimatedCostUSD: c > 0 ? c : (sess == 0 ? 0.0 : nil),
+                    completeness: sess == 0 ? .noData : (vendor == .antigravity ? .relayOnly : .complete)
+                )
+                dTot += tok
+                dCost += c
+                dRec += sess
+                dPriced += pricedCnt
             }
+            demoDailyBreakdown.append(
+                DailyLedgerDay(
+                    dateString: dayFormatter.string(from: dayDate),
+                    dayStart: dayDate,
+                    uncachedInputTokens: dTot / 10,
+                    cachedInputTokens: dTot - dTot / 10 - dTot / 20,
+                    cacheWriteTokens: 0,
+                    outputTokens: dTot / 20,
+                    totalTokens: dTot,
+                    recordCount: dRec,
+                    pricedRecordCount: dPriced,
+                    unmatchedModelCount: 0,
+                    estimatedCostUSD: dPriced > 0 ? dCost : 0.0,
+                    vendors: vMap
+                )
+            )
         }
 
         let relay = RelayRunSummary(
@@ -261,14 +297,16 @@ public enum DemoSnapshotFactory {
             UsageSample(id: "s2", vendor: .openCode, timestamp: now.addingTimeInterval(-190), sessionID: "ses-441", projectName: "kernel-bench", model: "deepseek-v4.1-flash", inputTokens: 64_000, outputTokens: 19_800, cacheReadTokens: 780_000, recordedCostUSD: 0.21),
             UsageSample(id: "s3", vendor: .claudeCode, timestamp: now.addingTimeInterval(-420), sessionID: "cld-772", projectName: "shader-pipeline", model: "claude-opus-5-5", inputTokens: 48_000, outputTokens: 11_400, cacheReadTokens: 420_000, cacheWriteTokens: 22_000),
             UsageSample(id: "s4", vendor: .codex, timestamp: now.addingTimeInterval(-1380), sessionID: "cdx-118", projectName: "wasm-guard", model: "gpt-6.1-sol", inputTokens: 18_000, outputTokens: 3_400, cacheReadTokens: 460_000),
-            UsageSample(unsplitID: "s5", vendor: .mistralVibe, origin: .relayLog, timestamp: now.addingTimeInterval(-2400), sessionID: "vib-305", projectName: "shader-pipeline", model: "deepseek-v4-1-flash-1017", rawTotalTokens: nil, recordedCostUSD: 0.089)
+            UsageSample(id: "s5", vendor: .mistralVibe, timestamp: now.addingTimeInterval(-2400), sessionID: "vib-305", projectName: "shader-pipeline", model: "deepseek-v4-1-flash-1017", inputTokens: 28_000, outputTokens: 6_200, cacheReadTokens: 290_000)
         ]
 
         return TelemetrySnapshot(
             capturedAt: now,
+            timeZoneIdentifier: "GMT",
             isDemoData: true,
             vendorSummaries: summaries,
             dailyBuckets: buckets,
+            dailyBreakdown: demoDailyBreakdown,
             recentSessions: sessions,
             relayRuns: [relay]
         )

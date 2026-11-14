@@ -117,8 +117,8 @@ public struct DashboardView: View {
                             .fixedSize(horizontal: true, vertical: false)
                     }
                     Text(localizer.L(
-                        "Read-only local telemetry · priced records only (unknown models excluded) · M0 session last-updated",
-                        "本地只读遥测 · 费用只含已计价记录（未知型号未计入）· M0 阶段 Codex/OpenCode 按会话最后更新时间归桶"
+                        "Read-only local telemetry · priced records only (unknown models excluded) · per-event timestamps",
+                        "本地只读遥测 · 费用只含已计价记录（未知型号未计入）· 按单条事件时间归桶"
                     ))
                     .font(.system(size: 10.5))
                     .foregroundStyle(AgentBarPalette.muted)
@@ -313,7 +313,7 @@ public struct DashboardView: View {
     private var dailyVelocitySection: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(localizer.L("14-day ledger (by session update)", "14 天多 CLI 趋势（按会话更新时间）"))
+                Text(localizer.L("14-day ledger (by event timestamp)", "14 天多 CLI 趋势（按事件时间）"))
                     .font(.system(size: 13.5, weight: .semibold))
                     .tracking(localizer.isChinese ? 0 : -0.2)
                     .foregroundStyle(AgentBarPalette.ink)

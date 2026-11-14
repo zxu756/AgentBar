@@ -57,19 +57,31 @@ private final class CodexRolloutCache: @unchecked Sendable {
         let path: String
         let modTime: TimeInterval
         let fileSize: UInt64
-        let expectedTotalTokens: Int
     }
 
-    struct Entry {
+    struct TurnEvent: Sendable {
+        let index: Int
+        let timestamp: Date?
         let uncachedInput: Int
         let cachedInput: Int
         let cacheWrite: Int
         let output: Int
-        let reportedTotalTokens: Int?
         let model: String?
+    }
+
+    struct RateLimitHit: Sendable {
+        let index: Int
+        let timestamp: Date?
+    }
+
+    struct Entry: Sendable {
+        let events: [TurnEvent]
+        let rateLimits: [RateLimitHit]
+        let reportedTotalTokens: Int?
+        let latestModel: String?
 
         var rolloutTotalTokens: Int {
-            uncachedInput + cachedInput + cacheWrite + output
+            events.reduce(0) { $0 + $1.uncachedInput + $1.cachedInput + $1.cacheWrite + $1.output }
         }
     }
 
@@ -91,6 +103,35 @@ private final class CodexRolloutCache: @unchecked Sendable {
 
 public enum LocalTelemetryCollector {
 
+    public struct ClaudeCollectionResult: Sendable {
+        public let samples: [UsageSample]
+        public let rateLimitEvents: [RateLimitEvent]
+        public let rateLimitHits24h: Int
+    }
+
+    public struct CodexCollectionResult: Sendable {
+        public let samples: [UsageSample]
+        public let rateLimitEvents: [RateLimitEvent]
+    }
+
+    public struct OpenCodeCollectionResult: Sendable {
+        public let samples: [UsageSample]
+        public let rateLimitEvents: [RateLimitEvent]
+    }
+
+    public struct VibeCollectionResult: Sendable {
+        public let samples: [UsageSample]
+        public let rateLimitEvents: [RateLimitEvent]
+        public let configuredActiveModel: String?
+    }
+
+    public struct AntigravityCollectionResult: Sendable {
+        public let samples: [UsageSample]
+        public let latestModel: String?
+        public let rateLimitEvents: [RateLimitEvent]
+        public let rateLimitHits24h: Int
+    }
+
     public static func defaultDataSourceDescription(
         for vendor: AgentVendor,
         language: AppLanguage = .en
@@ -102,12 +143,10 @@ public enum LocalTelemetryCollector {
             return "~/.codex/state_5.sqlite + rollout-*.jsonl"
         case .openCode:
             return language == .zhHans
-                ? "~/.local/share/opencode/opencode.db（session_v2 表）"
-                : "~/.local/share/opencode/opencode.db (session_v2)"
+                ? "~/.local/share/opencode/opencode.db（session_message 逐事件 + session_v2 兜底）"
+                : "~/.local/share/opencode/opencode.db (session_message events + session_v2 fallback)"
         case .mistralVibe:
-            return language == .zhHans
-                ? "~/Projects/*/.relay/LOG.md（meta.json 无 Token 统计）"
-                : "~/Projects/*/.relay/LOG.md (meta.json lacks token stats)"
+            return "~/.vibe/logs/session/unified/*/journal/*.jsonl + .relay/LOG.md"
         case .antigravity:
             return language == .zhHans
                 ? "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）"
@@ -119,7 +158,8 @@ public enum LocalTelemetryCollector {
         paths: CollectorPaths = .liveDefault(),
         now: Date = Date(),
         lookbackDays: Int = 30,
-        allowZstdRollout: Bool = true
+        allowZstdRollout: Bool = true,
+        timeZone: TimeZone = .current
     ) -> TelemetrySnapshot {
         let cutoff = now.addingTimeInterval(-Double(lookbackDays) * 86_400.0)
         let fm = FileManager.default
@@ -130,39 +170,47 @@ public enum LocalTelemetryCollector {
         let vibeAvailable = fm.fileExists(atPath: paths.vibeSessionsDir.path)
         let agyAvailable = fm.fileExists(atPath: paths.antigravityLogsDir.path)
 
-        let claudeResult = collectClaudeSamples(dir: paths.claudeProjectsDir, since: cutoff, now: now)
-        let codexSamples = collectCodexSamples(dbURL: paths.codexSQLiteFile, since: cutoff, now: now, allowZstd: allowZstdRollout)
-        let openCodeSamples = collectOpenCodeSamples(dbURL: paths.openCodeSQLiteFile, since: cutoff, now: now)
+        let claudeResult = collectClaudeTelemetry(dir: paths.claudeProjectsDir, since: cutoff, now: now)
+        let codexResult = collectCodexTelemetry(dbURL: paths.codexSQLiteFile, since: cutoff, now: now, allowZstd: allowZstdRollout)
+        let openCodeResult = collectOpenCodeTelemetry(dbURL: paths.openCodeSQLiteFile, since: cutoff, now: now)
         let relayRuns = collectRelayRuns(workspaceRoot: paths.workspaceRootDir)
-        let vibeSamples = collectVibeSamples(vibeDir: paths.vibeSessionsDir, relayRuns: relayRuns, since: cutoff, now: now)
-        let agyResult = collectAntigravitySamples(logDir: paths.antigravityLogsDir, relayRuns: relayRuns, since: cutoff, now: now)
+        let vibeResult = collectVibeTelemetry(vibeDir: paths.vibeSessionsDir, relayRuns: relayRuns, since: cutoff, now: now)
+        let agyResult = collectAntigravityTelemetry(logDir: paths.antigravityLogsDir, relayRuns: relayRuns, since: cutoff, now: now)
 
-        let allTurnSamples = claudeResult.samples + codexSamples + openCodeSamples + vibeSamples + agyResult.samples
+        let allTurnSamples = claudeResult.samples
+            + codexResult.samples
+            + openCodeResult.samples
+            + vibeResult.samples
+            + agyResult.samples
+
+        let allRateLimitEvents = claudeResult.rateLimitEvents
+            + codexResult.rateLimitEvents
+            + openCodeResult.rateLimitEvents
+            + vibeResult.rateLimitEvents
+            + agyResult.rateLimitEvents
 
         let availability: [AgentVendor: Bool] = [
             .claudeCode: claudeAvailable,
             .codex: codexAvailable,
             .openCode: openCodeAvailable,
-            .mistralVibe: vibeAvailable || !vibeSamples.isEmpty,
+            .mistralVibe: vibeAvailable || !vibeResult.samples.isEmpty,
             .antigravity: agyAvailable || !agyResult.samples.isEmpty
         ]
 
         let extraActiveModels: [AgentVendor: String] = [
+            .mistralVibe: vibeResult.configuredActiveModel,
             .antigravity: agyResult.latestModel
         ].compactMapValues { $0 }
-
-        let extraRateLimits: [AgentVendor: Int] = [
-            .claudeCode: claudeResult.rateLimitHits24h,
-            .antigravity: agyResult.rateLimitHits24h
-        ]
 
         return buildSnapshot(
             samples: allTurnSamples,
             relayRuns: relayRuns,
             availability: availability,
             extraActiveModels: extraActiveModels,
-            extraRateLimits: extraRateLimits,
-            now: now
+            extraRateLimits: [:],
+            rateLimitEvents: allRateLimitEvents,
+            now: now,
+            timeZone: timeZone
         )
     }
 
@@ -172,18 +220,29 @@ public enum LocalTelemetryCollector {
         availability: [AgentVendor: Bool],
         extraActiveModels: [AgentVendor: String] = [:],
         extraRateLimits: [AgentVendor: Int] = [:],
-        now: Date = Date()
+        rateLimitEvents: [RateLimitEvent] = [],
+        now: Date = Date(),
+        timeZone: TimeZone = .current
     ) -> TelemetrySnapshot {
-        let cal = Calendar.current
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+
         let startOfToday = cal.startOfDay(for: now)
         let fiveHoursAgo = now.addingTimeInterval(-5.0 * 3600.0)
         let sevenDaysAgo = now.addingTimeInterval(-7.0 * 86_400.0)
         let twentyFourHoursAgo = now.addingTimeInterval(-24.0 * 3600.0)
         let fourteenDaysAgo = cal.date(byAdding: .day, value: -13, to: startOfToday) ?? startOfToday
 
+        let dayFormatter = DateFormatter()
+        dayFormatter.calendar = cal
+        dayFormatter.timeZone = timeZone
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+
         var summaries: [VendorSummary] = []
         for vendor in AgentVendor.allCases {
             let vSamples = samples.filter { $0.vendor == vendor }.sorted { $0.timestamp < $1.timestamp }
+            let vRateEvents = rateLimitEvents.filter { $0.vendor == vendor && $0.timestamp <= now }
             let sourceAvail = availability[vendor] ?? !vSamples.isEmpty
             let dataSource = defaultDataSourceDescription(for: vendor)
 
@@ -192,15 +251,21 @@ public enum LocalTelemetryCollector {
                 samples: vSamples
             )
 
-            let fiveHourSlice = vSamples.filter { $0.timestamp >= fiveHoursAgo }
-            let todaySlice = vSamples.filter { $0.timestamp >= startOfToday }
-            let sevenDaySlice = vSamples.filter { $0.timestamp >= sevenDaysAgo }
-            let thirtyDaySlice = vSamples
+            let fiveHourSlice = vSamples.filter { $0.timestamp >= fiveHoursAgo && $0.timestamp <= now }
+            let todaySlice = vSamples.filter { $0.timestamp >= startOfToday && $0.timestamp <= now }
+            let sevenDaySlice = vSamples.filter { $0.timestamp >= sevenDaysAgo && $0.timestamp <= now }
+            let thirtyDaySlice = vSamples.filter { $0.timestamp <= now }
+
+            let rl5h = vRateEvents.filter { $0.timestamp >= fiveHoursAgo }.count + fiveHourSlice.filter(\.isRateLimited).count
+            let rlToday = vRateEvents.filter { $0.timestamp >= startOfToday }.count + todaySlice.filter(\.isRateLimited).count
+            let rl7d = vRateEvents.filter { $0.timestamp >= sevenDaysAgo }.count + sevenDaySlice.filter(\.isRateLimited).count
+            let rl30d = vRateEvents.count + thirtyDaySlice.filter(\.isRateLimited).count
 
             let windows: [TelemetryWindow: VendorWindowMetrics] = [
                 .fiveHours: computeWindowMetrics(
                     vendor: vendor,
                     slice: fiveHourSlice,
+                    rateLimit429Count: rl5h,
                     overallCompleteness: overallCompleteness,
                     sourceAvailable: sourceAvail,
                     dataSource: dataSource
@@ -208,6 +273,7 @@ public enum LocalTelemetryCollector {
                 .today: computeWindowMetrics(
                     vendor: vendor,
                     slice: todaySlice,
+                    rateLimit429Count: rlToday,
                     overallCompleteness: overallCompleteness,
                     sourceAvailable: sourceAvail,
                     dataSource: dataSource
@@ -215,6 +281,7 @@ public enum LocalTelemetryCollector {
                 .sevenDays: computeWindowMetrics(
                     vendor: vendor,
                     slice: sevenDaySlice,
+                    rateLimit429Count: rl7d,
                     overallCompleteness: overallCompleteness,
                     sourceAvailable: sourceAvail,
                     dataSource: dataSource
@@ -222,6 +289,7 @@ public enum LocalTelemetryCollector {
                 .thirtyDays: computeWindowMetrics(
                     vendor: vendor,
                     slice: thirtyDaySlice,
+                    rateLimit429Count: rl30d,
                     overallCompleteness: overallCompleteness,
                     sourceAvailable: sourceAvail,
                     dataSource: dataSource
@@ -237,8 +305,9 @@ public enum LocalTelemetryCollector {
                 return extraActiveModels[vendor] ?? "—"
             }()
 
-            let sample429 = vSamples.filter { $0.isRateLimited && $0.timestamp >= twentyFourHoursAgo }.count
-            let hits429 = sample429 + (extraRateLimits[vendor] ?? 0)
+            let event429_24h = vRateEvents.filter { $0.timestamp >= twentyFourHoursAgo }.count
+            let sample429_24h = vSamples.filter { $0.isRateLimited && $0.timestamp >= twentyFourHoursAgo && $0.timestamp <= now }.count
+            let hits429 = event429_24h + sample429_24h + (extraRateLimits[vendor] ?? 0)
 
             summaries.append(
                 VendorSummary(
@@ -255,24 +324,116 @@ public enum LocalTelemetryCollector {
             )
         }
 
-        // Build 14-day daily buckets per vendor
+        // Build 14-day daily buckets per vendor AND rich M1 per-day breakdown (with B14, B15, B7)
         var dailyBuckets: [DailyVendorBucket] = []
+        var dailyBreakdown: [DailyLedgerDay] = []
         for dayOffset in 0..<14 {
             guard let dayStart = cal.date(byAdding: .day, value: dayOffset, to: fourteenDaysAgo),
                   let dayEnd = cal.date(byAdding: .day, value: 1, to: dayStart) else { continue }
-            let daySlice = samples.filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd }
+            let dateStr = dayFormatter.string(from: dayStart)
+            let daySlice = samples.filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd && $0.timestamp <= now }
+            let dayRLSlice = rateLimitEvents.filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd && $0.timestamp <= now }
+
+            var vendorMetricsMap: [AgentVendor: DailyVendorMetrics] = [:]
+            var dayUncached = 0
+            var dayCached = 0
+            var dayCW = 0
+            var dayOut = 0
+            var dayTot = 0
+            var dayRec = 0
+            var dayPriced = 0
+            var dayUnmatched = 0
+            var dayCostAccum = 0.0
+            var dayHasAnyPriced = false
+            var dayRLTotal = 0
+
             for vendor in AgentVendor.allCases {
                 let vs = daySlice.filter { $0.vendor == vendor }
+                let vRL = dayRLSlice.filter { $0.vendor == vendor }.count + vs.filter(\.isRateLimited).count
+                let uncached = vs.filter(\.hasTokenBreakdown).map(\.inputTokens).reduce(0, +)
+                let cached = vs.filter(\.hasTokenBreakdown).map(\.cacheReadTokens).reduce(0, +)
+                let cw = vs.filter(\.hasTokenBreakdown).map(\.cacheWriteTokens).reduce(0, +)
+                let out = vs.filter(\.hasTokenBreakdown).map(\.outputTokens).reduce(0, +)
                 let tok = vs.map(\.totalTokens).reduce(0, +)
-                let cost = vs.compactMap(\.effectiveCostUSD).reduce(0, +)
-                let sess = Set(vs.map(\.sessionID)).count
-                dailyBuckets.append(DailyVendorBucket(date: dayStart, vendor: vendor, tokens: tok, costUSD: cost, sessions: sess))
+                let pricedValues = vs.compactMap(\.effectiveCostUSD)
+                let vCost: Double? = pricedValues.isEmpty ? (vs.isEmpty ? 0.0 : nil) : pricedValues.reduce(0, +)
+                let vUnmatched = vs.map(\.unmatchedModelCount).reduce(0, +)
+                let misSamples = vs.filter(\.hasRolloutMismatch)
+                let vHasMis = !misSamples.isEmpty
+                let vMisCount = Set(misSamples.map(\.sessionID)).count
+                let vMisDetails = uniqueStrings(misSamples.compactMap(\.mismatchNote))
+                let vComp: DataCompleteness = vs.isEmpty ? .noData : classifyVendorCompleteness(vendor: vendor, samples: vs)
+
+                let sessCount = Set(vs.map(\.sessionID)).count
+                dailyBuckets.append(
+                    DailyVendorBucket(
+                        date: dayStart,
+                        vendor: vendor,
+                        tokens: tok,
+                        costUSD: pricedValues.reduce(0, +),
+                        sessions: sessCount
+                    )
+                )
+
+                vendorMetricsMap[vendor] = DailyVendorMetrics(
+                    uncachedInputTokens: uncached,
+                    cachedInputTokens: cached,
+                    cacheWriteTokens: cw,
+                    outputTokens: out,
+                    totalTokens: tok,
+                    recordCount: vs.count,
+                    pricedRecordCount: pricedValues.count,
+                    unmatchedModelCount: vUnmatched,
+                    estimatedCostUSD: vCost,
+                    hasRolloutMismatch: vHasMis,
+                    rolloutMismatchCount: vMisCount,
+                    mismatchDetails: vMisDetails,
+                    rateLimit429Count: vRL,
+                    completeness: vComp
+                )
+
+                dayUncached += uncached
+                dayCached += cached
+                dayCW += cw
+                dayOut += out
+                dayTot += tok
+                dayRec += vs.count
+                dayPriced += pricedValues.count
+                dayUnmatched += vUnmatched
+                if !pricedValues.isEmpty {
+                    dayHasAnyPriced = true
+                    dayCostAccum += pricedValues.reduce(0, +)
+                }
+                dayRLTotal += vRL
             }
+
+            let codexDay = vendorMetricsMap[.codex] ?? DailyVendorMetrics()
+            let dayCost: Double? = dayHasAnyPriced ? dayCostAccum : (dayRec == 0 ? 0.0 : nil)
+
+            dailyBreakdown.append(
+                DailyLedgerDay(
+                    dateString: dateStr,
+                    dayStart: dayStart,
+                    uncachedInputTokens: dayUncached,
+                    cachedInputTokens: dayCached,
+                    cacheWriteTokens: dayCW,
+                    outputTokens: dayOut,
+                    totalTokens: dayTot,
+                    recordCount: dayRec,
+                    pricedRecordCount: dayPriced,
+                    unmatchedModelCount: dayUnmatched,
+                    estimatedCostUSD: dayCost,
+                    hasCodexRolloutMismatch: codexDay.hasRolloutMismatch,
+                    codexMismatchDetails: codexDay.mismatchDetails,
+                    rateLimit429Count: dayRLTotal,
+                    vendors: vendorMetricsMap
+                )
+            )
         }
 
         // Roll up recent sessions by (vendor, sessionID) preserving exact per-turn costs and breakdown honesty
         var groupedSessions: [String: UsageSample] = [:]
-        for sample in samples {
+        for sample in samples where sample.timestamp <= now {
             let key = "\(sample.vendor.rawValue)::\(sample.sessionID)"
             if let existing = groupedSessions[key] {
                 let newerTS = max(existing.timestamp, sample.timestamp)
@@ -297,16 +458,9 @@ public enum LocalTelemetryCollector {
                     }
                 }()
                 let combinedMismatch = existing.hasRolloutMismatch || sample.hasRolloutMismatch
-                let combinedExpectedTokens: Int? = {
-                    switch (existing.expectedTotalTokens, sample.expectedTotalTokens) {
-                    case let (a?, b?): return a + b
-                    case let (a?, nil): return a
-                    case let (nil, b?): return b
-                    case (nil, nil): return nil
-                    }
-                }()
+                let combinedExpectedTokens: Int? = existing.expectedTotalTokens ?? sample.expectedTotalTokens
                 let combinedMismatchNote: String? = {
-                    let parts = [existing.mismatchNote, sample.mismatchNote].compactMap { $0 }.filter { !$0.isEmpty }
+                    let parts = uniqueStrings([existing.mismatchNote, sample.mismatchNote].compactMap { $0 }.filter { !$0.isEmpty })
                     return parts.isEmpty ? nil : parts.joined(separator: "; ")
                 }()
                 groupedSessions[key] = UsageSample(
@@ -344,11 +498,14 @@ public enum LocalTelemetryCollector {
 
         return TelemetrySnapshot(
             capturedAt: now,
+            timeZoneIdentifier: timeZone.identifier,
             isDemoData: false,
             vendorSummaries: summaries,
             dailyBuckets: dailyBuckets,
+            dailyBreakdown: dailyBreakdown,
             recentSessions: recentSessions,
-            relayRuns: relayRuns.sorted { $0.updatedAt > $1.updatedAt }
+            relayRuns: relayRuns.sorted { $0.updatedAt > $1.updatedAt },
+            rateLimitEvents: rateLimitEvents
         )
     }
 
@@ -364,7 +521,9 @@ public enum LocalTelemetryCollector {
             if samples.contains(where: { $0.origin == .relayLog }) {
                 return .relayOnly
             }
-            // Standalone meta.json lacks prompt cache breakdown and misses journal/*.jsonl sessions in M0.
+            if samples.allSatisfy(\.hasTokenBreakdown) {
+                return .complete
+            }
             return .totalOnly
         case .claudeCode, .codex, .openCode:
             if samples.contains(where: \.hasRolloutMismatch) {
@@ -380,16 +539,20 @@ public enum LocalTelemetryCollector {
     private static func computeWindowMetrics(
         vendor: AgentVendor,
         slice: [UsageSample],
+        rateLimit429Count: Int = 0,
         overallCompleteness: DataCompleteness,
         sourceAvailable: Bool,
         dataSource: String
     ) -> VendorWindowMetrics {
         if slice.isEmpty {
-            // Vibe and Antigravity lack standalone token telemetry, so an empty slice means No Data (never 0 / complete).
-            if vendor == .mistralVibe || vendor == .antigravity || !sourceAvailable || overallCompleteness == .noData {
-                return .empty(dataSource: dataSource, completeness: .noData)
+            if vendor == .antigravity
+                || !sourceAvailable
+                || overallCompleteness == .noData
+                || overallCompleteness == .relayOnly {
+                var empty = VendorWindowMetrics.empty(dataSource: dataSource, completeness: .noData)
+                empty.rateLimit429Count = rateLimit429Count
+                return empty
             }
-            // Active standalone SQLite/JSONL store with 0 records in this shorter window:
             if overallCompleteness == .complete {
                 return VendorWindowMetrics(
                     inputTokens: 0,
@@ -403,7 +566,8 @@ public enum LocalTelemetryCollector {
                     unknownModelRecordCount: 0,
                     cacheHitRate: nil,
                     dataSource: dataSource,
-                    completeness: .complete
+                    completeness: .complete,
+                    rateLimit429Count: rateLimit429Count
                 )
             }
             return VendorWindowMetrics(
@@ -418,7 +582,8 @@ public enum LocalTelemetryCollector {
                 unknownModelRecordCount: 0,
                 cacheHitRate: nil,
                 dataSource: dataSource,
-                completeness: overallCompleteness == .mismatch ? .mismatch : .totalOnly
+                completeness: overallCompleteness == .mismatch ? .mismatch : .totalOnly,
+                rateLimit429Count: rateLimit429Count
             )
         }
 
@@ -426,8 +591,8 @@ public enum LocalTelemetryCollector {
         let unknownModels = slice.map(\.unmatchedModelCount).reduce(0, +)
         let mismatchSamples = slice.filter(\.hasRolloutMismatch)
         let hasMismatch = !mismatchSamples.isEmpty
-        let mismatchCount = mismatchSamples.count
-        let mismatchDetails = mismatchSamples.compactMap(\.mismatchNote)
+        let mismatchCount = Set(mismatchSamples.map(\.sessionID)).count
+        let mismatchDetails = uniqueStrings(mismatchSamples.compactMap(\.mismatchNote))
 
         if completeness == .complete || (completeness == .mismatch && slice.allSatisfy(\.hasTokenBreakdown)) {
             let inp = slice.map(\.inputTokens).reduce(0, +)
@@ -455,14 +620,14 @@ public enum LocalTelemetryCollector {
                 completeness: completeness,
                 hasRolloutMismatch: hasMismatch,
                 rolloutMismatchCount: mismatchCount,
-                mismatchDetails: mismatchDetails
+                mismatchDetails: mismatchDetails,
+                rateLimit429Count: rateLimit429Count
             )
         } else {
             let knownTots = slice.compactMap(\.knownTotalTokens)
             let tot: Int? = knownTots.isEmpty ? nil : knownTots.reduce(0, +)
             let pricedAndCost: (count: Int, cost: Double?) = {
                 if completeness == .totalOnly || completeness == .mismatch {
-                    // Without breakdown across all records in the slice, cost is only known if explicitly recorded for all records.
                     let recs = slice.compactMap { ($0.recordedCostUSD ?? 0) > 0 ? $0.recordedCostUSD : nil }
                     let known = (recs.count == slice.count && !recs.isEmpty) ? recs.reduce(0, +) : nil
                     return (known != nil ? recs.count : 0, known)
@@ -486,7 +651,8 @@ public enum LocalTelemetryCollector {
                 completeness: completeness,
                 hasRolloutMismatch: hasMismatch,
                 rolloutMismatchCount: mismatchCount,
-                mismatchDetails: mismatchDetails
+                mismatchDetails: mismatchDetails,
+                rateLimit429Count: rateLimit429Count
             )
         }
     }
@@ -500,20 +666,98 @@ public enum LocalTelemetryCollector {
         }
     }
 
-    // MARK: - 1. Claude Code JSONL Reader (Read-Only, In-Memory Line Parsing Extracting Token/Model/Timestamp Fields Only, Deduplicated by message.id + requestId)
+    private static func uniqueStrings(_ items: [String]) -> [String] {
+        var seen: Set<String> = []
+        var out: [String] = []
+        for s in items where !s.isEmpty {
+            if seen.insert(s).inserted {
+                out.append(s)
+            }
+        }
+        return out
+    }
+
+    // MARK: - Structured 429 / Rate-Limit Detection (Zero Substring Matching on Free-Form Text)
+
+    private static let structuredRateLimitCodes: Set<String> = [
+        "429",
+        "rate_limit",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "resource_exhausted"
+    ]
+
+    private static func hasStructured429Status(_ dict: [String: Any]) -> Bool {
+        for key in ["status", "status_code", "statusCode", "http_status", "httpStatus"] {
+            if let v = dict[key], intVal(v) == 429 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func isStructuredRateLimitValue(_ any: Any?) -> Bool {
+        guard let any else { return false }
+        if let s = any as? String {
+            let norm = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return structuredRateLimitCodes.contains(norm)
+        }
+        if let n = any as? NSNumber {
+            return n.intValue == 429
+        }
+        if let dict = any as? [String: Any] {
+            if hasStructured429Status(dict) {
+                return true
+            }
+            for key in ["code", "type", "error_code", "errorCode", "reason"] {
+                if let v = dict[key] {
+                    if let s = v as? String,
+                       structuredRateLimitCodes.contains(s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
+                        return true
+                    }
+                    if let n = v as? NSNumber, n.intValue == 429 {
+                        return true
+                    }
+                }
+            }
+            if let nestedData = dict["data"] as? [String: Any], isStructuredRateLimitValue(nestedData) {
+                return true
+            }
+            if let nestedErr = dict["error"], isStructuredRateLimitValue(nestedErr) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // MARK: - 1. Claude Code JSONL Reader (Read-Only, In-Memory Line Parsing, Deduplicated by message.id + requestId)
 
     public static func collectClaudeSamples(
         dir: URL,
         since: Date,
         now: Date = Date()
     ) -> (samples: [UsageSample], rateLimitHits24h: Int) {
+        let res = collectClaudeTelemetry(dir: dir, since: since, now: now)
+        return (res.samples, res.rateLimitHits24h)
+    }
+
+    public static func collectClaudeTelemetry(
+        dir: URL,
+        since: Date,
+        now: Date = Date()
+    ) -> ClaudeCollectionResult {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: dir.path) else { return ([], 0) }
+        guard fm.fileExists(atPath: dir.path) else {
+            return ClaudeCollectionResult(samples: [], rateLimitEvents: [], rateLimitHits24h: 0)
+        }
         guard let enumerator = fm.enumerator(
             at: dir,
             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
-        ) else { return ([], 0) }
+        ) else {
+            return ClaudeCollectionResult(samples: [], rateLimitEvents: [], rateLimitHits24h: 0)
+        }
 
         let isoFrac = ISO8601DateFormatter()
         isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -538,7 +782,7 @@ public enum LocalTelemetryCollector {
         let upperBound = now
         var deduped: [String: ClaudeAccumulator] = [:]
         var nextOrder = 0
-        var rateLimits = 0
+        var rateLimitDedup: [String: RateLimitEvent] = [:]
 
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "jsonl" else { continue }
@@ -553,22 +797,58 @@ public enum LocalTelemetryCollector {
             var lineIdx = 0
             text.enumerateLines { line, _ in
                 lineIdx += 1
-                guard line.contains("\"assistant\"") || line.contains("429") || line.contains("rate_limit") else { return }
+                guard line.contains("\"assistant\"") || line.contains("\"error\"") || line.contains("429") || line.contains("rate_limit") else { return }
                 guard let data = line.data(using: .utf8),
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
 
                 let tsStr = obj["timestamp"] as? String ?? ""
                 let parsedTS = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr)
+                let sessID = (obj["sessionId"] as? String) ?? fileURL.deletingPathExtension().lastPathComponent
+                let msg = obj["message"] as? [String: Any]
+                let msgID = (msg?["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let reqID = (obj["requestId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-                if let isApiErr = obj["isApiErrorMessage"] as? Bool, isApiErr {
-                    if let parsedTS, parsedTS >= dayAgo, parsedTS <= upperBound,
-                       (line.contains("429") || line.localizedCaseInsensitiveContains("rate")) {
-                        rateLimits += 1
+                let isStructured429: Bool = {
+                    if let isApiErr = obj["isApiErrorMessage"] as? Bool, isApiErr {
+                        return isStructuredRateLimitValue(obj["error"]) || hasStructured429Status(obj)
+                    }
+                    if (obj["type"] as? String) == "error" {
+                        return isStructuredRateLimitValue(obj["error"]) || hasStructured429Status(obj)
+                    }
+                    if let errDict = obj["error"] as? [String: Any] {
+                        return isStructuredRateLimitValue(errDict)
+                    }
+                    return false
+                }()
+
+                if isStructured429 {
+                    let rlTS = parsedTS ?? now
+                    if rlTS >= since && rlTS <= upperBound {
+                        let rlKey: String
+                        if !msgID.isEmpty && !reqID.isEmpty {
+                            rlKey = "mr:\(msgID)::\(reqID)"
+                        } else if !reqID.isEmpty {
+                            rlKey = "r:\(reqID)"
+                        } else if !msgID.isEmpty {
+                            rlKey = "m:\(msgID)"
+                        } else if let uuid = obj["uuid"] as? String, !uuid.isEmpty {
+                            rlKey = "u:\(uuid)"
+                        } else {
+                            rlKey = "line:\(fileURL.path)::\(lineIdx)"
+                        }
+                        if rateLimitDedup[rlKey] == nil {
+                            rateLimitDedup[rlKey] = RateLimitEvent(
+                                id: "claude-429-\(rlKey)",
+                                vendor: .claudeCode,
+                                timestamp: rlTS,
+                                sessionID: sessID
+                            )
+                        }
                     }
                 }
 
                 guard (obj["type"] as? String) == "assistant",
-                      let msg = obj["message"] as? [String: Any],
+                      let msg,
                       let usage = msg["usage"] as? [String: Any] else { return }
 
                 let inp = intVal(usage["input_tokens"])
@@ -578,8 +858,6 @@ public enum LocalTelemetryCollector {
                 let cost = (obj["costUSD"] as? NSNumber)?.doubleValue
                 if inp == 0 && out == 0 && cr == 0 && cw == 0 && (cost ?? 0) == 0 { return }
 
-                let msgID = (msg["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let reqID = (obj["requestId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let dedupKey: String
                 if !msgID.isEmpty && !reqID.isEmpty {
                     dedupKey = "mr:\(msgID)::\(reqID)"
@@ -592,7 +870,6 @@ public enum LocalTelemetryCollector {
                 }
 
                 let model = (msg["model"] as? String) ?? ""
-                let sessID = (obj["sessionId"] as? String) ?? fileURL.deletingPathExtension().lastPathComponent
                 let cwd = obj["cwd"] as? String
                 let project = cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? fallbackProject
                 let eventTS = parsedTS ?? now
@@ -647,10 +924,12 @@ public enum LocalTelemetryCollector {
                     recordedCostUSD: acc.cost
                 )
             }
-        return (samples, rateLimits)
+        let rlEvents = rateLimitDedup.values.sorted { $0.timestamp < $1.timestamp }
+        let hits24h = rlEvents.filter { $0.timestamp >= dayAgo && $0.timestamp <= upperBound }.count
+        return ClaudeCollectionResult(samples: samples, rateLimitEvents: rlEvents, rateLimitHits24h: hits24h)
     }
 
-    // MARK: - 2. Codex SQLite + Rollout JSONL Reader (SQLITE_OPEN_READONLY, Zero Fixed-Ratio Splits)
+    // MARK: - 2. Codex SQLite + Per-Event Rollout JSONL Reader (SQLITE_OPEN_READONLY, Incremental Event Deltas)
 
     public static func collectCodexSamples(
         dbURL: URL,
@@ -658,72 +937,109 @@ public enum LocalTelemetryCollector {
         now: Date = Date(),
         allowZstd: Bool = true
     ) -> [UsageSample] {
-        guard FileManager.default.fileExists(atPath: dbURL.path) else { return [] }
+        collectCodexTelemetry(dbURL: dbURL, since: since, now: now, allowZstd: allowZstd).samples
+    }
+
+    public static func collectCodexTelemetry(
+        dbURL: URL,
+        since: Date,
+        now: Date = Date(),
+        allowZstd: Bool = true
+    ) -> CodexCollectionResult {
+        guard FileManager.default.fileExists(atPath: dbURL.path) else {
+            return CodexCollectionResult(samples: [], rateLimitEvents: [])
+        }
         var db: OpaquePointer?
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
         guard sqlite3_open_v2(dbURL.path, &db, flags, nil) == SQLITE_OK, let db else {
             if let db { sqlite3_close(db) }
-            return []
+            return CodexCollectionResult(samples: [], rateLimitEvents: [])
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 250)
 
         let hasModelCol = tableHasColumn(db: db, table: "threads", column: "model")
         let hasRolloutCol = tableHasColumn(db: db, table: "threads", column: "rollout_path")
+        let hasCreatedCol = tableHasColumn(db: db, table: "threads", column: "created_at")
         let modelExpr = hasModelCol ? "model" : "NULL"
         let rolloutExpr = hasRolloutCol ? "rollout_path" : "NULL"
-        let sql = "SELECT id, cwd, tokens_used, updated_at, \(modelExpr), \(rolloutExpr) FROM threads WHERE tokens_used > 0;"
+        let createdExpr = hasCreatedCol ? "created_at" : "0"
+        let sql = "SELECT id, cwd, tokens_used, updated_at, \(createdExpr), \(modelExpr), \(rolloutExpr) FROM threads WHERE tokens_used > 0;"
 
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            return CodexCollectionResult(samples: [], rateLimitEvents: [])
+        }
         defer { sqlite3_finalize(stmt) }
 
         let upperBound = now
         var results: [UsageSample] = []
+        var rateLimits: [RateLimitEvent] = []
+
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = columnText(stmt, 0) ?? UUID().uuidString
             let cwd = columnText(stmt, 1) ?? ""
             let totalTok = Int(sqlite3_column_int64(stmt, 2))
-            let rawEpoch = sqlite3_column_int64(stmt, 3)
-            let dbModel = (columnText(stmt, 4) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let rolloutPath = (columnText(stmt, 5) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawUpdated = sqlite3_column_int64(stmt, 3)
+            let rawCreated = sqlite3_column_int64(stmt, 4)
+            let dbModel = (columnText(stmt, 5) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let rolloutPath = (columnText(stmt, 6) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
-            let ts = normalizeEpoch(rawEpoch)
-            if ts < since || ts > upperBound { continue }
-
+            let ts = normalizeEpoch(rawUpdated > 0 ? rawUpdated : rawCreated)
             let proj = cwd.isEmpty ? "codex" : URL(fileURLWithPath: cwd).lastPathComponent
 
             if !rolloutPath.isEmpty,
-               let breakdown = readCodexRolloutBreakdown(
-                   rolloutPath: rolloutPath,
-                   expectedTotalTokens: totalTok,
-                   allowZstd: allowZstd
-               ) {
-                let effectiveModel = !dbModel.isEmpty ? dbModel : (breakdown.model ?? "")
-                let rolloutTotal = breakdown.rolloutTotalTokens
-                let isMismatch = (rolloutTotal != totalTok)
-                    || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)
-                let note: String? = isMismatch ? "\(id): rollout=\(rolloutTotal) vs sqlite=\(totalTok)" : nil
-                results.append(
-                    UsageSample(
-                        id: "codex-\(id)",
-                        vendor: .codex,
-                        origin: .standalone,
-                        timestamp: ts,
-                        sessionID: id,
-                        projectName: proj,
-                        model: effectiveModel,
-                        inputTokens: breakdown.uncachedInput,
-                        outputTokens: breakdown.output,
-                        cacheReadTokens: breakdown.cachedInput,
-                        cacheWriteTokens: breakdown.cacheWrite,
-                        hasRolloutMismatch: isMismatch,
-                        expectedTotalTokens: totalTok,
-                        mismatchNote: note
-                    )
-                )
-            } else {
-                // No rollout breakdown available: report ONLY totalTokens = tokens_used, breakdown & cost = nil.
+               ts >= since.addingTimeInterval(-86_400),
+               let breakdown = readCodexRolloutEntry(rolloutPath: rolloutPath, allowZstd: allowZstd) {
+                for rl in breakdown.rateLimits {
+                    let rlTS = rl.timestamp ?? ts
+                    if rlTS >= since && rlTS <= upperBound {
+                        rateLimits.append(
+                            RateLimitEvent(
+                                id: "codex-429-\(id)-\(rl.index)",
+                                vendor: .codex,
+                                timestamp: rlTS,
+                                sessionID: id
+                            )
+                        )
+                    }
+                }
+
+                if !breakdown.events.isEmpty {
+                    let rolloutTotal = breakdown.rolloutTotalTokens
+                    let isMismatch = (rolloutTotal != totalTok)
+                        || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)
+                    let note: String? = isMismatch ? "\(id): rollout=\(rolloutTotal) vs sqlite=\(totalTok)" : nil
+
+                    for ev in breakdown.events {
+                        let evTS = ev.timestamp ?? ts
+                        guard evTS >= since && evTS <= upperBound else { continue }
+                        let effectiveModel = (ev.model?.isEmpty == false) ? ev.model! : dbModel
+                        results.append(
+                            UsageSample(
+                                id: "codex-\(id)-\(ev.index)",
+                                vendor: .codex,
+                                origin: .standalone,
+                                timestamp: evTS,
+                                sessionID: id,
+                                projectName: proj,
+                                model: effectiveModel,
+                                inputTokens: ev.uncachedInput,
+                                outputTokens: ev.output,
+                                cacheReadTokens: ev.cachedInput,
+                                cacheWriteTokens: ev.cacheWrite,
+                                hasRolloutMismatch: isMismatch,
+                                expectedTotalTokens: isMismatch ? totalTok : nil,
+                                mismatchNote: note
+                            )
+                        )
+                    }
+                    continue
+                }
+            }
+
+            // Fallback when no rollout file (or rollout contains 0 token_count events): attribute totalTokens to session timestamp.
+            if ts >= since && ts <= upperBound {
                 results.append(
                     UsageSample(
                         unsplitID: "codex-\(id)",
@@ -738,12 +1054,11 @@ public enum LocalTelemetryCollector {
                 )
             }
         }
-        return results
+        return CodexCollectionResult(samples: results, rateLimitEvents: rateLimits)
     }
 
-    private static func readCodexRolloutBreakdown(
+    private static func readCodexRolloutEntry(
         rolloutPath: String,
-        expectedTotalTokens: Int,
         allowZstd: Bool
     ) -> CodexRolloutCache.Entry? {
         let fm = FileManager.default
@@ -751,7 +1066,7 @@ public enum LocalTelemetryCollector {
             let attrs = try? fm.attributesOfItem(atPath: rolloutPath)
             let mod = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
             let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
-            let cacheKey = CodexRolloutCache.Key(path: rolloutPath, modTime: mod, fileSize: size, expectedTotalTokens: expectedTotalTokens)
+            let cacheKey = CodexRolloutCache.Key(path: rolloutPath, modTime: mod, fileSize: size)
             if let cached = CodexRolloutCache.shared.get(cacheKey) {
                 return cached
             }
@@ -767,7 +1082,7 @@ public enum LocalTelemetryCollector {
             let attrs = try? fm.attributesOfItem(atPath: zstPath)
             let mod = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
             let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
-            let cacheKey = CodexRolloutCache.Key(path: zstPath, modTime: mod, fileSize: size, expectedTotalTokens: expectedTotalTokens)
+            let cacheKey = CodexRolloutCache.Key(path: zstPath, modTime: mod, fileSize: size)
             if let cached = CodexRolloutCache.shared.get(cacheKey) {
                 return cached
             }
@@ -789,24 +1104,9 @@ public enum LocalTelemetryCollector {
 
     private static func parsePlainRolloutFile(atPath path: String) -> CodexRolloutCache.Entry? {
         let url = URL(fileURLWithPath: path)
-        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? fh.close() }
-
-        let tailBytes: UInt64 = 512 * 1024
-        let fileSize = (try? fh.seekToEnd()) ?? 0
-        if fileSize > tailBytes {
-            try? fh.seek(toOffset: fileSize - tailBytes)
-            if let tailData = try? fh.readToEnd(),
-               let tailText = String(data: tailData, encoding: .utf8),
-               let entry = extractLastCodexUsage(from: tailText) {
-                return entry
-            }
-        }
-
-        try? fh.seek(toOffset: 0)
-        guard let fullData = try? fh.readToEnd() else { return nil }
+        guard let fullData = try? Data(contentsOf: url, options: [.mappedIfSafe]) else { return nil }
         let fullText = String(decoding: fullData, as: UTF8.self)
-        return extractLastCodexUsage(from: fullText)
+        return extractCodexRolloutEvents(from: fullText)
     }
 
     private static func parseZstdRolloutFile(atPath zstPath: String, zstdExecutable: String) -> CodexRolloutCache.Entry? {
@@ -825,113 +1125,342 @@ public enum LocalTelemetryCollector {
         proc.waitUntilExit()
         guard proc.terminationStatus == 0, !data.isEmpty else { return nil }
         let text = String(decoding: data, as: UTF8.self)
-        return extractLastCodexUsage(from: text)
+        return extractCodexRolloutEvents(from: text)
     }
 
-    private static func extractLastCodexUsage(from text: String) -> CodexRolloutCache.Entry? {
-        var lastUsage: [String: Any]?
-        var latestModel: String?
+    private static func extractCodexRolloutEvents(from text: String) -> CodexRolloutCache.Entry {
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+
+        var events: [CodexRolloutCache.TurnEvent] = []
+        var rateLimits: [CodexRolloutCache.RateLimitHit] = []
+        var currentModel: String?
+        var prevUncached = 0
+        var prevCached = 0
+        var prevCacheWrite = 0
+        var prevOutput = 0
+        var baseReportedTotal = 0
+        var lastSegmentReported: Int?
+        var lineIndex = 0
 
         text.enumerateLines { line, _ in
-            guard line.contains("\"token_count\"") || line.contains("\"turn_context\"") else { return }
+            lineIndex += 1
+            guard line.contains("\"token_count\"")
+                || line.contains("\"turn_context\"")
+                || line.contains("\"error\"")
+                || line.contains("429")
+                || line.contains("rate_limit") else { return }
             guard let data = line.data(using: .utf8),
-                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let payload = obj["payload"] as? [String: Any] else { return }
-            let topType = obj["type"] as? String
-            if topType == "turn_context", let m = payload["model"] as? String, !m.isEmpty {
-                latestModel = m
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+
+            let tsStr = (obj["timestamp"] as? String) ?? ""
+            let parsedTS = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr)
+            let topType = (obj["type"] as? String) ?? ""
+            let payload = obj["payload"] as? [String: Any]
+
+            // Check structured 429 in Codex rollout record
+            let is429: Bool = {
+                if hasStructured429Status(obj) || isStructuredRateLimitValue(obj["error"]) {
+                    return true
+                }
+                if let payload {
+                    if hasStructured429Status(payload) || isStructuredRateLimitValue(payload["error"]) {
+                        return true
+                    }
+                    if (payload["type"] as? String) == "error", isStructuredRateLimitValue(payload) {
+                        return true
+                    }
+                }
+                return false
+            }()
+            if is429 {
+                rateLimits.append(CodexRolloutCache.RateLimitHit(index: lineIndex, timestamp: parsedTS))
+            }
+
+            guard let payload else { return }
+            if topType == "turn_context",
+               let m = (payload["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !m.isEmpty {
+                currentModel = m
             } else if topType == "event_msg",
                       (payload["type"] as? String) == "token_count",
                       let info = payload["info"] as? [String: Any],
-                      let totalUsage = info["total_token_usage"] as? [String: Any] {
-                if totalUsage["input_tokens"] != nil && totalUsage["output_tokens"] != nil {
-                    lastUsage = totalUsage
+                      let totalUsage = info["total_token_usage"] as? [String: Any],
+                      totalUsage["input_tokens"] != nil,
+                      totalUsage["output_tokens"] != nil {
+                let rawInput = max(0, intVal(totalUsage["input_tokens"]))
+                let cachedInput = max(0, intVal(totalUsage["cached_input_tokens"]))
+                let cacheWrite = max(0, intVal(totalUsage["cache_write_input_tokens"]))
+                let output = max(0, intVal(totalUsage["output_tokens"]))
+                let uncachedInput = max(0, rawInput - cachedInput)
+
+                // Handle cumulative counter reset if a rollout segment restarts counters from 0
+                if uncachedInput < prevUncached || cachedInput < prevCached || cacheWrite < prevCacheWrite || output < prevOutput {
+                    if let lastSeg = lastSegmentReported {
+                        baseReportedTotal += lastSeg
+                    }
+                    prevUncached = 0
+                    prevCached = 0
+                    prevCacheWrite = 0
+                    prevOutput = 0
                 }
+
+                let dUncached = max(0, uncachedInput - prevUncached)
+                let dCached = max(0, cachedInput - prevCached)
+                let dCW = max(0, cacheWrite - prevCacheWrite)
+                let dOut = max(0, output - prevOutput)
+
+                prevUncached = uncachedInput
+                prevCached = cachedInput
+                prevCacheWrite = cacheWrite
+                prevOutput = output
+                if totalUsage["total_tokens"] != nil {
+                    lastSegmentReported = max(0, intVal(totalUsage["total_tokens"]))
+                }
+
+                let deltaTotal = dUncached + dCached + dCW + dOut
+                guard deltaTotal > 0 else { return }
+
+                events.append(
+                    CodexRolloutCache.TurnEvent(
+                        index: events.count + 1,
+                        timestamp: parsedTS,
+                        uncachedInput: dUncached,
+                        cachedInput: dCached,
+                        cacheWrite: dCW,
+                        output: dOut,
+                        model: currentModel
+                    )
+                )
             }
         }
 
-        guard let usage = lastUsage else { return nil }
-        let rawInput = max(0, intVal(usage["input_tokens"]))
-        let cachedInput = max(0, intVal(usage["cached_input_tokens"]))
-        let cacheWrite = max(0, intVal(usage["cache_write_input_tokens"]))
-        let output = max(0, intVal(usage["output_tokens"]))
-        let uncachedInput = max(0, rawInput - cachedInput)
-        let reportedTotal: Int? = usage["total_tokens"] != nil ? max(0, intVal(usage["total_tokens"])) : nil
-        guard (uncachedInput + cachedInput + cacheWrite + output) > 0 else { return nil }
-
+        let totalReported: Int? = lastSegmentReported.map { baseReportedTotal + $0 }
         return CodexRolloutCache.Entry(
-            uncachedInput: uncachedInput,
-            cachedInput: cachedInput,
-            cacheWrite: cacheWrite,
-            output: output,
-            reportedTotalTokens: reportedTotal,
-            model: latestModel
+            events: events,
+            rateLimits: rateLimits,
+            reportedTotalTokens: totalReported,
+            latestModel: currentModel
         )
     }
 
-    // MARK: - 3. OpenCode SQLite Reader (SQLITE_OPEN_READONLY)
+    // MARK: - 3. OpenCode SQLite Reader (SQLITE_OPEN_READONLY, Per-Event session_message + session_v2 Fallback)
 
     public static func collectOpenCodeSamples(
         dbURL: URL,
         since: Date,
         now: Date = Date()
     ) -> [UsageSample] {
-        guard FileManager.default.fileExists(atPath: dbURL.path) else { return [] }
+        collectOpenCodeTelemetry(dbURL: dbURL, since: since, now: now).samples
+    }
+
+    public static func collectOpenCodeTelemetry(
+        dbURL: URL,
+        since: Date,
+        now: Date = Date()
+    ) -> OpenCodeCollectionResult {
+        guard FileManager.default.fileExists(atPath: dbURL.path) else {
+            return OpenCodeCollectionResult(samples: [], rateLimitEvents: [])
+        }
         var db: OpaquePointer?
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX
         guard sqlite3_open_v2(dbURL.path, &db, flags, nil) == SQLITE_OK, let db else {
             if let db { sqlite3_close(db) }
-            return []
+            return OpenCodeCollectionResult(samples: [], rateLimitEvents: [])
         }
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 250)
 
-        let sql = """
-        SELECT id, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, time_updated
-        FROM session_v2;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
+        struct SessionV2Row {
+            let id: String
+            let projectName: String
+            let cost: Double
+            let tIn: Int
+            let tOut: Int
+            let tCR: Int
+            let tCW: Int
+            let cleanModel: String
+            let timeUpdated: Date
+        }
+
+        var sessionMap: [String: SessionV2Row] = [:]
+        var sessionOrder: [String] = []
+
+        if tableExists(db: db, table: "session_v2") {
+            let sqlV2 = """
+            SELECT id, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, time_updated
+            FROM session_v2;
+            """
+            var stmtV2: OpaquePointer?
+            if sqlite3_prepare_v2(db, sqlV2, -1, &stmtV2, nil) == SQLITE_OK, let stmtV2 {
+                defer { sqlite3_finalize(stmtV2) }
+                while sqlite3_step(stmtV2) == SQLITE_ROW {
+                    let id = columnText(stmtV2, 0) ?? UUID().uuidString
+                    let dir = columnText(stmtV2, 1) ?? ""
+                    let cost = sqlite3_column_double(stmtV2, 2)
+                    let tIn = Int(sqlite3_column_int64(stmtV2, 3))
+                    let tOut = Int(sqlite3_column_int64(stmtV2, 4)) + Int(sqlite3_column_int64(stmtV2, 5))
+                    let tCR = Int(sqlite3_column_int64(stmtV2, 6))
+                    let tCW = Int(sqlite3_column_int64(stmtV2, 7))
+                    let rawModel = columnText(stmtV2, 8) ?? ""
+                    let rawUpdated = sqlite3_column_int64(stmtV2, 9)
+
+                    let proj = dir.isEmpty ? "opencode" : URL(fileURLWithPath: dir).lastPathComponent
+                    let row = SessionV2Row(
+                        id: id,
+                        projectName: proj,
+                        cost: cost,
+                        tIn: tIn,
+                        tOut: tOut,
+                        tCR: tCR,
+                        tCW: tCW,
+                        cleanModel: parseOpenCodeModelLabel(rawModel),
+                        timeUpdated: normalizeEpoch(rawUpdated)
+                    )
+                    sessionMap[id] = row
+                    sessionOrder.append(id)
+                }
+            }
+        }
 
         let upperBound = now
         var results: [UsageSample] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let id = columnText(stmt, 0) ?? UUID().uuidString
-            let dir = columnText(stmt, 1) ?? ""
-            let cost = sqlite3_column_double(stmt, 2)
-            let tIn = Int(sqlite3_column_int64(stmt, 3))
-            let tOut = Int(sqlite3_column_int64(stmt, 4)) + Int(sqlite3_column_int64(stmt, 5))
-            let tCR = Int(sqlite3_column_int64(stmt, 6))
-            let tCW = Int(sqlite3_column_int64(stmt, 7))
-            let rawModel = columnText(stmt, 8) ?? ""
-            let rawUpdated = sqlite3_column_int64(stmt, 9)
+        var rateLimits: [RateLimitEvent] = []
+        var sessionsWithMessages: Set<String> = []
 
-            if tIn == 0 && tOut == 0 && tCR == 0 && tCW == 0 && cost <= 0 { continue }
-            let ts = normalizeEpoch(rawUpdated)
-            if ts < since || ts > upperBound { continue }
+        let msgTable: String? = {
+            if tableExists(db: db, table: "session_message") { return "session_message" }
+            if tableExists(db: db, table: "message") { return "message" }
+            return nil
+        }()
 
-            let cleanModel = parseOpenCodeModelLabel(rawModel)
-            let proj = dir.isEmpty ? "opencode" : URL(fileURLWithPath: dir).lastPathComponent
+        if let msgTable {
+            let hasTypeCol = tableHasColumn(db: db, table: msgTable, column: "type")
+            let hasTimeCol = tableHasColumn(db: db, table: msgTable, column: "time_created")
+            let typeExpr = hasTypeCol ? "type" : "NULL"
+            let timeExpr = hasTimeCol ? "time_created" : "0"
+            let whereClause = hasTypeCol
+                ? "WHERE type IN ('assistant', 'compaction') OR instr(data, 'error') > 0 OR instr(data, '429') > 0"
+                : ""
+            let sqlMsg = "SELECT id, session_id, \(typeExpr), \(timeExpr), data FROM \(msgTable) \(whereClause);"
 
+            var stmtMsg: OpaquePointer?
+            if sqlite3_prepare_v2(db, sqlMsg, -1, &stmtMsg, nil) == SQLITE_OK, let stmtMsg {
+                defer { sqlite3_finalize(stmtMsg) }
+                while sqlite3_step(stmtMsg) == SQLITE_ROW {
+                    let msgID = columnText(stmtMsg, 0) ?? UUID().uuidString
+                    let sessID = columnText(stmtMsg, 1) ?? ""
+                    let rowType = (columnText(stmtMsg, 2) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawTimeCreated = sqlite3_column_int64(stmtMsg, 3)
+                    guard let dataStr = columnText(stmtMsg, 4),
+                          let dataBytes = dataStr.data(using: .utf8),
+                          let obj = (try? JSONSerialization.jsonObject(with: dataBytes)) as? [String: Any] else { continue }
+
+                    let msgTS: Date = {
+                        if let timeDict = obj["time"] as? [String: Any],
+                           let createdEpoch = int64Val(timeDict["created"]) ?? int64Val(timeDict["completed"]),
+                           createdEpoch > 0 {
+                            return normalizeEpoch(createdEpoch)
+                        }
+                        if rawTimeCreated > 0 {
+                            return normalizeEpoch(rawTimeCreated)
+                        }
+                        return sessionMap[sessID]?.timeUpdated ?? now
+                    }()
+
+                    if isStructuredRateLimitValue(obj["error"]) || hasStructured429Status(obj) {
+                        if msgTS >= since && msgTS <= upperBound {
+                            rateLimits.append(
+                                RateLimitEvent(
+                                    id: "opencode-429-\(msgID)",
+                                    vendor: .openCode,
+                                    timestamp: msgTS,
+                                    sessionID: sessID
+                                )
+                            )
+                        }
+                    }
+
+                    let roleOrType = rowType.isEmpty ? ((obj["role"] as? String) ?? (obj["type"] as? String) ?? "") : rowType
+                    if !roleOrType.isEmpty && roleOrType != "assistant" && roleOrType != "compaction" {
+                        continue
+                    }
+
+                    let tokDict = obj["tokens"] as? [String: Any]
+                    let cacheDict = tokDict?["cache"] as? [String: Any]
+                    // Verified against live opencode.db: tokens.input in session_message is ALREADY uncached input.
+                    let tIn = max(0, intVal(tokDict?["input"]))
+                    let tOut = max(0, intVal(tokDict?["output"])) + max(0, intVal(tokDict?["reasoning"]))
+                    let tCR = max(0, intVal(cacheDict?["read"]))
+                    let tCW = max(0, intVal(cacheDict?["write"]))
+                    let cost = (obj["cost"] as? NSNumber)?.doubleValue ?? 0.0
+
+                    if tIn == 0 && tOut == 0 && tCR == 0 && tCW == 0 && cost <= 0 { continue }
+                    sessionsWithMessages.insert(sessID)
+
+                    guard msgTS >= since && msgTS <= upperBound else { continue }
+
+                    let model: String = {
+                        if let mDict = obj["model"] as? [String: Any] {
+                            if let id = mDict["id"] as? String, !id.isEmpty { return id }
+                            if let id = mDict["modelID"] as? String, !id.isEmpty { return id }
+                        }
+                        if let mStr = obj["model"] as? String, !mStr.isEmpty {
+                            return parseOpenCodeModelLabel(mStr)
+                        }
+                        if let mID = obj["modelID"] as? String, !mID.isEmpty {
+                            return mID
+                        }
+                        return sessionMap[sessID]?.cleanModel ?? ""
+                    }()
+                    let proj = sessionMap[sessID]?.projectName ?? "opencode"
+
+                    results.append(
+                        UsageSample(
+                            id: "opencode-\(sessID)-\(msgID)",
+                            vendor: .openCode,
+                            origin: .standalone,
+                            timestamp: msgTS,
+                            sessionID: sessID,
+                            projectName: proj,
+                            model: model,
+                            inputTokens: tIn,
+                            outputTokens: tOut,
+                            cacheReadTokens: tCR,
+                            cacheWriteTokens: tCW,
+                            recordedCostUSD: cost > 0 ? cost : nil
+                        )
+                    )
+                }
+            }
+        }
+
+        // Fall back to session_v2 ONLY for sessions that have 0 token-bearing rows in session_message
+        for sessID in sessionOrder where !sessionsWithMessages.contains(sessID) {
+            guard let row = sessionMap[sessID] else { continue }
+            if row.tIn == 0 && row.tOut == 0 && row.tCR == 0 && row.tCW == 0 && row.cost <= 0 { continue }
+            if row.timeUpdated < since || row.timeUpdated > upperBound { continue }
             results.append(
                 UsageSample(
-                    id: "opencode-\(id)",
+                    id: "opencode-\(row.id)",
                     vendor: .openCode,
                     origin: .standalone,
-                    timestamp: ts,
-                    sessionID: id,
-                    projectName: proj,
-                    model: cleanModel,
-                    inputTokens: tIn,
-                    outputTokens: tOut,
-                    cacheReadTokens: tCR,
-                    cacheWriteTokens: tCW,
-                    recordedCostUSD: cost > 0 ? cost : nil
+                    timestamp: row.timeUpdated,
+                    sessionID: row.id,
+                    projectName: row.projectName,
+                    model: row.cleanModel,
+                    inputTokens: row.tIn,
+                    outputTokens: row.tOut,
+                    cacheReadTokens: row.tCR,
+                    cacheWriteTokens: row.tCW,
+                    recordedCostUSD: row.cost > 0 ? row.cost : nil
                 )
             )
         }
-        return results
+
+        return OpenCodeCollectionResult(samples: results, rateLimitEvents: rateLimits)
     }
 
     // MARK: - 4. Agent-Relay `.relay/LOG.md` Scanner (Strict Heading Vendor, Zero Bleed)
@@ -1028,7 +1557,6 @@ public enum LocalTelemetryCollector {
         ]
 
         text.enumerateLines { line, _ in
-            // Every markdown heading immediately terminates any open step block so detail lines never bleed.
             if line.hasPrefix("#") {
                 flushStep()
                 let ns = line as NSString
@@ -1067,7 +1595,6 @@ public enum LocalTelemetryCollector {
                 return
             }
 
-            // Only top-level `- ` metadata bullets inside an active step are inspected (never indented file paths or blockquotes).
             guard currentHeader != nil, line.hasPrefix("- ") else { return }
             let lowerLine = line.lowercased()
             if ignoredBulletPrefixes.contains(where: { lowerLine.hasPrefix($0) }) {
@@ -1097,7 +1624,7 @@ public enum LocalTelemetryCollector {
         return RelayRunSummary(projectName: projectName, logPath: logURL.path, updatedAt: modDate, steps: steps)
     }
 
-    // MARK: - 5. Mistral Vibe & Antigravity Metadata Readers (Zero Ratio Fabrication)
+    // MARK: - 5. Mistral Vibe Unified Journal Reader & Antigravity Metadata Reader
 
     public static func collectVibeSamples(
         vibeDir: URL,
@@ -1105,15 +1632,199 @@ public enum LocalTelemetryCollector {
         since: Date,
         now: Date = Date()
     ) -> [UsageSample] {
+        collectVibeTelemetry(vibeDir: vibeDir, relayRuns: relayRuns, since: since, now: now).samples
+    }
+
+    public static func collectVibeTelemetry(
+        vibeDir: URL,
+        relayRuns: [RelayRunSummary],
+        since: Date,
+        now: Date = Date()
+    ) -> VibeCollectionResult {
         var samples: [UsageSample] = []
+        var rateLimits: [RateLimitEvent] = []
+        var unifiedSessionIDs: Set<String> = []
+        let upperBound = now
+        let fm = FileManager.default
+
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+
+        func parseISO(_ raw: String?) -> Date? {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+            return isoFrac.date(from: raw) ?? isoPlain.date(from: raw)
+        }
+
+        // ~/.vibe/logs/session/unified -> ~/.vibe/config.toml
+        let vibeConfigURL = vibeDir
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("config.toml")
+        let configActiveModel = parseVibeConfigActiveModel(at: vibeConfigURL)
+
+        if fm.fileExists(atPath: vibeDir.path),
+           let children = try? fm.contentsOfDirectory(
+               at: vibeDir,
+               includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+               options: [.skipsHiddenFiles]
+           ) {
+            for folder in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                let metaURL = folder.appendingPathComponent("meta.json")
+                let metaObj: [String: Any]? = {
+                    guard let data = try? Data(contentsOf: metaURL) else { return nil }
+                    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                }()
+
+                let sessID = nonEmptyString(metaObj?["session_id"]) ?? folder.lastPathComponent
+                unifiedSessionIDs.insert(sessID)
+
+                let startTS = parseISO(metaObj?["start_time"] as? String)
+                let endTS = parseISO(metaObj?["end_time"] as? String)
+                let folderMod = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                let fallbackTS = startTS ?? endTS ?? folderMod ?? now
+                let origin = (metaObj?["origin_directory"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } ?? "vibe"
+
+                let cfg = metaObj?["config"] as? [String: Any]
+                let sessionModel = nonEmptyString(cfg?["active_model"])
+                    ?? nonEmptyString(cfg?["model_name"])
+                    ?? nonEmptyString(metaObj?["model"])
+                    ?? configActiveModel
+                    ?? ""
+
+                var emittedJournalTurns = false
+                let journalDir = folder.appendingPathComponent("journal")
+                if let segmentFiles = try? fm.contentsOfDirectory(
+                    at: journalDir,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                ) {
+                    let sortedSegments = segmentFiles
+                        .filter { $0.pathExtension == "jsonl" }
+                        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+                    var seenActionIDs: Set<String> = []
+                    var seenFailedActionIDs: Set<String> = []
+                    var runningTS: Date? = startTS ?? endTS
+                    var turnSeq = 0
+
+                    for segURL in sortedSegments {
+                        guard let text = try? String(contentsOf: segURL, encoding: .utf8) else { continue }
+                        text.enumerateLines { line, _ in
+                            guard let data = line.data(using: .utf8),
+                                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+
+                            if let recordTS = extractVibeRecordTimestamp(obj, parseISO: parseISO) {
+                                runningTS = recordTS
+                            }
+
+                            guard (obj["type"] as? String) == "action_result",
+                                  let payload = obj["payload"] as? [String: Any] else { return }
+
+                            let actionID = (payload["action_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            let state = (payload["state"] as? String) ?? ""
+                            let resObj = payload["result"] as? [String: Any]
+
+                            if state == "succeeded",
+                               (resObj?["type"] as? String) == "completion_succeeded",
+                               let innerRes = resObj?["result"] as? [String: Any],
+                               let usage = innerRes["usage"] as? [String: Any] {
+                                if !actionID.isEmpty {
+                                    guard seenActionIDs.insert(actionID).inserted else { return }
+                                }
+                                // Verified on live Vibe unified journals: input_tokens ALREADY includes cached_input_tokens,
+                                // and output_tokens ALREADY includes reasoning_tokens.
+                                let rawIn = max(0, intVal(usage["input_tokens"]))
+                                let cachedIn = max(0, intVal(usage["cached_input_tokens"]))
+                                let cw = max(0, intVal(usage["cache_write_tokens"]))
+                                let out = max(0, intVal(usage["output_tokens"]))
+                                let uncachedIn = max(0, rawIn - cachedIn)
+                                guard (uncachedIn + cachedIn + cw + out) > 0 else { return }
+
+                                emittedJournalTurns = true
+                                turnSeq += 1
+                                let evTS = runningTS ?? fallbackTS
+                                guard evTS >= since && evTS <= upperBound else { return }
+
+                                let sampleID = actionID.isEmpty ? "vibe-\(sessID)-\(turnSeq)" : "vibe-\(sessID)-\(actionID)"
+                                samples.append(
+                                    UsageSample(
+                                        id: sampleID,
+                                        vendor: .mistralVibe,
+                                        origin: .standalone,
+                                        timestamp: evTS,
+                                        sessionID: sessID,
+                                        projectName: origin,
+                                        model: sessionModel,
+                                        inputTokens: uncachedIn,
+                                        outputTokens: out,
+                                        cacheReadTokens: cachedIn,
+                                        cacheWriteTokens: cw
+                                    )
+                                )
+                            } else if state == "failed" {
+                                if isStructuredRateLimitValue(resObj?["error"] ?? payload["error"]) {
+                                    if !actionID.isEmpty {
+                                        guard seenFailedActionIDs.insert(actionID).inserted else { return }
+                                    }
+                                    let evTS = runningTS ?? fallbackTS
+                                    if evTS >= since && evTS <= upperBound {
+                                        rateLimits.append(
+                                            RateLimitEvent(
+                                                id: "vibe-429-\(sessID)-\(actionID.isEmpty ? UUID().uuidString : actionID)",
+                                                vendor: .mistralVibe,
+                                                timestamp: evTS,
+                                                sessionID: sessID
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to legacy meta.json numeric stats ONLY if journal/*.jsonl yielded 0 completion turns
+                if !emittedJournalTurns, let metaObj, fallbackTS >= since, fallbackTS <= upperBound {
+                    let stats = metaObj["stats"] as? [String: Any]
+                    let inTok = intVal(stats?["session_prompt_tokens"]) + intVal(stats?["prompt_tokens"])
+                    let outTok = intVal(stats?["session_completion_tokens"]) + intVal(stats?["completion_tokens"])
+                    let cost = (stats?["session_cost"] as? NSNumber)?.doubleValue
+                    if inTok > 0 || outTok > 0 || (cost ?? 0) > 0 {
+                        let rawTot = (inTok + outTok) > 0 ? (inTok + outTok) : nil
+                        samples.append(
+                            UsageSample(
+                                unsplitID: "vibe-meta-\(sessID)",
+                                vendor: .mistralVibe,
+                                origin: .standalone,
+                                timestamp: fallbackTS,
+                                sessionID: sessID,
+                                projectName: origin,
+                                model: sessionModel,
+                                rawTotalTokens: rawTot,
+                                recordedCostUSD: cost
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        // Include .relay/LOG.md Vibe steps ONLY when their session is NOT already covered by unified/
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm"
         df.locale = Locale(identifier: "en_US_POSIX")
-        let upperBound = now
 
         for run in relayRuns {
+            let relayDir = URL(fileURLWithPath: run.logPath).deletingLastPathComponent()
             for step in run.steps where step.vendor == .mistralVibe {
                 guard (step.tokens ?? 0) > 0 || (step.costUSD ?? 0) > 0 else { continue }
+                if let exportedSessID = readRelayVibeSessionID(relayDir: relayDir, stepID: step.stepID),
+                   unifiedSessionIDs.contains(exportedSessID) {
+                    continue
+                }
                 let ts = df.date(from: step.timestampString) ?? run.updatedAt
                 if ts < since || ts > upperBound { continue }
                 samples.append(
@@ -1132,46 +1843,104 @@ public enum LocalTelemetryCollector {
             }
         }
 
-        // Check standalone ~/.vibe/logs/session/unified/*/meta.json if legacy numeric stats exist
-        let fm = FileManager.default
-        if fm.fileExists(atPath: vibeDir.path),
-           let children = try? fm.contentsOfDirectory(at: vibeDir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            for folder in children {
-                let metaURL = folder.appendingPathComponent("meta.json")
-                guard let data = try? Data(contentsOf: metaURL),
-                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
-                let sessID = (obj["session_id"] as? String) ?? folder.lastPathComponent
-                let startStr = (obj["start_time"] as? String) ?? ""
-                let ts = iso.date(from: startStr)
-                    ?? (try? folder.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                    ?? now
-                if ts < since || ts > upperBound { continue }
-                let origin = (obj["origin_directory"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } ?? "vibe"
-                let stats = obj["stats"] as? [String: Any]
-                let inTok = intVal(stats?["session_prompt_tokens"]) + intVal(stats?["prompt_tokens"])
-                let outTok = intVal(stats?["session_completion_tokens"]) + intVal(stats?["completion_tokens"])
-                let cost = (stats?["session_cost"] as? NSNumber)?.doubleValue
-                if inTok > 0 || outTok > 0 || (cost ?? 0) > 0 {
-                    let rawTot = (inTok + outTok) > 0 ? (inTok + outTok) : nil
-                    samples.append(
-                        UsageSample(
-                            unsplitID: "vibe-meta-\(sessID)",
-                            vendor: .mistralVibe,
-                            origin: .standalone,
-                            timestamp: ts,
-                            sessionID: sessID,
-                            projectName: origin,
-                            model: (obj["model"] as? String) ?? "",
-                            rawTotalTokens: rawTot,
-                            recordedCostUSD: cost
-                        )
-                    )
-                }
+        return VibeCollectionResult(
+            samples: samples,
+            rateLimitEvents: rateLimits,
+            configuredActiveModel: configActiveModel
+        )
+    }
+
+    private static func parseVibeConfigActiveModel(at configURL: URL) -> String? {
+        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else { return nil }
+        let activeRegex = try? NSRegularExpression(pattern: #"^\s*active_model\s*=\s*"([^"]+)""#)
+        for rawLine in text.components(separatedBy: .newlines) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") {
+                // Stop at the first TOML section header so only root-level `active_model` is matched
+                break
+            }
+            let ns = rawLine as NSString
+            if let m = activeRegex?.firstMatch(in: rawLine, range: NSRange(location: 0, length: ns.length)),
+               m.numberOfRanges == 2 {
+                let model = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !model.isEmpty { return model }
             }
         }
-        return samples
+        return nil
+    }
+
+    private static func extractVibeRecordTimestamp(
+        _ obj: [String: Any],
+        parseISO: (String?) -> Date?
+    ) -> Date? {
+        for key in ["time_unix_ms", "timestamp", "created_at"] {
+            if let num = int64Val(obj[key]), num > 0 {
+                return normalizeEpoch(num)
+            }
+            if let str = obj[key] as? String, let d = parseISO(str) {
+                return d
+            }
+        }
+
+        guard let payload = obj["payload"] as? [String: Any] else { return nil }
+
+        if let input = payload["input"] as? [String: Any],
+           let det = input["determinism"] as? [String: Any],
+           let ms = int64Val(det["time_unix_ms"]),
+           ms > 0 {
+            return normalizeEpoch(ms)
+        }
+
+        if let deltas = payload["delta"] as? [[String: Any]] {
+            var latestEpoch: Int64 = 0
+            var latestDate: Date?
+            for delta in deltas {
+                guard let entry = delta["entry"] as? [String: Any] else { continue }
+                for key in ["updatedAt", "createdAt"] {
+                    if let num = int64Val(entry[key]), num > latestEpoch {
+                        latestEpoch = num
+                    } else if let str = entry[key] as? String, let d = parseISO(str) {
+                        if latestDate == nil || d > latestDate! {
+                            latestDate = d
+                        }
+                    }
+                }
+            }
+            if latestEpoch > 0 { return normalizeEpoch(latestEpoch) }
+            if let latestDate { return latestDate }
+        }
+
+        if let sa = payload["session_api"] as? [String: Any],
+           let outcomes = sa["turn_outcomes"] as? [String: Any] {
+            var latestEpoch: Int64 = 0
+            for val in outcomes.values {
+                if let outDict = val as? [String: Any],
+                   let completed = int64Val(outDict["completedAt"]),
+                   completed > latestEpoch {
+                    latestEpoch = completed
+                }
+            }
+            if latestEpoch > 0 { return normalizeEpoch(latestEpoch) }
+        }
+
+        return nil
+    }
+
+    private static func readRelayVibeSessionID(relayDir: URL, stepID: String) -> String? {
+        let stepFolder = relayDir.appendingPathComponent("\(stepID).vibe")
+        let candidates = [
+            stepFolder.appendingPathComponent("export.json"),
+            stepFolder.appendingPathComponent("session/meta.json"),
+            stepFolder.appendingPathComponent("meta.json")
+        ]
+        for url in candidates {
+            if let data = try? Data(contentsOf: url),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let sid = nonEmptyString(obj["session_id"]) {
+                return sid
+            }
+        }
+        return nil
     }
 
     public static func collectAntigravitySamples(
@@ -1180,7 +1949,18 @@ public enum LocalTelemetryCollector {
         since: Date,
         now: Date = Date()
     ) -> (samples: [UsageSample], latestModel: String?, rateLimitHits24h: Int) {
+        let res = collectAntigravityTelemetry(logDir: logDir, relayRuns: relayRuns, since: since, now: now)
+        return (res.samples, res.latestModel, res.rateLimitHits24h)
+    }
+
+    public static func collectAntigravityTelemetry(
+        logDir: URL,
+        relayRuns: [RelayRunSummary],
+        since: Date,
+        now: Date = Date()
+    ) -> AntigravityCollectionResult {
         var samples: [UsageSample] = []
+        var rateLimits: [RateLimitEvent] = []
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm"
         df.locale = Locale(identifier: "en_US_POSIX")
@@ -1209,27 +1989,61 @@ public enum LocalTelemetryCollector {
 
         var latestModel: String?
         var latestDate: Date = .distantPast
-        var rateLimits24h = 0
         let dayAgo = now.addingTimeInterval(-86_400)
         let labelRegex = try? NSRegularExpression(pattern: #"label="([^"]+)""#)
+        let structuredStatus429Regex = try? NSRegularExpression(pattern: #"(?:^|[\s,;(])(?:status|http_status|status_code)=429(?=$|[\s,;)])"#)
+        let leadingISORegex = try? NSRegularExpression(pattern: #"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))"#)
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
 
         let fm = FileManager.default
         if fm.fileExists(atPath: logDir.path),
            let files = try? fm.contentsOfDirectory(at: logDir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
-            for file in files where file.pathExtension == "log" {
+            for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where file.pathExtension == "log" {
                 let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
                 if mod < since { continue }
                 guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
                 var fileModel: String?
+                var lineNo = 0
                 text.enumerateLines { line, _ in
-                    if line.contains("override to backend: label=") {
-                        let ns = line as NSString
-                        if let m = labelRegex?.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
-                            fileModel = ns.substring(with: m.range(at: 1))
-                        }
+                    lineNo += 1
+                    let ns = line as NSString
+                    let fullRange = NSRange(location: 0, length: ns.length)
+                    if line.contains("override to backend: label="),
+                       let m = labelRegex?.firstMatch(in: line, range: fullRange) {
+                        fileModel = ns.substring(with: m.range(at: 1))
                     }
-                    if mod >= dayAgo && (line.contains("RESOURCE_EXHAUSTED") || line.contains("status=429")) {
-                        rateLimits24h += 1
+                    let is429: Bool = {
+                        if structuredStatus429Regex?.firstMatch(in: line, range: fullRange) != nil {
+                            return true
+                        }
+                        if line.hasPrefix("{"),
+                           let d = line.data(using: .utf8),
+                           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+                            return hasStructured429Status(obj) || isStructuredRateLimitValue(obj["error"])
+                        }
+                        return false
+                    }()
+                    if is429 {
+                        var rlTS = mod
+                        if let tm = leadingISORegex?.firstMatch(in: line, range: fullRange), tm.numberOfRanges == 2 {
+                            let tsStr = ns.substring(with: tm.range(at: 1))
+                            if let parsed = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr) {
+                                rlTS = parsed
+                            }
+                        }
+                        if rlTS >= since && rlTS <= upperBound {
+                            rateLimits.append(
+                                RateLimitEvent(
+                                    id: "agy-429-\(file.lastPathComponent)-\(lineNo)",
+                                    vendor: .antigravity,
+                                    timestamp: rlTS,
+                                    sessionID: file.deletingPathExtension().lastPathComponent
+                                )
+                            )
+                        }
                     }
                 }
                 if let fileModel, mod >= latestDate {
@@ -1239,7 +2053,13 @@ public enum LocalTelemetryCollector {
             }
         }
 
-        return (samples, latestModel, rateLimits24h)
+        let hits24h = rateLimits.filter { $0.timestamp >= dayAgo && $0.timestamp <= upperBound }.count
+        return AntigravityCollectionResult(
+            samples: samples,
+            latestModel: latestModel,
+            rateLimitEvents: rateLimits,
+            rateLimitHits24h: hits24h
+        )
     }
 
     // MARK: - Helpers
@@ -1270,15 +2090,41 @@ public enum LocalTelemetryCollector {
         return parts.last.map(String.init) ?? folderName
     }
 
+    private static func nonEmptyString(_ any: Any?) -> String? {
+        guard let s = (any as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else {
+            return nil
+        }
+        return s
+    }
+
     private static func intVal(_ any: Any?) -> Int {
         if let n = any as? NSNumber { return n.intValue }
         if let s = any as? String, let v = Int(s) { return v }
         return 0
     }
 
+    private static func int64Val(_ any: Any?) -> Int64? {
+        if let n = any as? NSNumber { return n.int64Value }
+        if let s = any as? String, let v = Int64(s) { return v }
+        return nil
+    }
+
     private static func columnText(_ stmt: OpaquePointer, _ index: Int32) -> String? {
         guard let cStr = sqlite3_column_text(stmt, index) else { return nil }
         return String(cString: cStr)
+    }
+
+    private static func tableExists(db: OpaquePointer, table: String) -> Bool {
+        var stmt: OpaquePointer?
+        let sql = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        _ = table.withCString { cStr in
+            sqlite3_bind_text(stmt, 1, cStr, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        return sqlite3_step(stmt) == SQLITE_ROW
     }
 
     private static func tableHasColumn(db: OpaquePointer, table: String, column: String) -> Bool {

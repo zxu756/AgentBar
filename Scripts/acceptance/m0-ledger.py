@@ -164,30 +164,26 @@ def independent_claude_30d(claude_dir: pathlib.Path, now_epoch: int) -> dict[str
     }
 
 
-def read_last_codex_rollout_usage(rollout_path: str) -> tuple[int, int, int, int, int | None] | None:
+def read_codex_rollout_events(rollout_path: str) -> tuple[list[tuple[float | None, int, int, int, int]], int | None] | None:
     p = pathlib.Path(rollout_path)
-    lines: list[str] = []
+    text: str | None = None
     if p.is_file():
-        with p.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            offset = max(0, size - 512 * 1024)
-            fh.seek(offset)
-            text = fh.read().decode("utf-8", errors="ignore")
-            lines = text.splitlines()
-            if not any('"token_count"' in ln for ln in lines) and offset > 0:
-                fh.seek(0)
-                lines = fh.read().decode("utf-8", errors="ignore").splitlines()
+        text = p.read_text(encoding="utf-8", errors="ignore")
     else:
         zst = pathlib.Path(rollout_path + ".zst")
         zstd_bin = shutil.which("zstd") or ("/opt/homebrew/bin/zstd" if pathlib.Path("/opt/homebrew/bin/zstd").is_file() else None)
         if zst.is_file() and zstd_bin:
             proc = subprocess.run([zstd_bin, "-dc", str(zst)], capture_output=True, text=True, check=False)
             if proc.returncode == 0 and proc.stdout:
-                lines = proc.stdout.splitlines()
+                text = proc.stdout
+    if text is None:
+        return None
 
-    last_total: dict[str, Any] | None = None
-    for ln in lines:
+    events: list[tuple[float | None, int, int, int, int]] = []
+    prev_u = prev_c = prev_cw = prev_o = 0
+    base_rep = 0
+    last_rep: int | None = None
+    for ln in text.splitlines():
         if '"token_count"' not in ln:
             continue
         try:
@@ -201,20 +197,33 @@ def read_last_codex_rollout_usage(rollout_path: str) -> tuple[int, int, int, int
             continue
         info = payload.get("info") or {}
         tu = info.get("total_token_usage")
-        if isinstance(tu, dict) and "input_tokens" in tu and "output_tokens" in tu:
-            last_total = tu
+        if not (isinstance(tu, dict) and "input_tokens" in tu and "output_tokens" in tu):
+            continue
+        ts = parse_iso_epoch(str(obj.get("timestamp") or ""))
+        raw_in = max(0, int(tu.get("input_tokens") or 0))
+        cached = max(0, int(tu.get("cached_input_tokens") or 0))
+        cw = max(0, int(tu.get("cache_write_input_tokens") or 0))
+        out = max(0, int(tu.get("output_tokens") or 0))
+        uncached = max(0, raw_in - cached)
+        if uncached < prev_u or cached < prev_c or cw < prev_cw or out < prev_o:
+            if last_rep is not None:
+                base_rep += last_rep
+            prev_u = prev_c = prev_cw = prev_o = 0
+        du = max(0, uncached - prev_u)
+        dc = max(0, cached - prev_c)
+        dcw = max(0, cw - prev_cw)
+        do = max(0, out - prev_o)
+        prev_u, prev_c, prev_cw, prev_o = uncached, cached, cw, out
+        if "total_tokens" in tu and tu["total_tokens"] is not None:
+            last_rep = max(0, int(tu["total_tokens"]))
+        if (du + dc + dcw + do) <= 0:
+            continue
+        events.append((ts, du, dc, dcw, do))
 
-    if not last_total:
+    if not events:
         return None
-    raw_in = max(0, int(last_total.get("input_tokens") or 0))
-    cached = max(0, int(last_total.get("cached_input_tokens") or 0))
-    cw = max(0, int(last_total.get("cache_write_input_tokens") or 0))
-    out = max(0, int(last_total.get("output_tokens") or 0))
-    rep_tot = int(last_total["total_tokens"]) if "total_tokens" in last_total and last_total["total_tokens"] is not None else None
-    uncached = max(0, raw_in - cached)
-    if (uncached + cached + cw + out) <= 0:
-        return None
-    return (uncached, cached, cw, out, rep_tot)
+    rep_tot = (base_rep + last_rep) if last_rep is not None else None
+    return (events, rep_tot)
 
 
 def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, Any]:
@@ -225,7 +234,9 @@ def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, An
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
-        cur = conn.execute("SELECT id, tokens_used, updated_at, rollout_path FROM threads WHERE tokens_used > 0")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
+        c_expr = "created_at" if "created_at" in cols else "0"
+        cur = conn.execute(f"SELECT id, tokens_used, updated_at, {c_expr}, rollout_path FROM threads WHERE tokens_used > 0")
         rows = cur.fetchall()
     finally:
         conn.close()
@@ -234,25 +245,30 @@ def independent_codex_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str, An
     missing = 0
     mismatches = 0
     s_in = s_cr = s_cw = s_out = s_tot = 0
-    for _tid, tok_used, updated_at, rpath in rows:
-        ts = updated_at / 1000.0 if updated_at > 10_000_000_000 else float(updated_at)
-        if ts < cutoff or ts > now_epoch:
+    for _tid, tok_used, updated_at, created_at, rpath in rows:
+        raw_ts = updated_at if (updated_at or 0) > 0 else (created_at or 0)
+        ts = raw_ts / 1000.0 if raw_ts > 10_000_000_000 else float(raw_ts)
+        parsed = read_codex_rollout_events(str(rpath or "")) if (rpath and ts >= cutoff - 86400) else None
+        if parsed is not None:
+            evs, rep_tot = parsed
+            rtot = sum(du + dc + dcw + do for _t, du, dc, dcw, do in evs)
+            in_win = [(du, dc, dcw, do) for et, du, dc, dcw, do in evs if cutoff <= (et if et is not None else ts) <= now_epoch]
+            if in_win:
+                if rtot != int(tok_used) or (rep_tot is not None and rep_tot != int(tok_used)):
+                    mismatches += 1
+                for du, dc, dcw, do in in_win:
+                    rec += 1
+                    s_in += du
+                    s_cr += dc
+                    s_cw += dcw
+                    s_out += do
+                    s_tot += du + dc + dcw + do
             continue
-        rec += 1
-        usage = read_last_codex_rollout_usage(str(rpath or "")) if rpath else None
-        if usage is None:
+
+        if cutoff <= ts <= now_epoch:
+            rec += 1
             missing += 1
             s_tot += int(tok_used)
-        else:
-            u_in, u_cr, u_cw, u_out, rep_tot = usage
-            rtot = u_in + u_cr + u_cw + u_out
-            if rtot != int(tok_used) or (rep_tot is not None and rep_tot != int(tok_used)):
-                mismatches += 1
-            s_in += u_in
-            s_cr += u_cr
-            s_cw += u_cw
-            s_out += u_out
-            s_tot += rtot
 
     return {
         "records": rec,
@@ -274,16 +290,70 @@ def independent_opencode_30d(db_path: pathlib.Path, now_epoch: int) -> dict[str,
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
-        cur = conn.execute(
-            "SELECT cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_updated FROM session_v2"
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        rows = conn.execute(
+            "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_updated FROM session_v2"
+        ).fetchall() if "session_v2" in tables else []
+        msg_table = "session_message" if "session_message" in tables else ("message" if "message" in tables else None)
+        msg_rows = (
+            conn.execute(
+                f"SELECT session_id, type, time_created, data FROM {msg_table} WHERE type IN ('assistant', 'compaction')"
+            ).fetchall()
+            if msg_table
+            else []
         )
-        rows = cur.fetchall()
     finally:
         conn.close()
 
+    sess_ts: dict[str, float] = {}
+    for sid, _c, _ti, _to, _tr, _tcr, _tcw, tupd in rows:
+        sess_ts[str(sid)] = (tupd / 1000.0) if (tupd or 0) > 10_000_000_000 else float(tupd or 0)
+
+    covered: set[str] = set()
     rec = s_in = s_out = s_cr = s_cw = 0
     s_cost = 0.0
-    for cost, tin, tout, treas, tcr, tcw, tupd in rows:
+
+    for sid_raw, rtype, raw_tc, data_str in msg_rows:
+        sid = str(sid_raw or "")
+        try:
+            d = json.loads(data_str or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        role = str(rtype or d.get("role") or d.get("type") or "").strip()
+        if role and role not in ("assistant", "compaction"):
+            continue
+        tok = d.get("tokens") if isinstance(d.get("tokens"), dict) else {}
+        cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
+        tin_i = max(0, int(tok.get("input") or 0))
+        tout_i = max(0, int(tok.get("output") or 0)) + max(0, int(tok.get("reasoning") or 0))
+        tcr_i = max(0, int(cache.get("read") or 0))
+        tcw_i = max(0, int(cache.get("write") or 0))
+        c_f = float(d.get("cost") or 0.0)
+        if tin_i == 0 and tout_i == 0 and tcr_i == 0 and tcw_i == 0 and c_f <= 0.0:
+            continue
+        covered.add(sid)
+        tdict = d.get("time") if isinstance(d.get("time"), dict) else {}
+        c_val = tdict.get("created") if tdict.get("created") is not None else tdict.get("completed")
+        if isinstance(c_val, (int, float)) and c_val > 0:
+            ts = c_val / 1000.0 if c_val > 10_000_000_000 else float(c_val)
+        elif raw_tc and int(raw_tc) > 0:
+            ts = int(raw_tc) / 1000.0 if int(raw_tc) > 10_000_000_000 else float(raw_tc)
+        else:
+            ts = sess_ts.get(sid, float(now_epoch))
+        if ts < cutoff or ts > now_epoch:
+            continue
+        rec += 1
+        s_in += tin_i
+        s_out += tout_i
+        s_cr += tcr_i
+        s_cw += tcw_i
+        s_cost += c_f
+
+    for sid, cost, tin, tout, treas, tcr, tcw, tupd in rows:
+        if str(sid) in covered:
+            continue
         tin_i = int(tin or 0)
         tout_i = int(tout or 0) + int(treas or 0)
         tcr_i = int(tcr or 0)
@@ -427,7 +497,7 @@ def run_scripted_mutations() -> tuple[bool, str]:
         (
             "M5-codex-mismatch-ignored",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
-            "let isMismatch = (rolloutTotal != totalTok)\n                    || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)",
+            "let isMismatch = (rolloutTotal != totalTok)\n                        || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)",
             "let isMismatch = false && (rolloutTotal != totalTok || breakdown.reportedTotalTokens != nil)",
             "AgentBarCoreTests.CollectorsTests/codexRolloutTotalMismatchFlagsAndDowngradesCompleteness",
             "Codex rollout total_token_usage mismatch against threads.tokens_used",
@@ -606,12 +676,13 @@ def main() -> int:
         tws = pathlib.Path(tmpdir) / "ws"
         (thome_ok / ".codex").mkdir(parents=True)
         tws.mkdir(parents=True)
+        ts_iso_codex = dt.datetime.fromtimestamp(now_epoch - 120, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         roll_ok = thome_ok / ".codex" / "rollout-ok.jsonl"
         roll_ok.write_text(
             "\n".join(
                 [
-                    '{"timestamp":"2026-11-14T01:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
-                    '{"timestamp":"2026-11-14T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500000,"cached_input_tokens":480000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":505000}}}}',
+                    f'{{"timestamp":"{ts_iso_codex}","type":"turn_context","payload":{{"model":"gpt-6.1-sol"}}}}',
+                    f'{{"timestamp":"{ts_iso_codex}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":500000,"cached_input_tokens":480000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":505000}}}}}}}}',
                 ]
             )
             + "\n",
@@ -663,7 +734,7 @@ def main() -> int:
         (thome_mis / ".codex").mkdir(parents=True)
         roll_mis = thome_mis / ".codex" / "rollout-mis.jsonl"
         roll_mis.write_text(
-            '{"timestamp":"2026-11-14T01:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}\n',
+            f'{{"timestamp":"{ts_iso_codex}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}}}}}\n',
             encoding="utf-8",
         )
         conn = sqlite3.connect(str(thome_mis / ".codex" / "state_5.sqlite"))
@@ -834,13 +905,29 @@ def main() -> int:
                 if b11_re.search(fp.read_text(encoding="utf-8")):
                     b11_hits.append(str(fp.relative_to(REPO_ROOT)))
 
-    # B13 check: localized Chinese dataSource strings
+    # B13 check: localized Chinese dataSource strings (M1 updates OpenCode & Vibe sources while keeping Antigravity localized)
+    oc_zh = snap_zh["vendors"]["opencode"]
     b13_ok = (
-        "meta.json 无 Token 统计" in vibe_zh["dataSource"]
+        "session_message 逐事件" in oc_zh["dataSource"]
         and "cli-*.log 无 Token 统计" in agy_zh["dataSource"]
         and "lacks token stats" not in vibe_zh["dataSource"]
+        and "lacks token stats" not in oc_zh["dataSource"]
         and "lacks token stats" not in agy_zh["dataSource"]
     )
+
+    # Relay-only Vibe check (when unified journals are absent, Vibe completeness must remain relayOnly != complete)
+    with tempfile.TemporaryDirectory(prefix="agentbar-m0-vibe-relayonly-") as tmpdir:
+        rhome = pathlib.Path(tmpdir) / "home"
+        rws = pathlib.Path(tmpdir) / "ws"
+        (rws / "p" / ".relay").mkdir(parents=True)
+        rhome.mkdir(parents=True)
+        local_ts = dt.datetime.fromtimestamp(now_epoch - 120).strftime("%Y-%m-%d %H:%M")
+        (rws / "p" / ".relay" / "LOG.md").write_text(
+            f"# Agent Relay Log\n\n## 01-vibe: ok, 20s, {local_ts}\n- vibe: model deepseek-v4-1-flash-1017, cost $0.05\n",
+            encoding="utf-8",
+        )
+        vro_en = run_cli_json(bin_path, ["--lang", "en", "--home", str(rhome), "--workspace", str(rws), "--now", str(now_epoch)])
+        vibe_relay_only_ok = vro_en["vendors"]["vibe"]["completeness"] == "relayOnly"
 
     # B14 check: 1 priced + 2 unknown-model records -> explicit costNote beside dollar figure
     with tempfile.TemporaryDirectory(prefix="agentbar-m0-b14-") as tmpdir:
@@ -885,14 +972,13 @@ def main() -> int:
     bad_home = subprocess.run([str(bin_path), "--cli", "snapshot", "--home", "/nonexistent_agentbar_m0_check"], capture_output=True, text=True, check=False)
     b16_ok = bad_sub.returncode == 2 and bad_home.returncode == 2 and bool(bad_home.stderr.strip())
 
+    vibe_live_ok = vibe_en["completeness"] in ("complete", "relayOnly", "totalOnly", "noData")
     row6_ok = (
-        vibe_en["completeness"] != "complete"
+        vibe_live_ok
+        and vibe_relay_only_ok
         and agy_en["completeness"] != "complete"
-        and vibe_zh["completeness"] != "complete"
         and agy_zh["completeness"] != "complete"
-        and vibe_en["completenessLabel"] != "Complete"
         and agy_en["completenessLabel"] != "Complete"
-        and vibe_zh["completenessLabel"] != "完整"
         and agy_zh["completenessLabel"] != "完整"
         and snap_en["pricingVersion"] == "unverified"
         and snap_en["costDisclaimer"] == "API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)"

@@ -117,6 +117,7 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
     public var hasRolloutMismatch: Bool
     public var rolloutMismatchCount: Int
     public var mismatchDetails: [String]
+    public var rateLimit429Count: Int
 
     public init(
         inputTokens: Int?,
@@ -133,7 +134,8 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
         completeness: DataCompleteness,
         hasRolloutMismatch: Bool = false,
         rolloutMismatchCount: Int = 0,
-        mismatchDetails: [String] = []
+        mismatchDetails: [String] = [],
+        rateLimit429Count: Int = 0
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -150,6 +152,7 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
         self.hasRolloutMismatch = hasRolloutMismatch
         self.rolloutMismatchCount = rolloutMismatchCount
         self.mismatchDetails = mismatchDetails
+        self.rateLimit429Count = rateLimit429Count
     }
 
     public func costNote(in language: AppLanguage) -> String? {
@@ -165,7 +168,8 @@ public struct VendorWindowMetrics: Codable, Sendable, Equatable {
 
     public func mismatchNote(in language: AppLanguage) -> String? {
         guard hasRolloutMismatch else { return nil }
-        let joined = mismatchDetails.joined(separator: "; ")
+        let unique = Array(NSOrderedSet(array: mismatchDetails)) as? [String] ?? mismatchDetails
+        let joined = unique.joined(separator: "; ")
         if joined.isEmpty {
             return language == .zhHans ? "rollout 与 SQLite 总量不一致" : "rollout vs SQLite total mismatch"
         }
@@ -551,6 +555,166 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
     }
 }
 
+public struct RateLimitEvent: Identifiable, Codable, Sendable, Equatable {
+    public var id: String
+    public var vendor: AgentVendor
+    public var timestamp: Date
+    public var sessionID: String
+    public var code: String
+
+    public init(id: String, vendor: AgentVendor, timestamp: Date, sessionID: String = "", code: String = "429") {
+        self.id = id
+        self.vendor = vendor
+        self.timestamp = timestamp
+        self.sessionID = sessionID
+        self.code = code
+    }
+}
+
+public struct DailyVendorMetrics: Codable, Sendable, Equatable {
+    public var uncachedInputTokens: Int
+    public var cachedInputTokens: Int
+    public var cacheWriteTokens: Int
+    public var outputTokens: Int
+    public var totalTokens: Int
+    public var recordCount: Int
+    public var pricedRecordCount: Int
+    public var unmatchedModelCount: Int
+    public var estimatedCostUSD: Double?
+    public var hasRolloutMismatch: Bool
+    public var rolloutMismatchCount: Int
+    public var mismatchDetails: [String]
+    public var rateLimit429Count: Int
+    public var completeness: DataCompleteness
+
+    public init(
+        uncachedInputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        cacheWriteTokens: Int = 0,
+        outputTokens: Int = 0,
+        totalTokens: Int = 0,
+        recordCount: Int = 0,
+        pricedRecordCount: Int = 0,
+        unmatchedModelCount: Int = 0,
+        estimatedCostUSD: Double? = nil,
+        hasRolloutMismatch: Bool = false,
+        rolloutMismatchCount: Int = 0,
+        mismatchDetails: [String] = [],
+        rateLimit429Count: Int = 0,
+        completeness: DataCompleteness = .noData
+    ) {
+        self.uncachedInputTokens = uncachedInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.outputTokens = outputTokens
+        self.totalTokens = totalTokens
+        self.recordCount = recordCount
+        self.pricedRecordCount = pricedRecordCount
+        self.unmatchedModelCount = unmatchedModelCount
+        self.estimatedCostUSD = estimatedCostUSD
+        self.hasRolloutMismatch = hasRolloutMismatch
+        self.rolloutMismatchCount = rolloutMismatchCount
+        self.mismatchDetails = mismatchDetails
+        self.rateLimit429Count = rateLimit429Count
+        self.completeness = completeness
+    }
+
+    public func costNote(in language: AppLanguage) -> String? {
+        guard pricedRecordCount > 0 || unmatchedModelCount > 0 else { return nil }
+        return TelemetryFormatter.costCoverageNote(
+            pricedCount: pricedRecordCount,
+            unmatchedCount: unmatchedModelCount,
+            in: language
+        )
+    }
+
+    public func mismatchNote(in language: AppLanguage) -> String? {
+        guard hasRolloutMismatch else { return nil }
+        let unique = Array(NSOrderedSet(array: mismatchDetails)) as? [String] ?? mismatchDetails
+        let joined = unique.joined(separator: "; ")
+        if joined.isEmpty {
+            return language == .zhHans ? "rollout 与 SQLite 总量不一致" : "rollout vs SQLite total mismatch"
+        }
+        return language == .zhHans ? "总量不一致（\(joined)）" : "Total mismatch (\(joined))"
+    }
+}
+
+public struct DailyLedgerDay: Identifiable, Codable, Sendable, Equatable {
+    public var id: String { dateString }
+    public var dateString: String
+    public var dayStart: Date
+    public var uncachedInputTokens: Int
+    public var cachedInputTokens: Int
+    public var cacheWriteTokens: Int
+    public var outputTokens: Int
+    public var totalTokens: Int
+    public var recordCount: Int
+    public var pricedRecordCount: Int
+    public var unmatchedModelCount: Int
+    public var estimatedCostUSD: Double?
+    public var hasCodexRolloutMismatch: Bool
+    public var codexMismatchDetails: [String]
+    public var rateLimit429Count: Int
+    public var vendors: [AgentVendor: DailyVendorMetrics]
+
+    public init(
+        dateString: String,
+        dayStart: Date,
+        uncachedInputTokens: Int = 0,
+        cachedInputTokens: Int = 0,
+        cacheWriteTokens: Int = 0,
+        outputTokens: Int = 0,
+        totalTokens: Int = 0,
+        recordCount: Int = 0,
+        pricedRecordCount: Int = 0,
+        unmatchedModelCount: Int = 0,
+        estimatedCostUSD: Double? = nil,
+        hasCodexRolloutMismatch: Bool = false,
+        codexMismatchDetails: [String] = [],
+        rateLimit429Count: Int = 0,
+        vendors: [AgentVendor: DailyVendorMetrics] = [:]
+    ) {
+        self.dateString = dateString
+        self.dayStart = dayStart
+        self.uncachedInputTokens = uncachedInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheWriteTokens = cacheWriteTokens
+        self.outputTokens = outputTokens
+        self.totalTokens = totalTokens
+        self.recordCount = recordCount
+        self.pricedRecordCount = pricedRecordCount
+        self.unmatchedModelCount = unmatchedModelCount
+        self.estimatedCostUSD = estimatedCostUSD
+        self.hasCodexRolloutMismatch = hasCodexRolloutMismatch
+        self.codexMismatchDetails = codexMismatchDetails
+        self.rateLimit429Count = rateLimit429Count
+        self.vendors = vendors
+    }
+
+    public func metrics(for vendor: AgentVendor) -> DailyVendorMetrics {
+        vendors[vendor] ?? DailyVendorMetrics()
+    }
+
+    public func costNote(in language: AppLanguage) -> String? {
+        guard pricedRecordCount > 0 || unmatchedModelCount > 0 else { return nil }
+        return TelemetryFormatter.costCoverageNote(
+            pricedCount: pricedRecordCount,
+            unmatchedCount: unmatchedModelCount,
+            in: language
+        )
+    }
+
+    public func codexMismatchNote(in language: AppLanguage) -> String? {
+        guard hasCodexRolloutMismatch else { return nil }
+        let unique = Array(NSOrderedSet(array: codexMismatchDetails)) as? [String] ?? codexMismatchDetails
+        let joined = unique.joined(separator: "; ")
+        if joined.isEmpty {
+            return language == .zhHans ? "rollout 与 SQLite 总量不一致" : "rollout vs SQLite total mismatch"
+        }
+        return language == .zhHans ? "总量不一致（\(joined)）" : "Total mismatch (\(joined))"
+    }
+}
+
 public struct DailyVendorBucket: Identifiable, Codable, Sendable, Equatable {
     public var id: String { "\(vendor.rawValue)-\(Int(date.timeIntervalSince1970))" }
     public var date: Date
@@ -696,26 +860,35 @@ public struct RelayRunSummary: Identifiable, Codable, Sendable, Equatable {
 
 public struct TelemetrySnapshot: Codable, Sendable, Equatable {
     public var capturedAt: Date
+    public var timeZoneIdentifier: String
     public var isDemoData: Bool
     public var vendorSummaries: [VendorSummary]
     public var dailyBuckets: [DailyVendorBucket]
+    public var dailyBreakdown: [DailyLedgerDay]
     public var recentSessions: [UsageSample]
     public var relayRuns: [RelayRunSummary]
+    public var rateLimitEvents: [RateLimitEvent]
 
     public init(
         capturedAt: Date,
+        timeZoneIdentifier: String = TimeZone.current.identifier,
         isDemoData: Bool = false,
         vendorSummaries: [VendorSummary],
         dailyBuckets: [DailyVendorBucket],
+        dailyBreakdown: [DailyLedgerDay] = [],
         recentSessions: [UsageSample],
-        relayRuns: [RelayRunSummary]
+        relayRuns: [RelayRunSummary],
+        rateLimitEvents: [RateLimitEvent] = []
     ) {
         self.capturedAt = capturedAt
+        self.timeZoneIdentifier = timeZoneIdentifier
         self.isDemoData = isDemoData
         self.vendorSummaries = vendorSummaries
         self.dailyBuckets = dailyBuckets
+        self.dailyBreakdown = dailyBreakdown
         self.recentSessions = recentSessions
         self.relayRuns = relayRuns
+        self.rateLimitEvents = rateLimitEvents
     }
 
     public var todayTotalCostUSD: Double {
