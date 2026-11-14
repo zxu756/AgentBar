@@ -117,6 +117,7 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
     public let mismatchNote30d: String?
     public let rateLimitHits24h: Int
     public let windows: [String: CLIWindowPayload]
+    public let untimestamped: CLIWindowPayload
 
     enum CodingKeys: String, CodingKey {
         case vendor
@@ -134,6 +135,7 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         case mismatchNote30d
         case rateLimitHits24h
         case windows
+        case untimestamped
     }
 
     public init(summary: VendorSummary, language: AppLanguage) {
@@ -158,6 +160,7 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
             winMap[w.rawValue] = CLIWindowPayload(metrics: summary.metrics(for: w), vendor: summary.vendor, language: language)
         }
         self.windows = winMap
+        self.untimestamped = CLIWindowPayload(metrics: summary.untimestamped, vendor: summary.vendor, language: language)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -177,6 +180,7 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         try encodeOptional(mismatchNote30d, forKey: .mismatchNote30d, in: &c)
         try c.encode(rateLimitHits24h, forKey: .rateLimitHits24h)
         try c.encode(windows, forKey: .windows)
+        try c.encode(untimestamped, forKey: .untimestamped)
     }
 }
 
@@ -292,8 +296,8 @@ public struct CLIDailyEntryPayload: Codable, Sendable, Equatable {
         case vendors
     }
 
-    public init(day: DailyLedgerDay, language: AppLanguage) {
-        self.date = day.dateString
+    public init(day: DailyLedgerDay, language: AppLanguage, labelOverride: String? = nil) {
+        self.date = labelOverride ?? day.dateString
         self.uncachedInputTokens = day.uncachedInputTokens
         self.cachedInputTokens = day.cachedInputTokens
         self.cacheWriteTokens = day.cacheWriteTokens
@@ -405,6 +409,7 @@ public struct CLISnapshotPayload: Codable, Sendable, Equatable {
     public let timeAttributionNote: String
     public let vendors: [String: CLIVendorPayload]
     public let dailyBreakdown: [CLIDailyEntryPayload]
+    public let untimestamped: CLIDailyEntryPayload
     public let relayRuns: [CLIRelayRunPayload]
 
     public init(snapshot: TelemetrySnapshot, language: AppLanguage) {
@@ -418,8 +423,8 @@ public struct CLISnapshotPayload: Codable, Sendable, Equatable {
         self.pricingVersion = PriceCatalog.pricingVersion
         self.costDisclaimer = PriceCatalog.costDisclaimer(in: language)
         self.timeAttributionNote = language == .zhHans
-            ? "M1 时间归属：Claude、Codex（rollout token_count 增量）、OpenCode（session_message）与 Mistral Vibe（unified journal）均按单条事件时间戳归桶；仅缺细账时退回会话时间。"
-            : "M1 time attribution: Claude, Codex (rollout token_count deltas), OpenCode (session_message), and Mistral Vibe (unified journal) bucket by per-event timestamp, falling back to session time only when event logs are absent."
+            ? "M1 时间归属：Claude、Codex（rollout token_count 增量）、OpenCode（session_message）与 Mistral Vibe（unified journal）均按单条事件时间戳归桶；仅缺细账且会话时间有效时退回会话时间，缺失或无效时间戳单独归入「没有时间」且不计入任何时间窗。"
+            : "M1 time attribution: Claude, Codex (rollout token_count deltas), OpenCode (session_message), and Mistral Vibe (unified journal) bucket by per-event timestamp; session timestamps are used only for aggregate-only sessions without event logs, and missing/invalid timestamps go strictly to 'No timestamp' outside all windows."
 
         var map: [String: CLIVendorPayload] = [:]
         for summary in snapshot.vendorSummaries {
@@ -427,6 +432,11 @@ public struct CLISnapshotPayload: Codable, Sendable, Equatable {
         }
         self.vendors = map
         self.dailyBreakdown = snapshot.dailyBreakdown.map { CLIDailyEntryPayload(day: $0, language: language) }
+        self.untimestamped = CLIDailyEntryPayload(
+            day: snapshot.untimestampedLedger,
+            language: language,
+            labelOverride: TelemetrySnapshot.untimestampedLabel(in: language)
+        )
         self.relayRuns = snapshot.relayRuns.map(CLIRelayRunPayload.init)
     }
 }
@@ -781,6 +791,17 @@ public enum CLIRunner {
                     row += ", \(mis)"
                 }
                 lines.append(row)
+                if item.untimestamped.recordCount > 0 {
+                    let uTokStr = TelemetryFormatter.optionalTokens(item.untimestamped.totalTokens, completeness: item.untimestamped.completeness, language: language)
+                    let uCostBase = TelemetryFormatter.optionalUSD(item.untimestamped.estimatedCostUSD, completeness: item.untimestamped.completeness, language: language)
+                    let uCostStr: String = {
+                        if let note = item.untimestamped.costNote(in: language), item.untimestamped.estimatedCostUSD != nil {
+                            return "\(uCostBase)（\(note)）"
+                        }
+                        return uCostBase
+                    }()
+                    lines.append("  没有时间: Token \(uTokStr), 折算 \(uCostStr), 记录数 \(item.untimestamped.recordCount)")
+                }
             } else {
                 var row = "  Today: tokens \(todayTokStr), cost \(todayCostStr) | 30d: tokens \(tok30Str), cost \(cost30Str), cache hit \(hit30Str), records \(w30.recordCount)"
                 if item.rateLimitHits24h > 0 {
@@ -790,6 +811,17 @@ public enum CLIRunner {
                     row += ", \(mis)"
                 }
                 lines.append(row)
+                if item.untimestamped.recordCount > 0 {
+                    let uTokStr = TelemetryFormatter.optionalTokens(item.untimestamped.totalTokens, completeness: item.untimestamped.completeness, language: language)
+                    let uCostBase = TelemetryFormatter.optionalUSD(item.untimestamped.estimatedCostUSD, completeness: item.untimestamped.completeness, language: language)
+                    let uCostStr: String = {
+                        if let note = item.untimestamped.costNote(in: language), item.untimestamped.estimatedCostUSD != nil {
+                            return "\(uCostBase) (\(note))"
+                        }
+                        return uCostBase
+                    }()
+                    lines.append("  No timestamp: tokens \(uTokStr), cost \(uCostStr), records \(item.untimestamped.recordCount)")
+                }
             }
         }
 
@@ -842,6 +874,35 @@ public enum CLIRunner {
             } else {
                 var row = "\(day.dateString) | tokens \(tokStr) | cost \(costStr) | records \(day.recordCount) | 429s \(day.rateLimit429Count)"
                 if let mis = day.codexMismatchNote(in: language) {
+                    row += " | \(mis)"
+                }
+                lines.append(row)
+            }
+        }
+
+        let u = snapshot.untimestampedLedger
+        if u.recordCount > 0 {
+            let label = TelemetrySnapshot.untimestampedLabel(in: language)
+            let tokStr = TelemetryFormatter.compactTokens(u.totalTokens)
+            let costStr: String = {
+                guard let c = u.estimatedCostUSD else {
+                    return isZH ? "未知" : "Unknown"
+                }
+                let base = TelemetryFormatter.usd(c)
+                if let note = u.costNote(in: language) {
+                    return isZH ? "\(base)（\(note)）" : "\(base) (\(note))"
+                }
+                return base
+            }()
+            if isZH {
+                var row = "\(label) | Token \(tokStr) | 折算 \(costStr) | 记录 \(u.recordCount) | 429限流 \(u.rateLimit429Count)"
+                if let mis = u.codexMismatchNote(in: language) {
+                    row += " | \(mis)"
+                }
+                lines.append(row)
+            } else {
+                var row = "\(label) | tokens \(tokStr) | cost \(costStr) | records \(u.recordCount) | 429s \(u.rateLimit429Count)"
+                if let mis = u.codexMismatchNote(in: language) {
                     row += " | \(mis)"
                 }
                 lines.append(row)

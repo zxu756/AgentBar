@@ -531,6 +531,16 @@ public struct DashboardView: View {
                                 .lineLimit(2)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
+                        if !pending, item.untimestamped.recordCount > 0 {
+                            let uTok = TelemetryFormatter.optionalTokens(item.untimestamped.totalTokens, completeness: item.untimestamped.completeness, language: lang)
+                            Text(localizer.L(
+                                "No timestamp: \(uTok) · \(item.untimestamped.recordCount) rec (excluded from windows)",
+                                "没有时间：\(uTok) · \(item.untimestamped.recordCount) 条（不计入时间窗）"
+                            ))
+                            .font(.system(size: 9.5, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.muted)
+                            .lineLimit(1)
+                        }
                     }
                     .padding(.vertical, 6.5)
                 }

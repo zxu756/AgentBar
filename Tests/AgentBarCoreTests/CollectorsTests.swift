@@ -729,6 +729,335 @@ struct CollectorsTests {
         #expect(d14With429.rateLimit429Count == 4)
     }
 
+    @Test("M1 BR1: Missing or malformed timestamps across all 5 sources contribute 0 to windows and dated rows and tally strictly in untimestamped")
+    func missingAndCorruptTimestampsRouteStrictlyToUntimestamped() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-br1-\(UUID().uuidString)")
+        let homeDir = tmp.appendingPathComponent("home")
+        let wsDir = tmp.appendingPathComponent("ws")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-br1")
+        let codexDir = homeDir.appendingPathComponent(".codex")
+        let ocDir = homeDir.appendingPathComponent(".local/share/opencode")
+        let vibeJournal = homeDir.appendingPathComponent(".vibe/logs/session/unified/sess-v-notime/journal")
+        let relayDir = wsDir.appendingPathComponent("pipe/.relay")
+
+        for d in [claudeProj, codexDir, ocDir, vibeJournal, relayDir] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let now = try #require(iso.date(from: "2026-11-15T12:00:00Z"))
+        let d14Sec = Int64(try #require(iso.date(from: "2026-11-14T12:00:00Z")).timeIntervalSince1970)
+        let d13Ms = Int64(try #require(iso.date(from: "2026-11-13T12:00:00Z")).timeIntervalSince1970 * 1000)
+
+        // 1. Claude JSONL: 1 missing timestamp (1,000 tok) + 1 malformed timestamp (1,310 tok) + 1 malformed-timestamp 429
+        //    Set file mtime 90 days in the past to verify untimestamped lines in older files are never skipped by mtime pre-filtering.
+        let claudeFile = claudeProj.appendingPathComponent("br1.jsonl")
+        try """
+        {"type":"assistant","sessionId":"sc1","requestId":"r1","cwd":"/tmp/br1","message":{"id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":800,"output_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","timestamp":"not-a-date","sessionId":"sc1","requestId":"r2","cwd":"/tmp/br1","message":{"id":"m2","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":310,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        {"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"not-a-date","sessionId":"sc1","requestId":"r429"}
+        """.write(to: claudeFile, atomically: true, encoding: .utf8)
+        let oldMtime = try #require(iso.date(from: "2026-08-01T00:00:00Z"))
+        try FileManager.default.setAttributes([.modificationDate: oldMtime], ofItemAtPath: claudeFile.path)
+
+        // 1b. Antigravity cli-*.log: structured status=429 WITHOUT leading timestamp (file mtime is 10m ago -> must NOT borrow mtime)
+        let agyLogDir = homeDir.appendingPathComponent(".gemini/antigravity-cli/log")
+        try FileManager.default.createDirectory(at: agyLogDir, withIntermediateDirectories: true)
+        let agyLogFile = agyLogDir.appendingPathComponent("cli-br1.log")
+        try "WARN request failed status=429 reason=rate_limit\n".write(to: agyLogFile, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-600)], ofItemAtPath: agyLogFile.path)
+
+        // 2. Codex: rollout event missing timestamp (1,100 tok; thread updated_at is 2026-11-14) + session-only thread with updated_at=0 (400 tok)
+        let rolloutNoTS = codexDir.appendingPathComponent("rollout-nots.jsonl")
+        try """
+        {"type":"turn_context","payload":{"model":"gpt-5.4"}}
+        {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":100,"total_tokens":1100}}}}
+        """.write(to: rolloutNoTS, atomically: true, encoding: .utf8)
+        try execSQL(at: codexDir.appendingPathComponent("state_5.sqlite"), sql: """
+        CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, created_at INTEGER, model TEXT, rollout_path TEXT);
+        INSERT INTO threads VALUES ('th-notime', '/tmp/br1', 1100, \(d14Sec), \(d14Sec), 'gpt-5.4', '\(rolloutNoTS.path)');
+        INSERT INTO threads VALUES ('th-agg-zero', '/tmp/br1', 400, 0, 0, 'gpt-5.4', '/nonexistent/missing.jsonl');
+        """)
+
+        // 3. OpenCode: session_message missing time (77 tok; session_v2.time_updated is 2026-11-13) + session_v2-only with time_updated=0 (230 tok)
+        try execSQL(at: ocDir.appendingPathComponent("opencode.db"), sql: """
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        INSERT INTO session_v2 VALUES ('oc-notime', '/tmp/br1', 0.01, 50, 27, 0, 0, 0, 'claude-sonnet-4-6', \(d13Ms));
+        INSERT INTO session_v2 VALUES ('oc-agg-zero', '/tmp/br1', 0.02, 200, 30, 0, 0, 0, 'claude-sonnet-4-6', 0);
+        INSERT INTO session_message VALUES ('msg-notime', 'oc-notime', 'assistant', 1, 0, 0,
+            '{"model":{"id":"claude-sonnet-4-6"},"tokens":{"input":50,"output":27,"reasoning":0,"cache":{"read":0,"write":0}}}');
+        """)
+
+        // 4. Vibe: journal action_result with NO preceding timestamp (500 tok) + core_input with corrupt timestamp followed by action_result (250 tok)
+        try """
+        {"session_id":"sess-v-notime","start_time":"2026-11-12T12:00:00Z","end_time":"2026-11-12T12:05:00Z","config":{"active_model":"deepseek-v4"}}
+        """.write(to: vibeJournal.deletingLastPathComponent().appendingPathComponent("meta.json"), atomically: true, encoding: .utf8)
+        try """
+        {"sequence":1,"type":"action_result","payload":{"action_id":"act-no-ts","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":400,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":100,"total_tokens":500}}}}}
+        {"sequence":2,"type":"core_input","payload":{"input":{"determinism":{"time_unix_ms":"not-a-number"}}}}
+        {"sequence":3,"type":"action_result","payload":{"action_id":"act-bad-ts","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":200,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":50,"total_tokens":250}}}}}
+        """.write(to: vibeJournal.appendingPathComponent("0000000000000001.jsonl"), atomically: true, encoding: .utf8)
+
+        // 5. .relay/LOG.md: Vibe step without timestamp (600 tok) + AGY step without timestamp (900 tok) + AGY step with invalid date (350 tok)
+        let logFile = relayDir.appendingPathComponent("LOG.md")
+        try """
+        # Agent Relay Log
+
+        ## 01-vibe: ok, 12s
+        - vibe: model deepseek-v4, tokens 600, cost $0.0200
+
+        ## 02-agy: ok, 20s
+        - agy: model gemini-2.5-pro, tokens 900, cost $0.0300
+
+        ## 03-agy: ok, 15s, 2026-99-99 99:99
+        - agy: model gemini-2.5-pro, tokens 350, cost $0.0100
+        """.write(to: logFile, atomically: true, encoding: .utf8)
+
+        let snap = LocalTelemetryCollector.collectSnapshot(
+            paths: .liveDefault(home: homeDir, workspaceRoot: wsDir),
+            now: now,
+            timeZone: utc
+        )
+
+        #expect(snap.rateLimitHits24h == 0)
+        let expectedUntimestampedByVendor: [AgentVendor: (tok: Int, rec: Int)] = [
+            .claudeCode: (2_310, 2),       // 1,000 + 1,310
+            .codex: (1_500, 2),            // 1,100 (rollout event missing ts) + 400 (session-only updated_at=0)
+            .openCode: (307, 2),           // 77 (session_message missing ts) + 230 (session_v2-only time_updated=0)
+            .mistralVibe: (1_350, 3),      // 500 + 250 (journal) + 600 (.relay/LOG.md)
+            .antigravity: (1_250, 2)       // 900 + 350 (.relay/LOG.md)
+        ]
+        for summary in snap.vendorSummaries {
+            for win in TelemetryWindow.allCases {
+                let m = summary.metrics(for: win)
+                #expect((m.totalTokens ?? 0) == 0, "Vendor \(summary.vendor.rawValue) window \(win.rawValue) leaked untimestamped tokens: \(String(describing: m.totalTokens))")
+                #expect(m.recordCount == 0)
+            }
+            let exp = try #require(expectedUntimestampedByVendor[summary.vendor])
+            #expect(summary.untimestamped.totalTokens == exp.tok)
+            #expect(summary.untimestamped.recordCount == exp.rec)
+        }
+        // Total untimestamped: 2310 + 1500 + 307 + 1350 + 1250 = 6717 across 11 records
+        #expect(snap.untimestampedLedger.totalTokens == 6_717)
+        #expect(snap.untimestampedLedger.recordCount == 11)
+        #expect(TelemetrySnapshot.untimestampedLabel(in: .en) == "No timestamp")
+        #expect(TelemetrySnapshot.untimestampedLabel(in: .zhHans) == "没有时间")
+        #expect(snap.dailyBreakdown.count == 14)
+        for day in snap.dailyBreakdown {
+            #expect(day.totalTokens == 0, "Dated row \(day.dateString) leaked untimestamped tokens: \(day.totalTokens)")
+            #expect(day.recordCount == 0)
+        }
+    }
+
+    @Test("M1 BR2: Pacific/Auckland NZDT spring-forward (23h), fall-back (25h), and cross-midnight event attribution")
+    func pacificAucklandDSTAndCrossMidnightBoundaries() throws {
+        let auckland = try #require(TimeZone(identifier: "Pacific/Auckland"))
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+
+        func sample(_ id: String, _ tsISO: String, _ tokens: Int) throws -> UsageSample {
+            let d = try #require(iso.date(from: tsISO))
+            return UsageSample(
+                id: id,
+                vendor: .claudeCode,
+                timestamp: d,
+                sessionID: "s-nz",
+                projectName: "nz-test",
+                model: "claude-sonnet-4-6",
+                inputTokens: tokens,
+                outputTokens: 0
+            )
+        }
+
+        // Case 1: NZDT Start Day (2026-09-27, spring-forward 23-hour day: 02:00 +12:00 jumps to 03:00 +13:00)
+        let springNow = try #require(iso.date(from: "2026-09-28T05:00:00Z")) // 2026-09-28 18:00:00 +13:00
+        let springSamples = [
+            try sample("sp1", "2026-09-26T11:59:59Z", 100),  // 2026-09-26 23:59:59 +12:00 -> 2026-09-26
+            try sample("sp2", "2026-09-26T12:00:00Z", 200),  // 2026-09-27 00:00:00 +12:00 -> 2026-09-27
+            try sample("sp3", "2026-09-26T13:30:00Z", 400),  // 2026-09-27 01:30:00 +12:00 -> 2026-09-27 (pre-jump)
+            try sample("sp4", "2026-09-26T13:59:59Z", 800),  // 2026-09-27 01:59:59 +12:00 -> 2026-09-27 (1s before jump)
+            try sample("sp5", "2026-09-26T14:00:00Z", 1600), // 2026-09-27 03:00:00 +13:00 -> 2026-09-27 (jump landing)
+            try sample("sp6", "2026-09-26T14:30:00Z", 3200), // 2026-09-27 03:30:00 +13:00 -> 2026-09-27 (post-jump)
+            try sample("sp7", "2026-09-27T10:59:59Z", 6400), // 2026-09-27 23:59:59 +13:00 -> 2026-09-27 (end of 23h day)
+            try sample("sp8", "2026-09-27T11:00:00Z", 12800) // 2026-09-28 00:00:00 +13:00 -> 2026-09-28
+        ]
+        let springSnap = LocalTelemetryCollector.buildSnapshot(
+            samples: springSamples, relayRuns: [], availability: [.claudeCode: true], now: springNow, timeZone: auckland
+        )
+        let springDays = Dictionary(uniqueKeysWithValues: springSnap.dailyBreakdown.map { ($0.dateString, $0.totalTokens) })
+        #expect(springDays["2026-09-26"] == 100)
+        // 200 + 400 + 800 + 1600 + 3200 + 6400 = 12600
+        #expect(springDays["2026-09-27"] == 12_600)
+        #expect(springDays["2026-09-28"] == 12_800)
+
+        // Case 2: NZDT End Day (2027-04-04, fall-back 25-hour day: 02:00-02:59 repeats in +13:00 then +12:00)
+        // Evaluate rolling 5h at now = 2027-04-03T18:00:00Z (2027-04-04 06:00:00 +12:00); now - 18000s = 2027-04-03T13:00:00Z (02:00:00 +13:00)
+        let fall5hNow = try #require(iso.date(from: "2027-04-03T18:00:00Z"))
+        let fallSamples = [
+            try sample("fb1", "2027-04-03T10:59:59Z", 100),  // 2027-04-03 23:59:59 +13:00 -> 2027-04-03
+            try sample("fb2", "2027-04-03T11:00:00Z", 200),  // 2027-04-04 00:00:00 +13:00 -> 2027-04-04 (outside 5h)
+            try sample("fb3", "2027-04-03T12:59:59Z", 400),  // 2027-04-04 01:59:59 +13:00 -> 2027-04-04 (now - 18001s, outside 5h)
+            try sample("fb4", "2027-04-03T13:00:00Z", 800),  // 2027-04-04 02:00:00 +13:00 -> 2027-04-04 (now - 18000s, inside 5h)
+            try sample("fb5", "2027-04-03T13:30:00Z", 1600), // 2027-04-04 02:30:00 +13:00 -> 2027-04-04 (1st 02:30, inside 5h)
+            try sample("fb6", "2027-04-03T14:30:00Z", 3200), // 2027-04-04 02:30:00 +12:00 -> 2027-04-04 (2nd 02:30, inside 5h)
+            try sample("fb7", "2027-04-04T11:59:59Z", 6400), // 2027-04-04 23:59:59 +12:00 -> 2027-04-04 (end of 25h day)
+            try sample("fb8", "2027-04-04T12:00:00Z", 12800) // 2027-04-05 00:00:00 +12:00 -> 2027-04-05
+        ]
+        let fall5hSnap = LocalTelemetryCollector.buildSnapshot(
+            samples: fallSamples, relayRuns: [], availability: [.claudeCode: true], now: fall5hNow, timeZone: auckland
+        )
+        let fall5hClaude = try #require(fall5hSnap.vendorSummaries.first(where: { $0.vendor == .claudeCode }))
+        // Inside [13:00:00Z, 18:00:00Z]: 800 + 1600 + 3200 = 5600 (excludes fb3=400 at 12:59:59Z and future fb7/fb8)
+        #expect(fall5hClaude.metrics(for: .fiveHours).totalTokens == 5_600)
+        // Today up to 18:00:00Z: 200 + 400 + 800 + 1600 + 3200 = 6200
+        #expect(fall5hClaude.metrics(for: .today).totalTokens == 6_200)
+
+        let fallNextDayNow = try #require(iso.date(from: "2027-04-04T13:00:00Z")) // 2027-04-05 01:00:00 +12:00
+        let fallDaySnap = LocalTelemetryCollector.buildSnapshot(
+            samples: fallSamples, relayRuns: [], availability: [.claudeCode: true], now: fallNextDayNow, timeZone: auckland
+        )
+        let fallDays = Dictionary(uniqueKeysWithValues: fallDaySnap.dailyBreakdown.map { ($0.dateString, $0.totalTokens) })
+        #expect(fallDays["2027-04-03"] == 100)
+        // Full 25-hour 2027-04-04: 200 + 400 + 800 + 1600 + 3200 + 6400 = 12600
+        #expect(fallDays["2027-04-04"] == 12_600)
+        #expect(fallDays["2027-04-05"] == 12_800)
+
+        // Case 3: Cross-Midnight Cases in Pacific/Auckland (+13:00)
+        let midNow = try #require(iso.date(from: "2026-11-15T11:00:00Z")) // 2026-11-16 00:00:00 +13:00
+        let midSamples = [
+            try sample("cm1", "2026-11-14T10:59:59Z", 300),  // same UTC date 2026-11-14 -> NZ 2026-11-14 23:59:59 +13:00
+            try sample("cm2", "2026-11-14T11:00:00Z", 700),  // same UTC date 2026-11-14 -> NZ 2026-11-15 00:00:00 +13:00
+            try sample("cm3", "2026-11-14T11:30:00Z", 1500), // UTC 2026-11-14 -> NZ 2026-11-15 00:30:00 +13:00
+            try sample("cm4", "2026-11-15T10:30:00Z", 3100)  // UTC 2026-11-15 -> NZ 2026-11-15 23:30:00 +13:00
+        ]
+        let midSnap = LocalTelemetryCollector.buildSnapshot(
+            samples: midSamples, relayRuns: [], availability: [.claudeCode: true], now: midNow, timeZone: auckland
+        )
+        let midDays = Dictionary(uniqueKeysWithValues: midSnap.dailyBreakdown.map { ($0.dateString, $0.totalTokens) })
+        #expect(midDays["2026-11-14"] == 300)
+        // 700 + 1500 + 3100 = 5300
+        #expect(midDays["2026-11-15"] == 5_300)
+
+        // Case 4: End-to-end .relay/LOG.md local HH:mm:ss cross-midnight + non-existent spring-forward 02:30 in Pacific/Auckland
+        let tmpNZ = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-nz-relay-\(UUID().uuidString)")
+        let nzHome = tmpNZ.appendingPathComponent("home")
+        let nzRelay = tmpNZ.appendingPathComponent("ws/proj/.relay")
+        try FileManager.default.createDirectory(at: nzHome, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nzRelay, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpNZ) }
+
+        try """
+        # Agent Relay Log
+
+        ## 01-agy: ok, 10s, 2026-11-14 23:59:59
+        - agy: model gemini-2.5-pro, tokens 410
+
+        ## 02-agy: ok, 12s, 2026-11-15 00:00:00
+        - agy: model gemini-2.5-pro, tokens 820
+
+        ## 03-agy: ok, 14s, 2026-09-27 02:30
+        - agy: model gemini-2.5-pro, tokens 999
+        """.write(to: nzRelay.appendingPathComponent("LOG.md"), atomically: true, encoding: .utf8)
+
+        let nzRelaySnap = LocalTelemetryCollector.collectSnapshot(
+            paths: .liveDefault(home: nzHome, workspaceRoot: tmpNZ.appendingPathComponent("ws")),
+            now: midNow,
+            timeZone: auckland
+        )
+        let nzRelayDays = Dictionary(uniqueKeysWithValues: nzRelaySnap.dailyBreakdown.map { ($0.dateString, $0.totalTokens) })
+        #expect(nzRelayDays["2026-11-14"] == 410)
+        #expect(nzRelayDays["2026-11-15"] == 820)
+        // Non-existent wall time 2026-09-27 02:30 during NZDT spring-forward jump routes to untimestamped
+        #expect(nzRelaySnap.untimestampedLedger.totalTokens == 999)
+    }
+
+    @Test("M1 BR3: Exact boundary second checks for dayStart, nextDayStart, fiveHoursAgo, sevenDaysAgo, thirtyDaysAgo, and now")
+    func exactSecondWindowAndDayBoundaries() throws {
+        let utc = TimeZone(secondsFromGMT: 0)!
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        let now = try #require(iso.date(from: "2026-11-14T12:00:00Z"))
+
+        let startOfToday = try #require(iso.date(from: "2026-11-14T00:00:00Z")) // == nextDayStart of 2026-11-13
+        let prevDayStart = try #require(iso.date(from: "2026-11-13T00:00:00Z"))
+        let fiveHoursAgo = now.addingTimeInterval(-18_000.0)   // 2026-11-14T07:00:00Z
+        let sevenDaysAgo = now.addingTimeInterval(-604_800.0)  // 2026-11-07T12:00:00Z
+        let thirtyDaysAgo = now.addingTimeInterval(-30.0 * 86_400.0) // 2026-10-15T12:00:00Z
+
+        func makeSample(_ id: String, _ ts: Date, _ tokens: Int) -> UsageSample {
+            UsageSample(
+                id: id,
+                vendor: .claudeCode,
+                timestamp: ts,
+                sessionID: "sess-br3",
+                projectName: "br3",
+                model: "claude-sonnet-4-6",
+                inputTokens: tokens,
+                outputTokens: 0
+            )
+        }
+
+        let samples: [UsageSample] = [
+            makeSample("b-30d-out", thirtyDaysAgo.addingTimeInterval(-1.0), 1_000),   // excluded from 30d
+            makeSample("b-30d-in", thirtyDaysAgo, 2_000),                              // included in 30d only
+            makeSample("b-7d-out", sevenDaysAgo.addingTimeInterval(-1.0), 4_000),      // in 30d, excluded from 7d
+            makeSample("b-7d-in", sevenDaysAgo, 8_000),                                // in 30d and 7d
+            makeSample("b-prev-start", prevDayStart, 16_000),                          // ONLY on 2026-11-13 (not 2026-11-12)
+            makeSample("b-today-out", startOfToday.addingTimeInterval(-1.0), 32_000),  // ONLY on 2026-11-13 (excluded from today)
+            makeSample("b-today-in", startOfToday, 64_000),                            // ONLY on 2026-11-14 (excluded from 2026-11-13!)
+            makeSample("b-5h-out", fiveHoursAgo.addingTimeInterval(-1.0), 128_000),    // in today, excluded from 5h
+            makeSample("b-5h-in", fiveHoursAgo, 256_000),                              // in 5h and today
+            makeSample("b-now-in", now, 512_000),                                      // in 5h, today, 7d, 30d, 2026-11-14
+            makeSample("b-future-out", now.addingTimeInterval(1.0), 1_024_000)         // future: excluded everywhere
+        ]
+
+        let rateEvents: [RateLimitEvent] = [
+            RateLimitEvent(id: "rl-5h-out", vendor: .claudeCode, timestamp: fiveHoursAgo.addingTimeInterval(-1.0)),
+            RateLimitEvent(id: "rl-5h-in", vendor: .claudeCode, timestamp: fiveHoursAgo),
+            RateLimitEvent(id: "rl-today-out", vendor: .claudeCode, timestamp: startOfToday.addingTimeInterval(-1.0)),
+            RateLimitEvent(id: "rl-today-in", vendor: .claudeCode, timestamp: startOfToday),
+            RateLimitEvent(id: "rl-future", vendor: .claudeCode, timestamp: now.addingTimeInterval(1.0))
+        ]
+
+        let snap = LocalTelemetryCollector.buildSnapshot(
+            samples: samples,
+            relayRuns: [],
+            availability: [.claudeCode: true],
+            rateLimitEvents: rateEvents,
+            now: now,
+            timeZone: utc
+        )
+        let claude = try #require(snap.vendorSummaries.first(where: { $0.vendor == .claudeCode }))
+
+        // fiveHours: 256_000 + 512_000 = 768_000
+        #expect(claude.metrics(for: .fiveHours).totalTokens == 768_000)
+        #expect(claude.metrics(for: .fiveHours).rateLimit429Count == 1)
+
+        // today (2026-11-14): 64_000 + 128_000 + 256_000 + 512_000 = 960_000
+        #expect(claude.metrics(for: .today).totalTokens == 960_000)
+        #expect(claude.metrics(for: .today).rateLimit429Count == 3)
+
+        // sevenDays: 8_000 + 16_000 + 32_000 + 960_000 = 1_016_000
+        #expect(claude.metrics(for: .sevenDays).totalTokens == 1_016_000)
+
+        // thirtyDays: 2_000 + 4_000 + 1_016_000 = 1_022_000 (excludes 1_000 at thirtyDaysAgo - 1s and 1_024_000 at now + 1s)
+        #expect(claude.metrics(for: .thirtyDays).totalTokens == 1_022_000)
+
+        let byDay = Dictionary(uniqueKeysWithValues: snap.dailyBreakdown.map { ($0.dateString, $0) })
+        // 2026-11-12: must NOT get prevDayStart (16_000) even if < dayEnd were mutated to <= dayEnd!
+        #expect(byDay["2026-11-12"]?.totalTokens == 0)
+        // 2026-11-13: 16_000 + 32_000 = 48_000 (must NOT get startOfToday = 64_000!)
+        #expect(byDay["2026-11-13"]?.totalTokens == 48_000)
+        #expect(byDay["2026-11-13"]?.rateLimit429Count == 1)
+        // 2026-11-14: 64_000 + 128_000 + 256_000 + 512_000 = 960_000 (excludes future 1_024_000!)
+        #expect(byDay["2026-11-14"]?.totalTokens == 960_000)
+        #expect(byDay["2026-11-14"]?.rateLimit429Count == 3)
+    }
+
     private func execSQL(at url: URL, sql: String) throws {
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else {

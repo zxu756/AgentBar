@@ -1,12 +1,17 @@
 ==============================================================================
 AgentBar M1 Independent Acceptance Ledger (measurement date: 2026-11-15)
 Binary: .build/debug/AgentBar
-Frozen evaluation epoch (--now): 1794655214 (UTC day=2026-11-14)
+Oracle mode: Hand-calculated literal expected tables beside fixtures (zero collector re-implementation)
 ==============================================================================
-[Row 1] PASS | Cross-day 3d sessions (2026-11-12..2026-11-14): Codex=[105k, 157k, 63k], OpenCode=[50k, 80k, 90k], Vibe=[12.5k, 22k, 31k], max_diff=0.0000%
-[Row 2] PASS | 14d x 5-vendor ledger: synth 70 cells max_diff=0.0000%; live 70 cells max_diff=0.0000% (cross-day threads: codex=5, opencode=8; 14d tokens: claude=2,462,748,476, codex=278,997,474, opencode=3,478,784,038, vibe=72,647,219, agy=11,230,126)
-[Row 3] PASS | fiveHours [now-5h, now]: synth boundary (claude=10k, codex=40k, opencode=30k, vibe=9k) exact; live 5-vendor max_diff=0.0000%
-[Row 4] PASS | Per-day B14/B15 + structured B7: prose_429=0, structured_429=2, per-day costNote & mismatchNote EN/ZH verified; live 14d unmatched=1629, 429s=9, mismatch_days=0, agy=relayOnly
-[Row 5] PASS | Scripted isolated M1 mutations: M1-codex-session-ts=RED(rc=1), M2-opencode-ignore-messages=RED(rc=1), M3-vibe-no-action-dedup=RED(rc=1), M4-prose-429-false-positive=RED(rc=1), M5-drop-daily-b15-mismatch=RED(rc=1), restored=GREEN(rc=0)
+[Row 1a] PASS | Cross-day 3d sessions (.jsonl/SQLite/journal): Codex=[105k, 157k, 63k], OpenCode=[16.5k(fb), 50k, 80k, 90k], Vibe=[12.5k, 22k, 31k], max_diff=0.0000%
+[Row 1b] PASS | Cross-day archived Codex .jsonl.zst: Codex .jsonl.zst=[40k, 50k] complete & --no-zstd=totalOnly(90k)
+[Row 2 ] PASS | 14d x 5-vendor 70-cell literal ledger: 70/70 day x vendor cells matched literal hand-calculated ledger with max_diff=0.0000%
+[Row 3 ] PASS | fiveHours [now-5h, now] & BR3 exact-second boundaries: Exact second boundaries verified: claude(5h=768k, today=960k, 7d=1,016k, 30d=1,022k, d13=0, d14=48k, d15=960k), codex_5h=40k, opencode_5h=30k, vibe_5h=9k
+[Row 4 ] PASS | Per-day B14/B15 + structured B7 429: prose_429=0, structured_429=2, per-day costNote & mismatchNote EN/ZH verified, agy=relayOnly(!=complete)
+[Row 5 ] PASS | Scripted isolated M1 + BR1/BR3 mutations (8): M1-br3-day-upper-le=RED(rc=1), M2-br3-fivehours-gt=RED(rc=1), M3-br3-sevendays-gt=RED(rc=1), M4-br1-claude-ts-now=RED(rc=1), M5-codex-session-ts=RED(rc=1), M6-opencode-ignore-messages=RED(rc=1), M7-vibe-no-action-dedup=RED(rc=1), M8-prose-429-false-positive=RED(rc=1), restored=GREEN(rc=0)
+[Row 6 ] PASS | BR1 missing/corrupt timestamps -> untimestamped: 0 tokens leaked into 5h/today/7d/30d/14d-dated rows; untimestamped=6,717 tok (11 records) labeled 'No timestamp' (EN) & '没有时间' (ZH)
+[Row 7 ] PASS | BR2 --tz Pacific/Auckland DST & cross-midnight: Pacific/Auckland verified: NZDT start 2026-09-27 (23h)=16,400 (02:30 gap->untimestamped=999), NZDT end 2027-04-04 (25h)=13,800 (both 02:30s summed, 5h=5,600/1,200), cross-midnight=[710, 6,120]
+[Row 8 ] SKIP | Optional live-host smoke check: AGENTBAR_LIVE_HOST != 1; live-host read-only smoke check skipped (counted as skipped, never as passed)
 ==============================================================================
-RESULT: ALL 5 M1 ACCEPTANCE ROWS + PART 2 PER-DAY B14/B15 + STRUCTURED B7 + W1 PASSED (read-only verified).
+SUMMARY: passed=8, skipped=1, failed=0 (skipped checks are never counted as passed)
+RESULT: PASSED (8 passed, 1 skipped, 0 failed; plist untouched).

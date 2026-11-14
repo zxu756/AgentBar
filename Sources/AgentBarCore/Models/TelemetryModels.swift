@@ -391,7 +391,7 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
     public var id: String
     public var vendor: AgentVendor
     public var origin: SampleOrigin
-    public var timestamp: Date
+    public var timestamp: Date?
     public var sessionID: String
     public var projectName: String
     public var model: String
@@ -413,7 +413,7 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         id: String,
         vendor: AgentVendor,
         origin: SampleOrigin = .standalone,
-        timestamp: Date,
+        timestamp: Date?,
         sessionID: String,
         projectName: String,
         model: String,
@@ -463,7 +463,7 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         unsplitID id: String,
         vendor: AgentVendor,
         origin: SampleOrigin,
-        timestamp: Date,
+        timestamp: Date?,
         sessionID: String,
         projectName: String,
         model: String,
@@ -500,7 +500,7 @@ public struct UsageSample: Identifiable, Codable, Sendable, Equatable {
         aggregatedID id: String,
         vendor: AgentVendor,
         origin: SampleOrigin,
-        timestamp: Date,
+        timestamp: Date?,
         sessionID: String,
         projectName: String,
         model: String,
@@ -739,6 +739,7 @@ public struct VendorSummary: Identifiable, Codable, Sendable, Equatable {
     public var dataSource: String
     public var completeness: DataCompleteness
     public var windows: [TelemetryWindow: VendorWindowMetrics]
+    public var untimestamped: VendorWindowMetrics
     public var sessionCount30d: Int
     public var activeModel: String
     public var lastActive: Date?
@@ -750,6 +751,7 @@ public struct VendorSummary: Identifiable, Codable, Sendable, Equatable {
         dataSource: String,
         completeness: DataCompleteness,
         windows: [TelemetryWindow: VendorWindowMetrics],
+        untimestamped: VendorWindowMetrics? = nil,
         sessionCount30d: Int,
         activeModel: String,
         lastActive: Date?,
@@ -760,6 +762,21 @@ public struct VendorSummary: Identifiable, Codable, Sendable, Equatable {
         self.dataSource = dataSource
         self.completeness = completeness
         self.windows = windows
+        self.untimestamped = untimestamped ?? VendorWindowMetrics(
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 0,
+            recordCount: 0,
+            pricedRecordCount: 0,
+            estimatedCostUSD: 0.0,
+            unknownModelRecordCount: 0,
+            cacheHitRate: nil,
+            dataSource: dataSource,
+            completeness: .noData,
+            rateLimit429Count: 0
+        )
         self.sessionCount30d = sessionCount30d
         self.activeModel = activeModel
         self.lastActive = lastActive
@@ -865,9 +882,14 @@ public struct TelemetrySnapshot: Codable, Sendable, Equatable {
     public var vendorSummaries: [VendorSummary]
     public var dailyBuckets: [DailyVendorBucket]
     public var dailyBreakdown: [DailyLedgerDay]
+    public var untimestampedLedger: DailyLedgerDay
     public var recentSessions: [UsageSample]
     public var relayRuns: [RelayRunSummary]
     public var rateLimitEvents: [RateLimitEvent]
+
+    public static func untimestampedLabel(in language: AppLanguage) -> String {
+        language == .zhHans ? "没有时间" : "No timestamp"
+    }
 
     public init(
         capturedAt: Date,
@@ -876,6 +898,7 @@ public struct TelemetrySnapshot: Codable, Sendable, Equatable {
         vendorSummaries: [VendorSummary],
         dailyBuckets: [DailyVendorBucket],
         dailyBreakdown: [DailyLedgerDay] = [],
+        untimestampedLedger: DailyLedgerDay = DailyLedgerDay(dateString: "No timestamp", dayStart: .distantPast),
         recentSessions: [UsageSample],
         relayRuns: [RelayRunSummary],
         rateLimitEvents: [RateLimitEvent] = []
@@ -886,6 +909,7 @@ public struct TelemetrySnapshot: Codable, Sendable, Equatable {
         self.vendorSummaries = vendorSummaries
         self.dailyBuckets = dailyBuckets
         self.dailyBreakdown = dailyBreakdown
+        self.untimestampedLedger = untimestampedLedger
         self.recentSessions = recentSessions
         self.relayRuns = relayRuns
         self.rateLimitEvents = rateLimitEvents

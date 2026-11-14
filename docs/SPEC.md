@@ -36,7 +36,7 @@ Every vendor summary and time window (`fiveHours`, `today`, `sevenDays`, `thirty
 
 1. **Claude Code (`claude`)** — `~/.claude/projects/**/*.jsonl`
    - Claude Code writes one `type: "assistant"` JSONL line per streamed content block (`thinking`, `text`, `tool_use`), repeating cumulative `message.usage` under the same `(message.id, requestId)` pair.
-   - `collectClaudeTelemetry` deduplicates all assistant usage lines by `(message.id, requestId)` (falling back to `message.id` or `requestId` if one is absent, and per-line key only when both are absent), taking the element-wise `max` across `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` so each assistant turn is counted **once** at its ISO-8601 `timestamp`.
+   - `collectClaudeTelemetry` scans all `.jsonl` files without filesystem `mtime` pre-skipping and deduplicates assistant usage lines by `(message.id, requestId)` (falling back to `message.id` or `requestId` if one is absent, and per-line key only when both are absent), taking the element-wise `max` across `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` so each assistant turn is counted **once** at its ISO-8601 `timestamp` (`nil` -> `untimestamped` when `"timestamp"` is missing or malformed; never falls back to `now`).
    - Completeness: `complete` when `recordCount > 0`.
 
 2. **Codex CLI (`codex`)** — `~/.codex/state_5.sqlite` + `threads.rollout_path` (`.jsonl` / `.jsonl.zst` full stream)
@@ -44,23 +44,23 @@ Every vendor summary and time window (`fiveHours`, `today`, `sevenDays`, `thirty
    - Reads the **entire** rollout event stream from `rollout_path` (or read-only `zstd -dc` when archived as `<rollout_path>.zst`), without tail-only truncation:
      - Tracks `turn_context` (`payload.model`) to attribute mid-thread model switches accurately to subsequent turns.
      - Computes per-turn incremental deltas across `event_msg` (`payload.type == "token_count"`, `payload.info.total_token_usage`): `delta = current_cumulative - previous_cumulative`, skipping duplicate consecutive zero-delta `token_count` events and handling session counter resets when `current_cumulative < previous_cumulative`.
-     - Attributes each turn delta to that event's own top-level ISO-8601 `"timestamp"`.
+     - Attributes each turn delta strictly to that event's own top-level ISO-8601 `"timestamp"`. If a rollout event lacks a valid `"timestamp"`, it never borrows `threads.updated_at` or `now` and instead routes to `untimestamped`.
    - In Codex rollout `total_token_usage`, `input_tokens` includes `cached_input_tokens`, and `output_tokens` already includes `reasoning_output_tokens`:
      - `inputTokens = max(0, delta_input - delta_cached_input)`
      - `cacheReadTokens = delta_cached_input`
      - `cacheWriteTokens = delta_cache_write`
      - `outputTokens = delta_output`
    - **Rollout vs SQLite Total Verification (`B15`, Window & Per-Day)**: Compares the thread's full rollout delta sum (`rolloutTotal`) and `total_token_usage.total_tokens` against `threads.tokens_used`. When they differ, sets `hasRolloutMismatch = true`, records `<threadID>: rollout=<rolloutTotal> vs sqlite=<tokens_used>` in `mismatchNote` / `codexMismatchNote` on both the summary windows AND every calendar day in `dailyBreakdown` touched by that thread, and downgrades completeness to `mismatch` (`Total mismatch` / `总量不一致`).
-   - If neither `.jsonl` nor readable `.jsonl.zst` turn events exist for a thread, falls back to `threads.updated_at` (`created_at`), emitting an unsplit sample with `totalTokens = tokens_used`, `completeness = totalOnly`, and `inputTokens = outputTokens = cacheReadTokens = cacheWriteTokens = estimatedCostUSD = cacheHitRate = null`.
+   - **Aggregate-Only Fallback**: Only when neither `.jsonl` nor readable `.jsonl.zst` turn events exist for a thread (`0` rollout events) does `AgentBar` emit an unsplit sample (`totalTokens = tokens_used`, `completeness = totalOnly`, `null` breakdown/cost/cacheHitRate), using `threads.updated_at` (`created_at`) when `> 0` or routing to `untimestamped` when `updated_at <= 0`.
 
 3. **OpenCode (`opencode`)** — `~/.local/share/opencode/opencode.db` (`session_message` / `message` + `session_v2` fallback)
-   - Reads per-message token events from `session_message` (or `message` if a schema uses that table name) where `type IN ('assistant', 'compaction')`, parsing `data` JSON (`time.created` / `time.completed` or `time_created` Unix ms, `model.id` / `model`, `cost`, and `tokens.{input, output, reasoning, cache.{read, write}}`).
+   - Reads per-message token events from `session_message` (or `message` if a schema uses that table name) where `type IN ('assistant', 'compaction')`, parsing `data` JSON (`time.created` / `time.completed` or `time_created` / `time_updated` Unix ms, `model.id` / `model`, `cost`, and `tokens.{input, output, reasoning, cache.{read, write}}`). If a `session_message` row lacks a valid positive timestamp, it routes strictly to `untimestamped` and never borrows `session_v2.time_updated` or `now`.
    - In OpenCode `session_message`, `tokens.input` is already uncached input (`input + output + reasoning + cache.read + cache.write` matches `session_v2` totals); `outputTokens = tokens.output + tokens.reasoning`.
-   - Falls back to `session_v2` (`time_updated`) **only** for sessions that have `0` token-bearing rows in `session_message` (preventing double-counting while preserving legacy sessions).
+   - Falls back to `session_v2` (`time_updated`) **only** for aggregate-only sessions that have `0` token-bearing rows in `session_message` (routing to `untimestamped` if `time_updated <= 0`).
 
 4. **Mistral Vibe (`vibe`)** — `~/.vibe/logs/session/unified/<session_id>/{meta.json,journal/*.jsonl}` + `~/.vibe/config.toml` + `<workspace>/*/.relay/LOG.md`
    - Reads `meta.json` (`session_id`, `start_time`, `end_time`, `config.active_model` / `config.model_name`) with model fallback to `~/.vibe/config.toml` (`active_model`).
-   - Reads all `journal/*.jsonl` segment files in lexicographic/sequence order, maintaining a running Unix-ms timestamp from `payload.input.determinism.time_unix_ms`, `payload.delta[].entry.{updatedAt,createdAt}`, `payload.session_api.turn_outcomes.*.completedAt`, or top-level `timestamp` (falling back to `meta.json` `start_time`/`end_time`).
+   - Reads all `journal/*.jsonl` segment files in lexicographic/sequence order, maintaining a running Unix-ms timestamp strictly from valid journal timestamps (`payload.input.determinism.time_unix_ms`, `payload.delta[].entry.{updatedAt,createdAt}`, `payload.session_api.turn_outcomes.*.completedAt`, or top-level `timestamp`). Journal `action_result` events lacking a valid timestamp (or preceded by a corrupt timestamp) never borrow `meta.json` `start_time`/`end_time`, directory `mtime`, or `now`, and route to `untimestamped` (`meta.json` timestamps are used only for aggregate-only `meta.json` `stats` fallback when `0` journal records exist).
    - Extracts `type == "action_result"` records with `payload.state == "succeeded"` and `payload.result.type == "completion_succeeded"`, deduplicated by `payload.action_id`.
    - In Vibe `usage`, `input_tokens` already includes `cached_input_tokens` and `output_tokens` already includes `reasoning_tokens`:
      - `inputTokens = max(0, input_tokens - cached_input_tokens)`
@@ -70,8 +70,18 @@ Every vendor summary and time window (`fiveHours`, `today`, `sevenDays`, `thirty
    - **Relay Deduplication**: Inspects `<workspace>/<proj>/.relay/<stepID>.vibe/export.json` (and `session/meta.json`) for `session_id`; if that `session_id` was already collected from `~/.vibe/logs/session/unified/`, the `.relay/LOG.md` step is skipped so Vibe usage is never double-counted. Completeness is `complete` when all Vibe samples come from `journal/*.jsonl`, or `relayOnly` when unlinked `.relay/LOG.md` Vibe steps are present.
 
 5. **Antigravity (`agy`)** — `<workspace>/*/.relay/LOG.md` + `~/.gemini/antigravity-cli/log/cli-*.log` (`cli-*.log lacks token stats` / `cli-*.log 无 Token 统计`)
-   - Standalone `cli-*.log` provides only active model (`override to backend: label="..."`) and structured `status=429` markers, not token usage.
-   - Reads recorded `tokens` and `cost` from `.relay/LOG.md` steps without fabricating input/output splits or guessing unsplit token prices. Completeness is `relayOnly` (or `noData`), **never `complete`**.
+   - Standalone `cli-*.log` provides only active model (`override to backend: label="..."`) and ISO-timestamped structured `status=429` markers (lines without a valid leading ISO-8601 timestamp never borrow file `mtime`).
+   - Reads recorded `tokens` and `cost` from `.relay/LOG.md` steps without fabricating input/output splits or guessing unsplit token prices. Step timestamps (`yyyy-MM-dd HH:mm` or `yyyy-MM-dd HH:mm:ss`) are strictly validated in the evaluation `timeZone` (`--tz`) via `Calendar` / `DateComponents.isValidDate(in:)`; missing or invalid wall-clock step dates (including non-existent spring-forward DST gap minutes) never borrow `LOG.md` `mtime` and route to `untimestamped`. Completeness is `relayOnly` (or `noData`), **never `complete`**.
+
+### Window & Calendar-Day Boundary Rules (`BR1`, `BR2`, `BR3`)
+
+- **Rolling & Current-Day Windows**: Evaluated against `now` and `cal` (`cal.timeZone = timeZone`):
+  - `fiveHours`: `timestamp >= now - 18_000s && timestamp <= now`
+  - `today`: `timestamp >= cal.startOfDay(for: now) && timestamp <= now`
+  - `sevenDays`: `timestamp >= now - 604_800s && timestamp <= now`
+  - `thirtyDays`: `timestamp >= now - 2_592_000s && timestamp <= now`
+- **14-Day `dailyBreakdown` Calendar Rows**: Half-open per-day intervals `[dayStart, nextDayStart)` computed via `cal.date(byAdding: .day, ...)` in `timeZone` (handling 23-hour spring-forward and 25-hour fall-back DST transitions such as `Pacific/Auckland` NZDT): `timestamp >= dayStart && timestamp < nextDayStart && timestamp <= now`.
+- **`untimestamped` Bucket (`No timestamp` / `没有时间`)**: Records with `timestamp == nil` contribute `0` tokens and `0` records to `fiveHours`, `today`, `sevenDays`, `thirtyDays`, and all 14 dated `dailyBreakdown` rows, and are reported separately in `vendors.<id>.untimestamped`, top-level `untimestamped` (`date: "No timestamp"` in English / `"没有时间"` in Simplified Chinese), and CLI/UI output when `recordCount > 0`.
 
 ### Structured `429` Rate-Limit Detection (`B7`)
 

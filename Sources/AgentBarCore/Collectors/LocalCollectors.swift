@@ -174,8 +174,8 @@ public enum LocalTelemetryCollector {
         let codexResult = collectCodexTelemetry(dbURL: paths.codexSQLiteFile, since: cutoff, now: now, allowZstd: allowZstdRollout)
         let openCodeResult = collectOpenCodeTelemetry(dbURL: paths.openCodeSQLiteFile, since: cutoff, now: now)
         let relayRuns = collectRelayRuns(workspaceRoot: paths.workspaceRootDir)
-        let vibeResult = collectVibeTelemetry(vibeDir: paths.vibeSessionsDir, relayRuns: relayRuns, since: cutoff, now: now)
-        let agyResult = collectAntigravityTelemetry(logDir: paths.antigravityLogsDir, relayRuns: relayRuns, since: cutoff, now: now)
+        let vibeResult = collectVibeTelemetry(vibeDir: paths.vibeSessionsDir, relayRuns: relayRuns, since: cutoff, now: now, timeZone: timeZone)
+        let agyResult = collectAntigravityTelemetry(logDir: paths.antigravityLogsDir, relayRuns: relayRuns, since: cutoff, now: now, timeZone: timeZone)
 
         let allTurnSamples = claudeResult.samples
             + codexResult.samples
@@ -230,6 +230,7 @@ public enum LocalTelemetryCollector {
         let startOfToday = cal.startOfDay(for: now)
         let fiveHoursAgo = now.addingTimeInterval(-5.0 * 3600.0)
         let sevenDaysAgo = now.addingTimeInterval(-7.0 * 86_400.0)
+        let thirtyDaysAgo = now.addingTimeInterval(-30.0 * 86_400.0)
         let twentyFourHoursAgo = now.addingTimeInterval(-24.0 * 3600.0)
         let fourteenDaysAgo = cal.date(byAdding: .day, value: -13, to: startOfToday) ?? startOfToday
 
@@ -241,25 +242,27 @@ public enum LocalTelemetryCollector {
 
         var summaries: [VendorSummary] = []
         for vendor in AgentVendor.allCases {
-            let vSamples = samples.filter { $0.vendor == vendor }.sorted { $0.timestamp < $1.timestamp }
+            let vendorAll = samples.filter { $0.vendor == vendor }
+            let vSamples = vendorAll.filter { $0.timestamp != nil }.sorted { $0.timestamp! < $1.timestamp! }
+            let untimestampedVSamples = vendorAll.filter { $0.timestamp == nil }
             let vRateEvents = rateLimitEvents.filter { $0.vendor == vendor && $0.timestamp <= now }
-            let sourceAvail = availability[vendor] ?? !vSamples.isEmpty
+            let sourceAvail = availability[vendor] ?? !vendorAll.isEmpty
             let dataSource = defaultDataSourceDescription(for: vendor)
+
+            let fiveHourSlice = vSamples.filter { $0.timestamp! >= fiveHoursAgo && $0.timestamp! <= now }
+            let todaySlice = vSamples.filter { $0.timestamp! >= startOfToday && $0.timestamp! <= now }
+            let sevenDaySlice = vSamples.filter { $0.timestamp! >= sevenDaysAgo && $0.timestamp! <= now }
+            let thirtyDaySlice = vSamples.filter { $0.timestamp! >= thirtyDaysAgo && $0.timestamp! <= now }
 
             let overallCompleteness = classifyVendorCompleteness(
                 vendor: vendor,
-                samples: vSamples
+                samples: thirtyDaySlice + untimestampedVSamples
             )
-
-            let fiveHourSlice = vSamples.filter { $0.timestamp >= fiveHoursAgo && $0.timestamp <= now }
-            let todaySlice = vSamples.filter { $0.timestamp >= startOfToday && $0.timestamp <= now }
-            let sevenDaySlice = vSamples.filter { $0.timestamp >= sevenDaysAgo && $0.timestamp <= now }
-            let thirtyDaySlice = vSamples.filter { $0.timestamp <= now }
 
             let rl5h = vRateEvents.filter { $0.timestamp >= fiveHoursAgo }.count + fiveHourSlice.filter(\.isRateLimited).count
             let rlToday = vRateEvents.filter { $0.timestamp >= startOfToday }.count + todaySlice.filter(\.isRateLimited).count
             let rl7d = vRateEvents.filter { $0.timestamp >= sevenDaysAgo }.count + sevenDaySlice.filter(\.isRateLimited).count
-            let rl30d = vRateEvents.count + thirtyDaySlice.filter(\.isRateLimited).count
+            let rl30d = vRateEvents.filter { $0.timestamp >= thirtyDaysAgo }.count + thirtyDaySlice.filter(\.isRateLimited).count
 
             let windows: [TelemetryWindow: VendorWindowMetrics] = [
                 .fiveHours: computeWindowMetrics(
@@ -296,8 +299,39 @@ public enum LocalTelemetryCollector {
                 )
             ]
 
-            let distinctSessions = Set(vSamples.map(\.sessionID)).count
-            let latestSample = vSamples.last(where: { !$0.model.isEmpty && $0.model != "—" && $0.model != "unknown" }) ?? vSamples.last
+            let untimestampedMetrics: VendorWindowMetrics = {
+                if untimestampedVSamples.isEmpty {
+                    return VendorWindowMetrics(
+                        inputTokens: 0,
+                        outputTokens: 0,
+                        cacheReadTokens: 0,
+                        cacheWriteTokens: 0,
+                        totalTokens: 0,
+                        recordCount: 0,
+                        pricedRecordCount: 0,
+                        estimatedCostUSD: 0.0,
+                        unknownModelRecordCount: 0,
+                        cacheHitRate: nil,
+                        dataSource: dataSource,
+                        completeness: .noData,
+                        rateLimit429Count: 0
+                    )
+                }
+                return computeWindowMetrics(
+                    vendor: vendor,
+                    slice: untimestampedVSamples,
+                    rateLimit429Count: untimestampedVSamples.filter(\.isRateLimited).count,
+                    overallCompleteness: classifyVendorCompleteness(vendor: vendor, samples: untimestampedVSamples),
+                    sourceAvailable: sourceAvail,
+                    dataSource: dataSource
+                )
+            }()
+
+            let distinctSessions = Set(thirtyDaySlice.map(\.sessionID)).count
+            let latestSample = vSamples.last(where: { !$0.model.isEmpty && $0.model != "—" && $0.model != "unknown" })
+                ?? untimestampedVSamples.last(where: { !$0.model.isEmpty && $0.model != "—" && $0.model != "unknown" })
+                ?? vSamples.last
+                ?? untimestampedVSamples.last
             let modelName: String = {
                 if let m = latestSample?.model, !m.isEmpty, m != "unknown" {
                     return m
@@ -306,7 +340,7 @@ public enum LocalTelemetryCollector {
             }()
 
             let event429_24h = vRateEvents.filter { $0.timestamp >= twentyFourHoursAgo }.count
-            let sample429_24h = vSamples.filter { $0.isRateLimited && $0.timestamp >= twentyFourHoursAgo && $0.timestamp <= now }.count
+            let sample429_24h = vSamples.filter { $0.isRateLimited && $0.timestamp! >= twentyFourHoursAgo && $0.timestamp! <= now }.count
             let hits429 = event429_24h + sample429_24h + (extraRateLimits[vendor] ?? 0)
 
             summaries.append(
@@ -316,6 +350,7 @@ public enum LocalTelemetryCollector {
                     dataSource: dataSource,
                     completeness: overallCompleteness,
                     windows: windows,
+                    untimestamped: untimestampedMetrics,
                     sessionCount30d: distinctSessions,
                     activeModel: modelName,
                     lastActive: vSamples.last?.timestamp,
@@ -324,6 +359,9 @@ public enum LocalTelemetryCollector {
             )
         }
 
+        let timedSamples = samples.filter { $0.timestamp != nil }
+        let untimestampedSamples = samples.filter { $0.timestamp == nil }
+
         // Build 14-day daily buckets per vendor AND rich M1 per-day breakdown (with B14, B15, B7)
         var dailyBuckets: [DailyVendorBucket] = []
         var dailyBreakdown: [DailyLedgerDay] = []
@@ -331,115 +369,55 @@ public enum LocalTelemetryCollector {
             guard let dayStart = cal.date(byAdding: .day, value: dayOffset, to: fourteenDaysAgo),
                   let dayEnd = cal.date(byAdding: .day, value: 1, to: dayStart) else { continue }
             let dateStr = dayFormatter.string(from: dayStart)
-            let daySlice = samples.filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd && $0.timestamp <= now }
+            let daySlice = timedSamples.filter { $0.timestamp! >= dayStart && $0.timestamp! < dayEnd && $0.timestamp! <= now }
             let dayRLSlice = rateLimitEvents.filter { $0.timestamp >= dayStart && $0.timestamp < dayEnd && $0.timestamp <= now }
 
-            var vendorMetricsMap: [AgentVendor: DailyVendorMetrics] = [:]
-            var dayUncached = 0
-            var dayCached = 0
-            var dayCW = 0
-            var dayOut = 0
-            var dayTot = 0
-            var dayRec = 0
-            var dayPriced = 0
-            var dayUnmatched = 0
-            var dayCostAccum = 0.0
-            var dayHasAnyPriced = false
-            var dayRLTotal = 0
-
-            for vendor in AgentVendor.allCases {
-                let vs = daySlice.filter { $0.vendor == vendor }
-                let vRL = dayRLSlice.filter { $0.vendor == vendor }.count + vs.filter(\.isRateLimited).count
-                let uncached = vs.filter(\.hasTokenBreakdown).map(\.inputTokens).reduce(0, +)
-                let cached = vs.filter(\.hasTokenBreakdown).map(\.cacheReadTokens).reduce(0, +)
-                let cw = vs.filter(\.hasTokenBreakdown).map(\.cacheWriteTokens).reduce(0, +)
-                let out = vs.filter(\.hasTokenBreakdown).map(\.outputTokens).reduce(0, +)
-                let tok = vs.map(\.totalTokens).reduce(0, +)
-                let pricedValues = vs.compactMap(\.effectiveCostUSD)
-                let vCost: Double? = pricedValues.isEmpty ? (vs.isEmpty ? 0.0 : nil) : pricedValues.reduce(0, +)
-                let vUnmatched = vs.map(\.unmatchedModelCount).reduce(0, +)
-                let misSamples = vs.filter(\.hasRolloutMismatch)
-                let vHasMis = !misSamples.isEmpty
-                let vMisCount = Set(misSamples.map(\.sessionID)).count
-                let vMisDetails = uniqueStrings(misSamples.compactMap(\.mismatchNote))
-                let vComp: DataCompleteness = vs.isEmpty ? .noData : classifyVendorCompleteness(vendor: vendor, samples: vs)
-
-                let sessCount = Set(vs.map(\.sessionID)).count
-                dailyBuckets.append(
-                    DailyVendorBucket(
-                        date: dayStart,
-                        vendor: vendor,
-                        tokens: tok,
-                        costUSD: pricedValues.reduce(0, +),
-                        sessions: sessCount
-                    )
-                )
-
-                vendorMetricsMap[vendor] = DailyVendorMetrics(
-                    uncachedInputTokens: uncached,
-                    cachedInputTokens: cached,
-                    cacheWriteTokens: cw,
-                    outputTokens: out,
-                    totalTokens: tok,
-                    recordCount: vs.count,
-                    pricedRecordCount: pricedValues.count,
-                    unmatchedModelCount: vUnmatched,
-                    estimatedCostUSD: vCost,
-                    hasRolloutMismatch: vHasMis,
-                    rolloutMismatchCount: vMisCount,
-                    mismatchDetails: vMisDetails,
-                    rateLimit429Count: vRL,
-                    completeness: vComp
-                )
-
-                dayUncached += uncached
-                dayCached += cached
-                dayCW += cw
-                dayOut += out
-                dayTot += tok
-                dayRec += vs.count
-                dayPriced += pricedValues.count
-                dayUnmatched += vUnmatched
-                if !pricedValues.isEmpty {
-                    dayHasAnyPriced = true
-                    dayCostAccum += pricedValues.reduce(0, +)
-                }
-                dayRLTotal += vRL
-            }
-
-            let codexDay = vendorMetricsMap[.codex] ?? DailyVendorMetrics()
-            let dayCost: Double? = dayHasAnyPriced ? dayCostAccum : (dayRec == 0 ? 0.0 : nil)
-
-            dailyBreakdown.append(
-                DailyLedgerDay(
-                    dateString: dateStr,
-                    dayStart: dayStart,
-                    uncachedInputTokens: dayUncached,
-                    cachedInputTokens: dayCached,
-                    cacheWriteTokens: dayCW,
-                    outputTokens: dayOut,
-                    totalTokens: dayTot,
-                    recordCount: dayRec,
-                    pricedRecordCount: dayPriced,
-                    unmatchedModelCount: dayUnmatched,
-                    estimatedCostUSD: dayCost,
-                    hasCodexRolloutMismatch: codexDay.hasRolloutMismatch,
-                    codexMismatchDetails: codexDay.mismatchDetails,
-                    rateLimit429Count: dayRLTotal,
-                    vendors: vendorMetricsMap
-                )
+            let built = buildDailyLedgerEntry(
+                dateString: dateStr,
+                dayStart: dayStart,
+                slice: daySlice,
+                rlSlice: dayRLSlice,
+                appendChartBuckets: true,
+                dailyBuckets: &dailyBuckets
             )
+            dailyBreakdown.append(built)
         }
+
+        var unusedBuckets: [DailyVendorBucket] = []
+        let untimestampedLedger = buildDailyLedgerEntry(
+            dateString: "No timestamp",
+            dayStart: .distantPast,
+            slice: untimestampedSamples,
+            rlSlice: [],
+            appendChartBuckets: false,
+            dailyBuckets: &unusedBuckets
+        )
 
         // Roll up recent sessions by (vendor, sessionID) preserving exact per-turn costs and breakdown honesty
         var groupedSessions: [String: UsageSample] = [:]
-        for sample in samples where sample.timestamp <= now {
+        for sample in samples where sample.timestamp == nil || sample.timestamp! <= now {
             let key = "\(sample.vendor.rawValue)::\(sample.sessionID)"
             if let existing = groupedSessions[key] {
-                let newerTS = max(existing.timestamp, sample.timestamp)
+                let newerTS: Date? = {
+                    switch (existing.timestamp, sample.timestamp) {
+                    case let (a?, b?): return max(a, b)
+                    case let (a?, nil): return a
+                    case let (nil, b?): return b
+                    case (nil, nil): return nil
+                    }
+                }()
                 let chosenModel: String = {
-                    if sample.timestamp >= existing.timestamp, !sample.model.isEmpty, sample.model != "—" {
-                        return sample.model
+                    if !sample.model.isEmpty, sample.model != "—" {
+                        switch (existing.timestamp, sample.timestamp) {
+                        case let (a?, b?) where b >= a:
+                            return sample.model
+                        case (nil, _?):
+                            return sample.model
+                        default:
+                            if existing.model.isEmpty || existing.model == "—" {
+                                return sample.model
+                            }
+                        }
                     }
                     return existing.model
                 }()
@@ -492,7 +470,18 @@ public enum LocalTelemetryCollector {
 
         let recentSessions = groupedSessions.values
             .filter { $0.totalTokens > 0 || ($0.effectiveCostUSD ?? 0) > 0 }
-            .sorted { $0.timestamp > $1.timestamp }
+            .sorted { lhs, rhs in
+                switch (lhs.timestamp, rhs.timestamp) {
+                case let (a?, b?):
+                    return a == b ? lhs.id < rhs.id : a > b
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                case (nil, nil):
+                    return lhs.id < rhs.id
+                }
+            }
             .prefix(30)
             .map { $0 }
 
@@ -503,9 +492,115 @@ public enum LocalTelemetryCollector {
             vendorSummaries: summaries,
             dailyBuckets: dailyBuckets,
             dailyBreakdown: dailyBreakdown,
+            untimestampedLedger: untimestampedLedger,
             recentSessions: recentSessions,
             relayRuns: relayRuns.sorted { $0.updatedAt > $1.updatedAt },
             rateLimitEvents: rateLimitEvents
+        )
+    }
+
+    private static func buildDailyLedgerEntry(
+        dateString: String,
+        dayStart: Date,
+        slice: [UsageSample],
+        rlSlice: [RateLimitEvent],
+        appendChartBuckets: Bool,
+        dailyBuckets: inout [DailyVendorBucket]
+    ) -> DailyLedgerDay {
+        var vendorMetricsMap: [AgentVendor: DailyVendorMetrics] = [:]
+        var dayUncached = 0
+        var dayCached = 0
+        var dayCW = 0
+        var dayOut = 0
+        var dayTot = 0
+        var dayRec = 0
+        var dayPriced = 0
+        var dayUnmatched = 0
+        var dayCostAccum = 0.0
+        var dayHasAnyPriced = false
+        var dayRLTotal = 0
+
+        for vendor in AgentVendor.allCases {
+            let vs = slice.filter { $0.vendor == vendor }
+            let vRL = rlSlice.filter { $0.vendor == vendor }.count + vs.filter(\.isRateLimited).count
+            let uncached = vs.filter(\.hasTokenBreakdown).map(\.inputTokens).reduce(0, +)
+            let cached = vs.filter(\.hasTokenBreakdown).map(\.cacheReadTokens).reduce(0, +)
+            let cw = vs.filter(\.hasTokenBreakdown).map(\.cacheWriteTokens).reduce(0, +)
+            let out = vs.filter(\.hasTokenBreakdown).map(\.outputTokens).reduce(0, +)
+            let tok = vs.map(\.totalTokens).reduce(0, +)
+            let pricedValues = vs.compactMap(\.effectiveCostUSD)
+            let vCost: Double? = pricedValues.isEmpty ? (vs.isEmpty ? 0.0 : nil) : pricedValues.reduce(0, +)
+            let vUnmatched = vs.map(\.unmatchedModelCount).reduce(0, +)
+            let misSamples = vs.filter(\.hasRolloutMismatch)
+            let vHasMis = !misSamples.isEmpty
+            let vMisCount = Set(misSamples.map(\.sessionID)).count
+            let vMisDetails = uniqueStrings(misSamples.compactMap(\.mismatchNote))
+            let vComp: DataCompleteness = vs.isEmpty ? .noData : classifyVendorCompleteness(vendor: vendor, samples: vs)
+
+            if appendChartBuckets {
+                let sessCount = Set(vs.map(\.sessionID)).count
+                dailyBuckets.append(
+                    DailyVendorBucket(
+                        date: dayStart,
+                        vendor: vendor,
+                        tokens: tok,
+                        costUSD: pricedValues.reduce(0, +),
+                        sessions: sessCount
+                    )
+                )
+            }
+
+            vendorMetricsMap[vendor] = DailyVendorMetrics(
+                uncachedInputTokens: uncached,
+                cachedInputTokens: cached,
+                cacheWriteTokens: cw,
+                outputTokens: out,
+                totalTokens: tok,
+                recordCount: vs.count,
+                pricedRecordCount: pricedValues.count,
+                unmatchedModelCount: vUnmatched,
+                estimatedCostUSD: vCost,
+                hasRolloutMismatch: vHasMis,
+                rolloutMismatchCount: vMisCount,
+                mismatchDetails: vMisDetails,
+                rateLimit429Count: vRL,
+                completeness: vComp
+            )
+
+            dayUncached += uncached
+            dayCached += cached
+            dayCW += cw
+            dayOut += out
+            dayTot += tok
+            dayRec += vs.count
+            dayPriced += pricedValues.count
+            dayUnmatched += vUnmatched
+            if !pricedValues.isEmpty {
+                dayHasAnyPriced = true
+                dayCostAccum += pricedValues.reduce(0, +)
+            }
+            dayRLTotal += vRL
+        }
+
+        let codexDay = vendorMetricsMap[.codex] ?? DailyVendorMetrics()
+        let dayCost: Double? = dayHasAnyPriced ? dayCostAccum : (dayRec == 0 ? 0.0 : nil)
+
+        return DailyLedgerDay(
+            dateString: dateString,
+            dayStart: dayStart,
+            uncachedInputTokens: dayUncached,
+            cachedInputTokens: dayCached,
+            cacheWriteTokens: dayCW,
+            outputTokens: dayOut,
+            totalTokens: dayTot,
+            recordCount: dayRec,
+            pricedRecordCount: dayPriced,
+            unmatchedModelCount: dayUnmatched,
+            estimatedCostUSD: dayCost,
+            hasCodexRolloutMismatch: codexDay.hasRolloutMismatch,
+            codexMismatchDetails: codexDay.mismatchDetails,
+            rateLimit429Count: dayRLTotal,
+            vendors: vendorMetricsMap
         )
     }
 
@@ -767,7 +862,7 @@ public enum LocalTelemetryCollector {
         struct ClaudeAccumulator {
             var orderIndex: Int
             var id: String
-            var timestamp: Date
+            var timestamp: Date?
             var sessionID: String
             var projectName: String
             var model: String
@@ -786,11 +881,6 @@ public enum LocalTelemetryCollector {
 
         for case let fileURL as URL in enumerator {
             guard fileURL.pathExtension == "jsonl" else { continue }
-            if let vals = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]),
-               let mod = vals.contentModificationDate,
-               mod < since.addingTimeInterval(-3600) {
-                continue
-            }
             guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
             let fallbackProject = cleanProjectLabel(from: fileURL.deletingLastPathComponent().lastPathComponent)
 
@@ -821,29 +911,26 @@ public enum LocalTelemetryCollector {
                     return false
                 }()
 
-                if isStructured429 {
-                    let rlTS = parsedTS ?? now
-                    if rlTS >= since && rlTS <= upperBound {
-                        let rlKey: String
-                        if !msgID.isEmpty && !reqID.isEmpty {
-                            rlKey = "mr:\(msgID)::\(reqID)"
-                        } else if !reqID.isEmpty {
-                            rlKey = "r:\(reqID)"
-                        } else if !msgID.isEmpty {
-                            rlKey = "m:\(msgID)"
-                        } else if let uuid = obj["uuid"] as? String, !uuid.isEmpty {
-                            rlKey = "u:\(uuid)"
-                        } else {
-                            rlKey = "line:\(fileURL.path)::\(lineIdx)"
-                        }
-                        if rateLimitDedup[rlKey] == nil {
-                            rateLimitDedup[rlKey] = RateLimitEvent(
-                                id: "claude-429-\(rlKey)",
-                                vendor: .claudeCode,
-                                timestamp: rlTS,
-                                sessionID: sessID
-                            )
-                        }
+                if isStructured429, let rlTS = parsedTS, rlTS >= since, rlTS <= upperBound {
+                    let rlKey: String
+                    if !msgID.isEmpty && !reqID.isEmpty {
+                        rlKey = "mr:\(msgID)::\(reqID)"
+                    } else if !reqID.isEmpty {
+                        rlKey = "r:\(reqID)"
+                    } else if !msgID.isEmpty {
+                        rlKey = "m:\(msgID)"
+                    } else if let uuid = obj["uuid"] as? String, !uuid.isEmpty {
+                        rlKey = "u:\(uuid)"
+                    } else {
+                        rlKey = "line:\(fileURL.path)::\(lineIdx)"
+                    }
+                    if rateLimitDedup[rlKey] == nil {
+                        rateLimitDedup[rlKey] = RateLimitEvent(
+                            id: "claude-429-\(rlKey)",
+                            vendor: .claudeCode,
+                            timestamp: rlTS,
+                            sessionID: sessID
+                        )
                     }
                 }
 
@@ -872,7 +959,6 @@ public enum LocalTelemetryCollector {
                 let model = (msg["model"] as? String) ?? ""
                 let cwd = obj["cwd"] as? String
                 let project = cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? fallbackProject
-                let eventTS = parsedTS ?? now
 
                 if var existing = deduped[dedupKey] {
                     existing.inp = max(existing.inp, inp)
@@ -885,13 +971,16 @@ public enum LocalTelemetryCollector {
                     if existing.model.isEmpty && !model.isEmpty {
                         existing.model = model
                     }
+                    if existing.timestamp == nil, let parsedTS {
+                        existing.timestamp = parsedTS
+                    }
                     deduped[dedupKey] = existing
                 } else {
                     nextOrder += 1
                     deduped[dedupKey] = ClaudeAccumulator(
                         orderIndex: nextOrder,
                         id: "claude-\(sessID)-\(nextOrder)",
-                        timestamp: eventTS,
+                        timestamp: parsedTS,
                         sessionID: sessID,
                         projectName: project,
                         model: model,
@@ -906,7 +995,10 @@ public enum LocalTelemetryCollector {
         }
 
         let samples = deduped.values
-            .filter { $0.timestamp >= since && $0.timestamp <= upperBound }
+            .filter { acc in
+                guard let ts = acc.timestamp else { return true }
+                return ts >= since && ts <= upperBound
+            }
             .sorted { $0.orderIndex < $1.orderIndex }
             .map { acc in
                 UsageSample(
@@ -973,6 +1065,7 @@ public enum LocalTelemetryCollector {
         defer { sqlite3_finalize(stmt) }
 
         let upperBound = now
+        let fm = FileManager.default
         var results: [UsageSample] = []
         var rateLimits: [RateLimitEvent] = []
 
@@ -985,15 +1078,19 @@ public enum LocalTelemetryCollector {
             let dbModel = (columnText(stmt, 5) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let rolloutPath = (columnText(stmt, 6) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
-            let ts = normalizeEpoch(rawUpdated > 0 ? rawUpdated : rawCreated)
+            let rawEpoch = rawUpdated > 0 ? rawUpdated : (rawCreated > 0 ? rawCreated : 0)
+            let sessionTS: Date? = rawEpoch > 0 ? normalizeEpoch(rawEpoch) : nil
             let proj = cwd.isEmpty ? "codex" : URL(fileURLWithPath: cwd).lastPathComponent
 
-            if !rolloutPath.isEmpty,
-               ts >= since.addingTimeInterval(-86_400),
+            let shouldReadRollout = !rolloutPath.isEmpty && (
+                fm.fileExists(atPath: rolloutPath)
+                || sessionTS == nil
+                || sessionTS! >= since.addingTimeInterval(-86_400)
+            )
+            if shouldReadRollout,
                let breakdown = readCodexRolloutEntry(rolloutPath: rolloutPath, allowZstd: allowZstd) {
                 for rl in breakdown.rateLimits {
-                    let rlTS = rl.timestamp ?? ts
-                    if rlTS >= since && rlTS <= upperBound {
+                    if let rlTS = rl.timestamp, rlTS >= since, rlTS <= upperBound {
                         rateLimits.append(
                             RateLimitEvent(
                                 id: "codex-429-\(id)-\(rl.index)",
@@ -1012,15 +1109,16 @@ public enum LocalTelemetryCollector {
                     let note: String? = isMismatch ? "\(id): rollout=\(rolloutTotal) vs sqlite=\(totalTok)" : nil
 
                     for ev in breakdown.events {
-                        let evTS = ev.timestamp ?? ts
-                        guard evTS >= since && evTS <= upperBound else { continue }
+                        if let evTS = ev.timestamp, (evTS < since || evTS > upperBound) {
+                            continue
+                        }
                         let effectiveModel = (ev.model?.isEmpty == false) ? ev.model! : dbModel
                         results.append(
                             UsageSample(
                                 id: "codex-\(id)-\(ev.index)",
                                 vendor: .codex,
                                 origin: .standalone,
-                                timestamp: evTS,
+                                timestamp: ev.timestamp,
                                 sessionID: id,
                                 projectName: proj,
                                 model: effectiveModel,
@@ -1038,8 +1136,10 @@ public enum LocalTelemetryCollector {
                 }
             }
 
-            // Fallback when no rollout file (or rollout contains 0 token_count events): attribute totalTokens to session timestamp.
-            if ts >= since && ts <= upperBound {
+            // Fallback ONLY when no rollout file (or rollout contains 0 token_count events):
+            // attribute totalTokens to session timestamp if valid, or to untimestamped if missing/0.
+            let ts = sessionTS
+            if ts == nil || (ts! >= since && ts! <= upperBound) {
                 results.append(
                     UsageSample(
                         unsplitID: "codex-\(id)",
@@ -1282,7 +1382,17 @@ public enum LocalTelemetryCollector {
             let tCR: Int
             let tCW: Int
             let cleanModel: String
-            let timeUpdated: Date
+            let timeUpdated: Date?
+        }
+
+        let isoFrac = ISO8601DateFormatter()
+        isoFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoPlain = ISO8601DateFormatter()
+        isoPlain.formatOptions = [.withInternetDateTime]
+
+        func parseISOTS(_ any: Any?) -> Date? {
+            guard let s = (any as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+            return isoFrac.date(from: s) ?? isoPlain.date(from: s)
         }
 
         var sessionMap: [String: SessionV2Row] = [:]
@@ -1317,7 +1427,7 @@ public enum LocalTelemetryCollector {
                         tCR: tCR,
                         tCW: tCW,
                         cleanModel: parseOpenCodeModelLabel(rawModel),
-                        timeUpdated: normalizeEpoch(rawUpdated)
+                        timeUpdated: rawUpdated > 0 ? normalizeEpoch(rawUpdated) : nil
                     )
                     sessionMap[id] = row
                     sessionOrder.append(id)
@@ -1358,29 +1468,37 @@ public enum LocalTelemetryCollector {
                           let dataBytes = dataStr.data(using: .utf8),
                           let obj = (try? JSONSerialization.jsonObject(with: dataBytes)) as? [String: Any] else { continue }
 
-                    let msgTS: Date = {
-                        if let timeDict = obj["time"] as? [String: Any],
-                           let createdEpoch = int64Val(timeDict["created"]) ?? int64Val(timeDict["completed"]),
-                           createdEpoch > 0 {
-                            return normalizeEpoch(createdEpoch)
+                    let msgTS: Date? = {
+                        if let timeDict = obj["time"] as? [String: Any] {
+                            if let createdEpoch = int64Val(timeDict["created"]) ?? int64Val(timeDict["completed"]),
+                               createdEpoch > 0 {
+                                return normalizeEpoch(createdEpoch)
+                            }
+                            if let isoDate = parseISOTS(timeDict["created"]) ?? parseISOTS(timeDict["completed"]) {
+                                return isoDate
+                            }
                         }
                         if rawTimeCreated > 0 {
                             return normalizeEpoch(rawTimeCreated)
                         }
-                        return sessionMap[sessID]?.timeUpdated ?? now
+                        if let isoDate = parseISOTS(obj["timestamp"]) {
+                            return isoDate
+                        }
+                        return nil
                     }()
 
-                    if isStructuredRateLimitValue(obj["error"]) || hasStructured429Status(obj) {
-                        if msgTS >= since && msgTS <= upperBound {
-                            rateLimits.append(
-                                RateLimitEvent(
-                                    id: "opencode-429-\(msgID)",
-                                    vendor: .openCode,
-                                    timestamp: msgTS,
-                                    sessionID: sessID
-                                )
+                    if isStructuredRateLimitValue(obj["error"]) || hasStructured429Status(obj),
+                       let rlTS = msgTS,
+                       rlTS >= since,
+                       rlTS <= upperBound {
+                        rateLimits.append(
+                            RateLimitEvent(
+                                id: "opencode-429-\(msgID)",
+                                vendor: .openCode,
+                                timestamp: rlTS,
+                                sessionID: sessID
                             )
-                        }
+                        )
                     }
 
                     let roleOrType = rowType.isEmpty ? ((obj["role"] as? String) ?? (obj["type"] as? String) ?? "") : rowType
@@ -1400,7 +1518,9 @@ public enum LocalTelemetryCollector {
                     if tIn == 0 && tOut == 0 && tCR == 0 && tCW == 0 && cost <= 0 { continue }
                     sessionsWithMessages.insert(sessID)
 
-                    guard msgTS >= since && msgTS <= upperBound else { continue }
+                    if let ts = msgTS, (ts < since || ts > upperBound) {
+                        continue
+                    }
 
                     let model: String = {
                         if let mDict = obj["model"] as? [String: Any] {
@@ -1441,7 +1561,7 @@ public enum LocalTelemetryCollector {
         for sessID in sessionOrder where !sessionsWithMessages.contains(sessID) {
             guard let row = sessionMap[sessID] else { continue }
             if row.tIn == 0 && row.tOut == 0 && row.tCR == 0 && row.tCW == 0 && row.cost <= 0 { continue }
-            if row.timeUpdated < since || row.timeUpdated > upperBound { continue }
+            if let ts = row.timeUpdated, (ts < since || ts > upperBound) { continue }
             results.append(
                 UsageSample(
                     id: "opencode-\(row.id)",
@@ -1630,16 +1750,18 @@ public enum LocalTelemetryCollector {
         vibeDir: URL,
         relayRuns: [RelayRunSummary],
         since: Date,
-        now: Date = Date()
+        now: Date = Date(),
+        timeZone: TimeZone = .current
     ) -> [UsageSample] {
-        collectVibeTelemetry(vibeDir: vibeDir, relayRuns: relayRuns, since: since, now: now).samples
+        collectVibeTelemetry(vibeDir: vibeDir, relayRuns: relayRuns, since: since, now: now, timeZone: timeZone).samples
     }
 
     public static func collectVibeTelemetry(
         vibeDir: URL,
         relayRuns: [RelayRunSummary],
         since: Date,
-        now: Date = Date()
+        now: Date = Date(),
+        timeZone: TimeZone = .current
     ) -> VibeCollectionResult {
         var samples: [UsageSample] = []
         var rateLimits: [RateLimitEvent] = []
@@ -1668,7 +1790,7 @@ public enum LocalTelemetryCollector {
         if fm.fileExists(atPath: vibeDir.path),
            let children = try? fm.contentsOfDirectory(
                at: vibeDir,
-               includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+               includingPropertiesForKeys: [.isDirectoryKey],
                options: [.skipsHiddenFiles]
            ) {
             for folder in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
@@ -1683,8 +1805,7 @@ public enum LocalTelemetryCollector {
 
                 let startTS = parseISO(metaObj?["start_time"] as? String)
                 let endTS = parseISO(metaObj?["end_time"] as? String)
-                let folderMod = (try? folder.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                let fallbackTS = startTS ?? endTS ?? folderMod ?? now
+                let metaTS: Date? = startTS ?? endTS
                 let origin = (metaObj?["origin_directory"] as? String).map { URL(fileURLWithPath: $0).lastPathComponent } ?? "vibe"
 
                 let cfg = metaObj?["config"] as? [String: Any]
@@ -1707,7 +1828,7 @@ public enum LocalTelemetryCollector {
 
                     var seenActionIDs: Set<String> = []
                     var seenFailedActionIDs: Set<String> = []
-                    var runningTS: Date? = startTS ?? endTS
+                    var runningTS: Date? = nil
                     var turnSeq = 0
 
                     for segURL in sortedSegments {
@@ -1716,13 +1837,30 @@ public enum LocalTelemetryCollector {
                             guard let data = line.data(using: .utf8),
                                   let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
 
-                            if let recordTS = extractVibeRecordTimestamp(obj, parseISO: parseISO) {
+                            let recType = (obj["type"] as? String) ?? ""
+                            let hasDirectTSKey = obj["time_unix_ms"] != nil || obj["timestamp"] != nil || obj["created_at"] != nil
+                            let directTS: Date? = {
+                                for key in ["time_unix_ms", "timestamp", "created_at"] {
+                                    if let num = int64Val(obj[key]), num > 0 {
+                                        return normalizeEpoch(num)
+                                    }
+                                    if let str = obj[key] as? String, let d = parseISO(str) {
+                                        return d
+                                    }
+                                }
+                                return nil
+                            }()
+
+                            if recType == "core_input" {
+                                runningTS = extractVibeRecordTimestamp(obj, parseISO: parseISO)
+                            } else if let recordTS = extractVibeRecordTimestamp(obj, parseISO: parseISO) {
                                 runningTS = recordTS
                             }
 
-                            guard (obj["type"] as? String) == "action_result",
+                            guard recType == "action_result",
                                   let payload = obj["payload"] as? [String: Any] else { return }
 
+                            let evTS: Date? = hasDirectTSKey ? directTS : runningTS
                             let actionID = (payload["action_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                             let state = (payload["state"] as? String) ?? ""
                             let resObj = payload["result"] as? [String: Any]
@@ -1745,8 +1883,7 @@ public enum LocalTelemetryCollector {
 
                                 emittedJournalTurns = true
                                 turnSeq += 1
-                                let evTS = runningTS ?? fallbackTS
-                                guard evTS >= since && evTS <= upperBound else { return }
+                                if let ts = evTS, (ts < since || ts > upperBound) { return }
 
                                 let sampleID = actionID.isEmpty ? "vibe-\(sessID)-\(turnSeq)" : "vibe-\(sessID)-\(actionID)"
                                 samples.append(
@@ -1769,13 +1906,12 @@ public enum LocalTelemetryCollector {
                                     if !actionID.isEmpty {
                                         guard seenFailedActionIDs.insert(actionID).inserted else { return }
                                     }
-                                    let evTS = runningTS ?? fallbackTS
-                                    if evTS >= since && evTS <= upperBound {
+                                    if let ts = evTS, ts >= since, ts <= upperBound {
                                         rateLimits.append(
                                             RateLimitEvent(
                                                 id: "vibe-429-\(sessID)-\(actionID.isEmpty ? UUID().uuidString : actionID)",
                                                 vendor: .mistralVibe,
-                                                timestamp: evTS,
+                                                timestamp: ts,
                                                 sessionID: sessID
                                             )
                                         )
@@ -1787,19 +1923,22 @@ public enum LocalTelemetryCollector {
                 }
 
                 // Fallback to legacy meta.json numeric stats ONLY if journal/*.jsonl yielded 0 completion turns
-                if !emittedJournalTurns, let metaObj, fallbackTS >= since, fallbackTS <= upperBound {
+                if !emittedJournalTurns, let metaObj {
                     let stats = metaObj["stats"] as? [String: Any]
                     let inTok = intVal(stats?["session_prompt_tokens"]) + intVal(stats?["prompt_tokens"])
                     let outTok = intVal(stats?["session_completion_tokens"]) + intVal(stats?["completion_tokens"])
                     let cost = (stats?["session_cost"] as? NSNumber)?.doubleValue
                     if inTok > 0 || outTok > 0 || (cost ?? 0) > 0 {
+                        if let ts = metaTS, (ts < since || ts > upperBound) {
+                            continue
+                        }
                         let rawTot = (inTok + outTok) > 0 ? (inTok + outTok) : nil
                         samples.append(
                             UsageSample(
                                 unsplitID: "vibe-meta-\(sessID)",
                                 vendor: .mistralVibe,
                                 origin: .standalone,
-                                timestamp: fallbackTS,
+                                timestamp: metaTS,
                                 sessionID: sessID,
                                 projectName: origin,
                                 model: sessionModel,
@@ -1813,10 +1952,6 @@ public enum LocalTelemetryCollector {
         }
 
         // Include .relay/LOG.md Vibe steps ONLY when their session is NOT already covered by unified/
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm"
-        df.locale = Locale(identifier: "en_US_POSIX")
-
         for run in relayRuns {
             let relayDir = URL(fileURLWithPath: run.logPath).deletingLastPathComponent()
             for step in run.steps where step.vendor == .mistralVibe {
@@ -1825,14 +1960,14 @@ public enum LocalTelemetryCollector {
                    unifiedSessionIDs.contains(exportedSessID) {
                     continue
                 }
-                let ts = df.date(from: step.timestampString) ?? run.updatedAt
-                if ts < since || ts > upperBound { continue }
+                let stepTS = parseRelayStepTimestamp(step.timestampString, timeZone: timeZone)
+                if let ts = stepTS, (ts < since || ts > upperBound) { continue }
                 samples.append(
                     UsageSample(
                         unsplitID: "vibe-relay-\(run.projectName)-\(step.id)",
                         vendor: .mistralVibe,
                         origin: .relayLog,
-                        timestamp: ts,
+                        timestamp: stepTS,
                         sessionID: "\(run.projectName)-\(step.stepID)",
                         projectName: run.projectName,
                         model: step.model == "default" ? "" : step.model,
@@ -1947,9 +2082,10 @@ public enum LocalTelemetryCollector {
         logDir: URL,
         relayRuns: [RelayRunSummary],
         since: Date,
-        now: Date = Date()
+        now: Date = Date(),
+        timeZone: TimeZone = .current
     ) -> (samples: [UsageSample], latestModel: String?, rateLimitHits24h: Int) {
-        let res = collectAntigravityTelemetry(logDir: logDir, relayRuns: relayRuns, since: since, now: now)
+        let res = collectAntigravityTelemetry(logDir: logDir, relayRuns: relayRuns, since: since, now: now, timeZone: timeZone)
         return (res.samples, res.latestModel, res.rateLimitHits24h)
     }
 
@@ -1957,26 +2093,24 @@ public enum LocalTelemetryCollector {
         logDir: URL,
         relayRuns: [RelayRunSummary],
         since: Date,
-        now: Date = Date()
+        now: Date = Date(),
+        timeZone: TimeZone = .current
     ) -> AntigravityCollectionResult {
         var samples: [UsageSample] = []
         var rateLimits: [RateLimitEvent] = []
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm"
-        df.locale = Locale(identifier: "en_US_POSIX")
         let upperBound = now
 
         for run in relayRuns {
             for step in run.steps where step.vendor == .antigravity {
                 guard (step.tokens ?? 0) > 0 || (step.costUSD ?? 0) > 0 else { continue }
-                let ts = df.date(from: step.timestampString) ?? run.updatedAt
-                if ts < since || ts > upperBound { continue }
+                let stepTS = parseRelayStepTimestamp(step.timestampString, timeZone: timeZone)
+                if let ts = stepTS, (ts < since || ts > upperBound) { continue }
                 samples.append(
                     UsageSample(
                         unsplitID: "agy-relay-\(run.projectName)-\(step.id)",
                         vendor: .antigravity,
                         origin: .relayLog,
-                        timestamp: ts,
+                        timestamp: stepTS,
                         sessionID: "\(run.projectName)-\(step.stepID)",
                         projectName: run.projectName,
                         model: step.model == "default" ? "" : step.model,
@@ -2003,7 +2137,6 @@ public enum LocalTelemetryCollector {
            let files = try? fm.contentsOfDirectory(at: logDir, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
             for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) where file.pathExtension == "log" {
                 let mod = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                if mod < since { continue }
                 guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
                 var fileModel: String?
                 var lineNo = 0
@@ -2015,6 +2148,7 @@ public enum LocalTelemetryCollector {
                        let m = labelRegex?.firstMatch(in: line, range: fullRange) {
                         fileModel = ns.substring(with: m.range(at: 1))
                     }
+                    var jsonTS: Date?
                     let is429: Bool = {
                         if structuredStatus429Regex?.firstMatch(in: line, range: fullRange) != nil {
                             return true
@@ -2022,19 +2156,22 @@ public enum LocalTelemetryCollector {
                         if line.hasPrefix("{"),
                            let d = line.data(using: .utf8),
                            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+                            if let tsStr = obj["timestamp"] as? String {
+                                jsonTS = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr)
+                            }
                             return hasStructured429Status(obj) || isStructuredRateLimitValue(obj["error"])
                         }
                         return false
                     }()
                     if is429 {
-                        var rlTS = mod
-                        if let tm = leadingISORegex?.firstMatch(in: line, range: fullRange), tm.numberOfRanges == 2 {
+                        var rlTS: Date? = jsonTS
+                        if rlTS == nil,
+                           let tm = leadingISORegex?.firstMatch(in: line, range: fullRange),
+                           tm.numberOfRanges == 2 {
                             let tsStr = ns.substring(with: tm.range(at: 1))
-                            if let parsed = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr) {
-                                rlTS = parsed
-                            }
+                            rlTS = isoFrac.date(from: tsStr) ?? isoPlain.date(from: tsStr)
                         }
-                        if rlTS >= since && rlTS <= upperBound {
+                        if let rlTS, rlTS >= since, rlTS <= upperBound {
                             rateLimits.append(
                                 RateLimitEvent(
                                     id: "agy-429-\(file.lastPathComponent)-\(lineNo)",
@@ -2060,6 +2197,42 @@ public enum LocalTelemetryCollector {
             rateLimitEvents: rateLimits,
             rateLimitHits24h: hits24h
         )
+    }
+
+    private static func parseRelayStepTimestamp(_ raw: String, timeZone: TimeZone) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        let dateParts = parts[0].split(separator: "-").compactMap { Int($0) }
+        let timeParts = parts[1].split(separator: ":").compactMap { Int($0) }
+        guard dateParts.count == 3, (timeParts.count == 2 || timeParts.count == 3) else { return nil }
+
+        let year = dateParts[0]
+        let month = dateParts[1]
+        let day = dateParts[2]
+        let hour = timeParts[0]
+        let minute = timeParts[1]
+        let second = timeParts.count == 3 ? timeParts[2] : 0
+        guard (1...12).contains(month),
+              (1...31).contains(day),
+              (0...23).contains(hour),
+              (0...59).contains(minute),
+              (0...59).contains(second) else { return nil }
+
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        var comps = DateComponents()
+        comps.calendar = cal
+        comps.timeZone = timeZone
+        comps.year = year
+        comps.month = month
+        comps.day = day
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = second
+        guard comps.isValidDate(in: cal) else { return nil }
+        return cal.date(from: comps)
     }
 
     // MARK: - Helpers

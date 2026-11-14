@@ -132,6 +132,46 @@ struct AgentBarCoreTests {
         )
         #expect((dashData?.count ?? 0) > 20_000)
         #expect((popData?.count ?? 0) > 10_000)
+
+        // Also render DashboardView and MenuBarPopoverView with non-zero untimestamped records in EN and ZH
+        let untimestampedSnap = LocalTelemetryCollector.buildSnapshot(
+            samples: [
+                UsageSample(
+                    id: "u-ui-1",
+                    vendor: .claudeCode,
+                    timestamp: nil,
+                    sessionID: "s-ui",
+                    projectName: "ui-br1",
+                    model: "claude-sonnet-4-6",
+                    inputTokens: 1_200,
+                    outputTokens: 300
+                )
+            ],
+            relayRuns: [],
+            availability: [.claudeCode: true],
+            now: Date(timeIntervalSince1970: 1_794_560_400),
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        let untimestampedMonitor = TelemetryMonitor(
+            previewSnapshot: untimestampedSnap,
+            startImmediately: false,
+            preferenceStore: InMemoryPreferenceStore()
+        )
+        for lang in [AppLanguage.en, AppLanguage.zhHans] {
+            let loc = AppLocalizer(fixedLanguage: lang)
+            let dPNG = ScreenshotExporter.renderPNG(
+                view: DashboardView(monitor: untimestampedMonitor, localizer: loc),
+                size: CGSize(width: 980, height: 640),
+                scale: 2.0
+            )
+            let mPNG = ScreenshotExporter.renderPNG(
+                view: MenuBarPopoverView(monitor: untimestampedMonitor, localizer: loc, onOpenDashboard: {}, onOpenSettings: {}),
+                size: CGSize(width: 396, height: 500),
+                scale: 2.0
+            )
+            #expect((dPNG?.count ?? 0) > 15_000)
+            #expect((mPNG?.count ?? 0) > 8_000)
+        }
     }
 
     @Test("Toggles live between zh-Hans and en and persists to PreferenceStore")

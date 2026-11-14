@@ -23,7 +23,7 @@
 
 同时使用多款本地 AI 编程 CLI（`claude`、`codex`、`opencode`、`vibe`、`agy`）时，用量分散在包月滚动窗口、API 预付额度与多工具文件接力记录中。**AgentBar** 通过原生菜单栏界面与无头命令行（`AgentBar --cli snapshot|daily [--json]`，未发布（v0.2.0 之后））以严格只读方式汇总本地真实记录：
 
-- **逐事件时间戳归桶（`最近 5 小时`、`今天`、`7 天`、`14 天按日`、`30 天`）**：将跨天长会话按每轮真实事件时间戳拆分——涵盖 `Claude Code` 单轮 JSONL、`Codex` rollout `token_count` 累计差值、`OpenCode` `session_message` 逐消息行以及 `Mistral Vibe` `unified/*/journal/*.jsonl` 动作记录，仅在缺失事件细账时退回会话更新时间。
+- **逐事件时间戳归桶与「没有时间」隔离（`最近 5 小时`、`今天`、`7 天`、`14 天按日`、`30 天`、`没有时间`）**：将跨天长会话按每轮真实事件时间戳拆分——涵盖 `Claude Code` 单轮 JSONL、`Codex` rollout `token_count` 累计差值、`OpenCode` `session_message` 逐消息行以及 `Mistral Vibe` `unified/*/journal/*.jsonl` 动作记录。会话级更新时间（`threads.updated_at` / `session_v2.time_updated`）**仅**用于完全没有逐事件记录且会话时间戳有效的聚合会话；缺失或损坏时间戳的逐事件记录（以及会话时间戳缺失/为 `0` 的聚合会话）绝不退回 `now`、会话 `updated_at` 或文件修改时间 `mtime`，对 `5h` / `今天` / `7d` / `30d` 及有日期按日行贡献为 `0`，统一单独计入 `untimestamped`（`没有时间` / `No timestamp`）。
 - **流式内容块去重统计（`Claude Code`）**：按 `(message.id, requestId)` 对同一轮回复的多条流式块（`thinking`、`text`、`tool_use`）去重并取最终最大用量，消除多块重复累加。
 - **Rollout 逐轮明细核对与按日不一致标记（`Codex CLI`）**：将 `~/.codex/state_5.sqlite` 的 `threads` 表与完整 `rollout-*.jsonl` 事件流（及归档 `.jsonl.zst`，需本机装有 `zstd`）关联，按单轮增量提取未缓存输入、缓存读取与输出 Token，追踪会话中途 `turn_context` 模型切换，并与 `threads.tokens_used` 核对总量。若 rollout 合计与 SQLite 不一致，则在汇总窗口及该会话触及的每个自然日均标出 `rollout=X vs sqlite=Y` 并将完整度降级为 `总量不一致`（`mismatch`）；若缺少可读 rollout 明细，则标为 `只有总量`（`totalOnly`），明细、缓存命中率与费用均输出 `null`（界面显示 `未知`），不用固定比例拆分伪造。
 - **独立 `Mistral Vibe` 多分片 Journal 解析**：读取 `~/.vibe/logs/session/unified/<session_id>/meta.json` 与有序 `journal/*.jsonl` 分片，按 `payload.action_id` 对 `completion_succeeded` 去重，支持从 `~/.vibe/config.toml` 回退读取模型，并通过 `.relay/<步骤>.vibe/export.json` 的 `session_id` 与 `.relay/LOG.md` 自动去重避免双计。
@@ -39,11 +39,11 @@
 
 | CLI 工具 | 本地只读数据源 | 典型完整度 | 逐事件归桶口径与边界 |
 |---|---|---|---|
-| **Claude Code** | `~/.claude/projects/**/*.jsonl`（`message.id`、`requestId`、`message.usage`、`message.model`、`costUSD`、`timestamp`、结构化 `error`） | `完整` (`complete`) | 按 `(message.id, requestId)` 单轮去重；按单轮 ISO-8601 `timestamp` 归桶；仅统计结构化 `429`。 |
-| **Codex CLI** | `~/.codex/state_5.sqlite` (`threads`) + `rollout_path`（完整 `rollout-*.jsonl` / `.jsonl.zst`） | `完整` / `总量不一致` / `只有总量` | 按每条 `token_count` 事件的增量与 `timestamp` 归桶并追踪 `turn_context` 模型切换；按窗口及按日核对 `threads.tokens_used`（仅缺 rollout 时退回 `threads.updated_at`）。 |
-| **OpenCode** | `~/.local/share/opencode/opencode.db`（`session_message` / `message` 逐事件 + `session_v2` 兜底） | `完整` (`complete`) | 读取 `assistant` 与 `compaction` 消息行（`time.created` / `time_created` 毫秒时间戳、未缓存 `tokens.input`、`output + reasoning`、`cache.read/write`、`cost`）；仅在某会话无消息 Token 行时回退 `session_v2`。 |
-| **Mistral Vibe** | `~/.vibe/logs/session/unified/*/journal/*.jsonl` + `meta.json` + `~/.vibe/config.toml` + `.relay/LOG.md` | `完整` / `只有接力里的部分` / `只有总量` / `没有数据` | 按序读取多分片 `journal/*.jsonl` 中 `completion_succeeded` 并按 `action_id` 去重，维护递增毫秒时间戳并通过 `.relay/*.vibe/export.json` 去重（已被 Vibe 自身压缩清理的早期分片在磁盘上不存在）。 |
-| **Antigravity** | `~/Projects/*/.relay/LOG.md` + `~/.gemini/antigravity-cli/log/cli-*.log`（`cli-*.log 无 Token 统计`） | `只有接力里的部分` (`relayOnly`) 或 `没有数据` | 独立 `cli-*.log` 仅提供当前模型与结构化 `status=429` 计数，不含 Token 用量；仅汇总 `.relay/LOG.md` 步骤总 Token，不猜测未拆分费用（不标为 `完整`）。 |
+| **Claude Code** | `~/.claude/projects/**/*.jsonl`（`message.id`、`requestId`、`message.usage`、`message.model`、`costUSD`、`timestamp`、结构化 `error`） | `完整` (`complete`) | 按 `(message.id, requestId)` 单轮去重；按单轮 ISO-8601 `timestamp` 归桶（缺失/损坏时间戳归入 `没有时间`，绝不当作 `now`）；仅统计带有效时间的结构化 `429`。 |
+| **Codex CLI** | `~/.codex/state_5.sqlite` (`threads`) + `rollout_path`（完整 `rollout-*.jsonl` / `.jsonl.zst`） | `完整` / `总量不一致` / `只有总量` | 按每条 `token_count` 事件的增量与 `timestamp` 归桶并追踪 `turn_context` 模型切换；按窗口及按日核对 `threads.tokens_used`（仅无 rollout 事件且 `updated_at > 0` 时退回 `threads.updated_at`；无时间 rollout 事件归入 `没有时间`）。 |
+| **OpenCode** | `~/.local/share/opencode/opencode.db`（`session_message` / `message` 逐事件 + `session_v2` 兜底） | `完整` (`complete`) | 读取 `assistant` 与 `compaction` 消息行（`time.created` / `time_created` 毫秒时间戳、未缓存 `tokens.input`、`output + reasoning`、`cache.read/write`、`cost`）；仅在某会话无消息 Token 行且 `time_updated > 0` 时回退 `session_v2`（缺失时间归入 `没有时间`）。 |
+| **Mistral Vibe** | `~/.vibe/logs/session/unified/*/journal/*.jsonl` + `meta.json` + `~/.vibe/config.toml` + `.relay/LOG.md` | `完整` / `只有接力里的部分` / `只有总量` / `没有数据` | 按序读取多分片 `journal/*.jsonl` 中 `completion_succeeded` 并按 `action_id` 去重，维护有效毫秒时间戳并通过 `.relay/*.vibe/export.json` 去重（缺有效前置时间的动作归入 `没有时间`；已压缩清理分片在磁盘上不存在）。 |
+| **Antigravity** | `~/Projects/*/.relay/LOG.md` + `~/.gemini/antigravity-cli/log/cli-*.log`（`cli-*.log 无 Token 统计`） | `只有接力里的部分` (`relayOnly`) 或 `没有数据` | 独立 `cli-*.log` 仅提供当前模型与带时间戳的结构化 `status=429` 计数，不含 Token 用量；`.relay/LOG.md` 步骤在 `--tz` 时区下做严格日历校验（缺失/非法时间归入 `没有时间`，不标为 `完整`）。 |
 
 ---
 

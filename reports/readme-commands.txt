@@ -62,4 +62,4 @@ AgentBar README Command Replay (Extracted from README.md & README.zh-CN.md)
 [RUN]  .build/debug/AgentBar --cli snapshot --home /nonexistent_agentbar_readme_check (expect exit 2)
   -> exit=2, stderr verified: 错误：--home 指定的目录不存在或不是目录：'/nonexistent_agentbar_readme_check'。 
 
-RESULT: ALL 21 README COMMANDS VERIFIED (14 executed, 7 explicitly skipped; plist untouched).
+RESULT: README COMMAND REPLAY PASSED (passed=14/21 README commands + 1 negative check, skipped=7/21 not counted as passed, failed=0; plist untouched).

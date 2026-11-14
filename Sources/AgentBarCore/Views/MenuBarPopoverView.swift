@@ -213,6 +213,21 @@ public struct MenuBarPopoverView: View {
                         }
                     }
                     .frame(height: 4)
+                    if !pending, item.untimestamped.recordCount > 0 {
+                        let uTok = TelemetryFormatter.optionalTokens(item.untimestamped.totalTokens, completeness: item.untimestamped.completeness, language: lang)
+                        HStack {
+                            Text(localizer.L("No timestamp", "没有时间"))
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(AgentBarPalette.muted)
+                            Spacer()
+                            Text(localizer.L(
+                                "\(uTok) · \(item.untimestamped.recordCount) rec",
+                                "\(uTok) · \(item.untimestamped.recordCount) 条"
+                            ))
+                            .font(.system(size: 9.5, design: .monospaced))
+                            .foregroundStyle(AgentBarPalette.muted)
+                        }
+                    }
                 }
             }
         }

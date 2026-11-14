@@ -1,42 +1,54 @@
 #!/usr/bin/env python3
 """
-AgentBar M1 Independent Acceptance Verifier (Strictly Read-Only, Aggregate Counts Only).
+AgentBar M1 Independent Acceptance Verifier (Hand-Calculated Fixture Oracles, Strictly Read-Only).
 
-Verifies all M1 requirements from flagship-acceptance/tools/agentbar.md and 07-tools-m0-review.md Part 2:
-  Row 1: Cross-day long sessions (Codex rollout deltas, OpenCode session_message, Vibe multi-segment journal)
-         bucketed by per-event timestamp with 0-diff per day (synthetic 3-day + live host cross-day check).
-  Row 2: 14-day x 5-vendor daily ledger reconciliation (< 1% diff on every day & vendor; synthetic 70-cell
-         fixture + read-only live host stores, reporting exact maximum observed discrepancy).
-  Row 3: Rolling 5-hour window (`fiveHours`: [now - 5h, now]) exact event-timestamp filtering (synthetic
-         cross-boundary session updated 10m ago with 8h-old & 1h-old turns + live host 5h check).
-  Row 4: Part 2 additions: per-day B14 (`pricedRecordCount`, `unmatchedModelCount`, bilingual `costNote`),
-         per-day B15 (`hasCodexRolloutMismatch`, `codexMismatchNote`), and B7 structured `429` counting
-         (prose `"frame rate is 429 fps"` / `"corporate tax rate limit"` -> 0; structured codes -> exact count).
-  Row 5: W1 scripted isolated M1 mutations (5 targeted M1 regressions compile, run, and fail their named test,
-         then restore cleanly to GREEN).
+Verifies all M1 requirements from flagship-acceptance/tools/agentbar.md and
+07-tools-m0-review.md (Part 2 + Rework BR1, BR2, BR3) WITHOUT any self-authored
+duplicate collector implementation:
+
+  Row 1 (a & b): Cross-day long sessions (Codex .jsonl & .jsonl.zst rollouts, OpenCode
+                 session_message + session_v2 fallback, Vibe multi-segment journal +
+                 .relay/LOG.md export.json dedup) verified against literal hand-calculated
+                 expected dictionaries right beside each fixture.
+  Row 2:         14-day x 5-vendor complete 70-cell daily ledger verified against a literal
+                 70-cell hand-calculated expected table (0-token / 0.0000% diff).
+  Row 3 + BR3:   Rolling 5-hour window [now - 5h, now] and exact-second boundaries
+                 (thirtyDaysAgo -/+ 0s, sevenDaysAgo -/+ 0s, prevDayStart, startOfToday -/+ 0s,
+                 fiveHoursAgo -/+ 0s, now, now + 1s) verified against literal hand sums.
+  Row 4:         Per-day B14 (pricedRecordCount, unmatchedModelCount, bilingual costNote),
+                 per-day B15 (hasCodexRolloutMismatch, codexMismatchNote), B7 structured 429
+                 vs prose traps, and Antigravity completeness != "complete".
+  Row 5 + BR3:   8 scripted isolated mutations in a clean temp workspace (including < -> <=
+                 on dayEnd, >= -> > on fiveHoursAgo & sevenDaysAgo, BR1 parsedTS ?? now,
+                 Codex session-ts, OpenCode message skip, Vibe action_id dedup removal, and
+                 prose 429 match) — all 8 compile, run, and FAIL (RED), then restore GREEN.
+  Row 6 (BR1):   Missing & malformed timestamps across all 5 sources contribute 0 tokens and
+                 0 records to 5h/today/7d/30d and all 14 dated rows, routing strictly to
+                 untimestamped ("No timestamp" / "没有时间").
+  Row 7 (BR2):   Pacific/Auckland (--tz Pacific/Auckland) NZDT start day (2026-09-27, 23h),
+                 NZDT end day (2027-04-04, 25h + rolling 5h across fall-back), and cross-midnight
+                 cases verified against literal hand-calculated expected dictionaries.
+  Row 8 (Opt):   Live-host read-only smoke check runs ONLY when AGENTBAR_LIVE_HOST=1; otherwise
+                 explicitly recorded as SKIPPED (never counted as passed).
 
 Privacy & Safety Invariants:
-  - Opens local SQLite files strictly with ?mode=ro (immutable read-only URI).
-  - Extracts only numeric token counters, model IDs, timestamps, error codes, and costs; never stores or prints conversation text.
+  - Opens zero GUI windows and writes zero files under ~/Library.
   - Verifies ~/Library/Preferences/local.xu.AgentBar.plist modification time is untouched.
+  - Skipped checks are counted separately and NEVER counted as passed.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import glob
 import json
-import math
 import os
 import pathlib
 import pwd
-import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 from typing import Any
 
 
@@ -45,48 +57,6 @@ EFFECTIVE_HOME = pathlib.Path(os.environ.get("HOME") or str(pathlib.Path.home())
 REAL_USER_HOME = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
 PLIST_PATH = REAL_USER_HOME / "Library" / "Preferences" / "local.xu.AgentBar.plist"
 VENDORS = ("claude", "codex", "opencode", "vibe", "agy")
-
-RATE_LIMIT_CODES = {
-    "429",
-    "rate_limit",
-    "rate_limit_error",
-    "rate_limit_exceeded",
-    "too_many_requests",
-    "resource_exhausted",
-}
-
-# Independent price prefix table mirroring PriceCatalog.entries for independent B14 verification
-PRICE_PREFIXES: list[tuple[str, str, tuple[float, float, float, float]]] = [
-    ("claude-opus", "prefix", (15.0, 1.50, 18.75, 75.0)),
-    ("claude-3-opus", "prefix", (15.0, 1.50, 18.75, 75.0)),
-    ("claude-4-opus", "prefix", (15.0, 1.50, 18.75, 75.0)),
-    ("claude-sonnet", "prefix", (3.0, 0.30, 3.75, 15.0)),
-    ("claude-3-5-sonnet", "prefix", (3.0, 0.30, 3.75, 15.0)),
-    ("claude-3-7-sonnet", "prefix", (3.0, 0.30, 3.75, 15.0)),
-    ("claude-4-sonnet", "prefix", (3.0, 0.30, 3.75, 15.0)),
-    ("claude-haiku", "prefix", (0.80, 0.08, 1.00, 4.00)),
-    ("claude-3-haiku", "prefix", (0.80, 0.08, 1.00, 4.00)),
-    ("claude-3-5-haiku", "prefix", (0.80, 0.08, 1.00, 4.00)),
-    ("claude-4-haiku", "prefix", (0.80, 0.08, 1.00, 4.00)),
-    ("gpt-6", "prefix", (2.0, 0.50, 2.0, 8.0)),
-    ("gpt-5", "prefix", (2.0, 0.50, 2.0, 8.0)),
-    ("codex-mini", "prefix", (2.0, 0.50, 2.0, 8.0)),
-    ("o3", "exact_or_hyphen", (2.0, 0.50, 2.0, 8.0)),
-    ("o4-mini", "prefix", (2.0, 0.50, 2.0, 8.0)),
-    ("deepseek-v4", "prefix", (0.30, 0.007, 0.30, 1.20)),
-    ("deepseek-v3", "prefix", (0.30, 0.007, 0.30, 1.20)),
-    ("deepseek-chat", "prefix", (0.30, 0.007, 0.30, 1.20)),
-    ("deepseek-reasoner", "prefix", (0.30, 0.007, 0.30, 1.20)),
-    ("gemini-4-carbon", "prefix", (1.25, 0.30, 1.25, 5.0)),
-    ("gemini 4 carbon", "prefix", (1.25, 0.30, 1.25, 5.0)),
-    ("gemini-2.5-pro", "prefix", (1.25, 0.30, 1.25, 5.0)),
-    ("gemini-3-pro", "prefix", (1.25, 0.30, 1.25, 5.0)),
-    ("gemini-4-argon", "prefix", (0.30, 0.075, 0.30, 1.20)),
-    ("gemini 4 argon", "prefix", (0.30, 0.075, 0.30, 1.20)),
-    ("gemini-2.0-flash", "prefix", (0.30, 0.075, 0.30, 1.20)),
-    ("gemini-2.5-flash", "prefix", (0.30, 0.075, 0.30, 1.20)),
-    ("gemini-3-flash", "prefix", (0.30, 0.075, 0.30, 1.20)),
-]
 
 
 def plist_mtime() -> float | None:
@@ -111,1165 +81,966 @@ def resolve_agentbar_bin() -> pathlib.Path:
     raise RuntimeError("AgentBar binary not found; run `swift build` first.")
 
 
-def run_cli_json(bin_path: pathlib.Path, subcmd: str, extra_args: list[str]) -> dict[str, Any]:
-    cmd = [str(bin_path), "--cli", subcmd, "--json", *extra_args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"CLI failed ({proc.returncode}): {' '.join(cmd)}\nstderr: {proc.stderr}")
-    return json.loads(proc.stdout)
-
-
-def parse_iso_epoch(ts_str: str | None) -> float | None:
-    if not ts_str:
-        return None
-    s = ts_str.strip()
-    if not s:
-        return None
-    try:
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def norm_epoch(val: int | float) -> float:
-    return float(val) / 1000.0 if val > 10_000_000_000 else float(val)
-
-
-def utc_date_str(epoch: float) -> str:
-    return dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).strftime("%Y-%m-%d")
-
-
-def normalize_model_id(raw: str) -> str:
-    s = (raw or "").strip()
-    low = s.lower()
-    idx = low.find(" (asked for ")
-    if idx >= 0:
-        s = s[:idx]
-    if "," in s:
-        s = s.split(",", 1)[0]
-    if "/" in s and not s.endswith("/"):
-        s = s.rsplit("/", 1)[-1]
-    return s.strip().lower()
-
-
-def is_model_recognized(model: str) -> bool:
-    m = normalize_model_id(model)
-    if not m:
-        return False
-    for pfx, kind, _rates in PRICE_PREFIXES:
-        if kind == "prefix" and m.startswith(pfx):
-            return True
-        if kind == "exact_or_hyphen" and (m == pfx or m.startswith(pfx + "-")):
-            return True
-    return False
-
-
-def int_or_zero(val: Any) -> int:
-    if isinstance(val, bool):
-        return 0
-    if isinstance(val, (int, float)):
-        return int(val)
-    if isinstance(val, str):
-        try:
-            return int(val.strip())
-        except ValueError:
-            return 0
-    return 0
-
-
-def has_structured_429_status(d: dict[str, Any]) -> bool:
-    for k in ("status", "status_code", "statusCode", "http_status", "httpStatus"):
-        if k in d and int_or_zero(d[k]) == 429:
-            return True
-    return False
-
-
-def is_structured_rate_limit(val: Any) -> bool:
-    if val is None or isinstance(val, bool):
-        return False
-    if isinstance(val, str):
-        return val.strip().lower() in RATE_LIMIT_CODES
-    if isinstance(val, (int, float)):
-        return int(val) == 429
-    if isinstance(val, dict):
-        if has_structured_429_status(val):
-            return True
-        for k in ("code", "type", "error_code", "errorCode", "reason"):
-            v = val.get(k)
-            if isinstance(v, str) and v.strip().lower() in RATE_LIMIT_CODES:
-                return True
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) == 429:
-                return True
-        if isinstance(val.get("data"), dict) and is_structured_rate_limit(val["data"]):
-            return True
-        if "error" in val and is_structured_rate_limit(val["error"]):
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Independent Reference Collectors (Pure Python reading raw SQLite/JSONL/TOML)
-# ---------------------------------------------------------------------------
-
-
-def ref_collect_claude(claude_dir: pathlib.Path, cutoff: float, now_epoch: float) -> tuple[list[dict[str, Any]], list[float]]:
-    if not claude_dir.is_dir():
-        return ([], [])
-    dedup: dict[str, dict[str, Any]] = {}
-    rl_dedup: dict[str, float] = {}
-
-    for path_str in sorted(glob.glob(str(claude_dir / "**" / "*.jsonl"), recursive=True)):
-        p = pathlib.Path(path_str)
-        try:
-            if p.stat().st_mtime < (cutoff - 3600):
-                continue
-        except OSError:
-            continue
-        try:
-            with p.open("r", encoding="utf-8", errors="ignore") as fh:
-                for idx, line in enumerate(fh, start=1):
-                    if not ('"assistant"' in line or '"error"' in line or "429" in line or "rate_limit" in line):
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    t = parse_iso_epoch(obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None)
-                    ev_t = t if t is not None else now_epoch
-                    msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-                    mid = str(msg.get("id") or "").strip()
-                    rid = str(obj.get("requestId") or "").strip()
-
-                    is_429 = False
-                    if obj.get("isApiErrorMessage") is True:
-                        is_429 = is_structured_rate_limit(obj.get("error")) or has_structured_429_status(obj)
-                    elif obj.get("type") == "error":
-                        is_429 = is_structured_rate_limit(obj.get("error")) or has_structured_429_status(obj)
-                    elif isinstance(obj.get("error"), dict):
-                        is_429 = is_structured_rate_limit(obj.get("error"))
-
-                    if is_429 and cutoff <= ev_t <= now_epoch:
-                        if mid and rid:
-                            rk = f"mr:{mid}::{rid}"
-                        elif rid:
-                            rk = f"r:{rid}"
-                        elif mid:
-                            rk = f"m:{mid}"
-                        elif obj.get("uuid"):
-                            rk = f"u:{obj['uuid']}"
-                        else:
-                            rk = f"line:{path_str}::{idx}"
-                        rl_dedup.setdefault(rk, ev_t)
-
-                    if obj.get("type") != "assistant":
-                        continue
-                    usage = msg.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
-                    inp = max(0, int_or_zero(usage.get("input_tokens")))
-                    out = max(0, int_or_zero(usage.get("output_tokens")))
-                    cr = max(0, int_or_zero(usage.get("cache_read_input_tokens")))
-                    cw = max(0, int_or_zero(usage.get("cache_creation_input_tokens")))
-                    cost = float(obj.get("costUSD") or 0.0) if isinstance(obj.get("costUSD"), (int, float)) else 0.0
-                    if inp == 0 and out == 0 and cr == 0 and cw == 0 and cost <= 0.0:
-                        continue
-
-                    if mid and rid:
-                        dk = f"mr:{mid}::{rid}"
-                    elif mid:
-                        dk = f"m:{mid}"
-                    elif rid:
-                        dk = f"r:{rid}"
-                    else:
-                        dk = f"line:{path_str}::{idx}"
-
-                    model = str(msg.get("model") or "")
-                    if dk not in dedup:
-                        dedup[dk] = {"ts": ev_t, "in": inp, "out": out, "cr": cr, "cw": cw, "cost": cost, "model": model}
-                    else:
-                        cur = dedup[dk]
-                        cur["in"] = max(cur["in"], inp)
-                        cur["out"] = max(cur["out"], out)
-                        cur["cr"] = max(cur["cr"], cr)
-                        cur["cw"] = max(cur["cw"], cw)
-                        cur["cost"] = max(cur["cost"], cost)
-                        if not cur["model"] and model:
-                            cur["model"] = model
-        except OSError:
-            continue
-
-    events: list[dict[str, Any]] = []
-    for item in dedup.values():
-        if cutoff <= item["ts"] <= now_epoch:
-            has_cost = item["cost"] > 0.0 or is_model_recognized(item["model"])
-            events.append(
-                {
-                    "vendor": "claude",
-                    "ts": item["ts"],
-                    "in": item["in"],
-                    "cr": item["cr"],
-                    "cw": item["cw"],
-                    "out": item["out"],
-                    "total": item["in"] + item["cr"] + item["cw"] + item["out"],
-                    "priced": 1 if has_cost else 0,
-                    "unmatched": 0 if has_cost else 1,
-                    "mismatch": False,
-                }
-            )
-    return (events, list(rl_dedup.values()))
-
-
-def ref_read_codex_rollout(rollout_path: str, allow_zstd: bool = True) -> tuple[list[dict[str, Any]], list[float], int | None] | None:
-    p = pathlib.Path(rollout_path)
-    text: str | None = None
-    if p.is_file():
-        text = p.read_text(encoding="utf-8", errors="ignore")
-    elif allow_zstd:
-        zst = pathlib.Path(rollout_path + ".zst")
-        zstd_bin = shutil.which("zstd") or ("/opt/homebrew/bin/zstd" if pathlib.Path("/opt/homebrew/bin/zstd").is_file() else None)
-        if zst.is_file() and zstd_bin:
-            proc = subprocess.run([zstd_bin, "-dc", str(zst)], capture_output=True, text=True, check=False)
-            if proc.returncode == 0 and proc.stdout:
-                text = proc.stdout
-    if text is None:
-        return None
-
-    turns: list[dict[str, Any]] = []
-    rls: list[float] = []
-    cur_model: str | None = None
-    prev_u = prev_c = prev_cw = prev_o = 0
-    base_rep = 0
-    last_rep: int | None = None
-
-    for ln in text.splitlines():
-        if not ('"token_count"' in ln or '"turn_context"' in ln or '"error"' in ln or "429" in ln or "rate_limit" in ln):
-            continue
-        try:
-            obj = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        ts = parse_iso_epoch(obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None)
-        top_type = obj.get("type")
-        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else None
-
-        is_429 = has_structured_429_status(obj) or is_structured_rate_limit(obj.get("error"))
-        if not is_429 and payload is not None:
-            if has_structured_429_status(payload) or is_structured_rate_limit(payload.get("error")):
-                is_429 = True
-            elif payload.get("type") == "error" and is_structured_rate_limit(payload):
-                is_429 = True
-        if is_429 and ts is not None:
-            rls.append(ts)
-
-        if payload is None:
-            continue
-        if top_type == "turn_context":
-            m = str(payload.get("model") or "").strip()
-            if m:
-                cur_model = m
-        elif top_type == "event_msg" and payload.get("type") == "token_count":
-            info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-            tu = info.get("total_token_usage")
-            if not (isinstance(tu, dict) and "input_tokens" in tu and "output_tokens" in tu):
-                continue
-            raw_in = max(0, int_or_zero(tu.get("input_tokens")))
-            cached = max(0, int_or_zero(tu.get("cached_input_tokens")))
-            cw = max(0, int_or_zero(tu.get("cache_write_input_tokens")))
-            out = max(0, int_or_zero(tu.get("output_tokens")))
-            uncached = max(0, raw_in - cached)
-
-            if uncached < prev_u or cached < prev_c or cw < prev_cw or out < prev_o:
-                if last_rep is not None:
-                    base_rep += last_rep
-                prev_u = prev_c = prev_cw = prev_o = 0
-
-            du = max(0, uncached - prev_u)
-            dc = max(0, cached - prev_c)
-            dcw = max(0, cw - prev_cw)
-            do = max(0, out - prev_o)
-            prev_u, prev_c, prev_cw, prev_o = uncached, cached, cw, out
-            if tu.get("total_tokens") is not None:
-                last_rep = max(0, int_or_zero(tu.get("total_tokens")))
-
-            if (du + dc + dcw + do) <= 0:
-                continue
-            turns.append({"ts": ts, "in": du, "cr": dc, "cw": dcw, "out": do, "model": cur_model})
-
-    rep_total = (base_rep + last_rep) if last_rep is not None else None
-    return (turns, rls, rep_total)
-
-
-def ref_collect_codex(
-    db_path: pathlib.Path, cutoff: float, now_epoch: float, allow_zstd: bool = True
-) -> tuple[list[dict[str, Any]], list[float], int]:
-    if not db_path.is_file():
-        return ([], [], 0)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)").fetchall()}
-        m_expr = "model" if "model" in cols else "NULL"
-        r_expr = "rollout_path" if "rollout_path" in cols else "NULL"
-        c_expr = "created_at" if "created_at" in cols else "0"
-        rows = conn.execute(
-            f"SELECT id, tokens_used, updated_at, {c_expr}, {m_expr}, {r_expr} FROM threads WHERE tokens_used > 0"
-        ).fetchall()
-    finally:
-        conn.close()
-
-    events: list[dict[str, Any]] = []
-    rls: list[float] = []
-    cross_day_threads = 0
-
-    for tid, tok_used, upd, crt, db_m, rpath in rows:
-        ts = norm_epoch(upd if (upd or 0) > 0 else (crt or 0))
-        db_model = str(db_m or "").strip()
-        rpath_s = str(rpath or "").strip()
-
-        if rpath_s and ts >= (cutoff - 86400):
-            parsed = ref_read_codex_rollout(rpath_s, allow_zstd=allow_zstd)
-            if parsed is not None:
-                turns, turn_rls, rep_tot = parsed
-                for rt in turn_rls:
-                    if cutoff <= rt <= now_epoch:
-                        rls.append(rt)
-                if turns:
-                    rtot = sum(t["in"] + t["cr"] + t["cw"] + t["out"] for t in turns)
-                    is_mis = (rtot != int(tok_used)) or (rep_tot is not None and rep_tot != int(tok_used))
-                    touched_days = {utc_date_str(t["ts"] if t["ts"] is not None else ts) for t in turns if cutoff <= (t["ts"] if t["ts"] is not None else ts) <= now_epoch}
-                    if len(touched_days) >= 2:
-                        cross_day_threads += 1
-                    for t in turns:
-                        ev_ts = t["ts"] if t["ts"] is not None else ts
-                        if not (cutoff <= ev_ts <= now_epoch):
-                            continue
-                        m = t["model"] or db_model
-                        priced = 1 if is_model_recognized(m) else 0
-                        events.append(
-                            {
-                                "vendor": "codex",
-                                "ts": ev_ts,
-                                "in": t["in"],
-                                "cr": t["cr"],
-                                "cw": t["cw"],
-                                "out": t["out"],
-                                "total": t["in"] + t["cr"] + t["cw"] + t["out"],
-                                "priced": priced,
-                                "unmatched": 0 if priced else 1,
-                                "mismatch": is_mis,
-                                "thread_id": str(tid),
-                            }
-                        )
-                    continue
-
-        if cutoff <= ts <= now_epoch:
-            unmatched = 1 if (db_model and db_model not in ("—", "unknown", "default", "?") and not is_model_recognized(db_model)) else 0
-            events.append(
-                {
-                    "vendor": "codex",
-                    "ts": ts,
-                    "in": 0,
-                    "cr": 0,
-                    "cw": 0,
-                    "out": 0,
-                    "total": int(tok_used),
-                    "priced": 0,
-                    "unmatched": unmatched,
-                    "mismatch": False,
-                    "thread_id": str(tid),
-                }
-            )
-    return (events, rls, cross_day_threads)
-
-
-def ref_collect_opencode(db_path: pathlib.Path, cutoff: float, now_epoch: float) -> tuple[list[dict[str, Any]], list[float], int]:
-    if not db_path.is_file():
-        return ([], [], 0)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        sess_v2: dict[str, tuple[float, int, int, int, int, str, float]] = {}
-        if "session_v2" in tables:
-            for sid, cost, tin, tout, treas, tcr, tcw, raw_m, tupd in conn.execute(
-                "SELECT id, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, model, time_updated FROM session_v2"
-            ).fetchall():
-                m_str = str(raw_m or "").strip()
-                if m_str.startswith("{"):
-                    try:
-                        m_str = str(json.loads(m_str).get("id") or m_str)
-                    except json.JSONDecodeError:
-                        pass
-                sess_v2[str(sid)] = (
-                    float(cost or 0.0),
-                    int(tin or 0),
-                    int(tout or 0) + int(treas or 0),
-                    int(tcr or 0),
-                    int(tcw or 0),
-                    m_str,
-                    norm_epoch(int(tupd or 0)),
-                )
-
-        msg_table = "session_message" if "session_message" in tables else ("message" if "message" in tables else None)
-        msg_rows: list[tuple[Any, ...]] = []
-        if msg_table:
-            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({msg_table})").fetchall()}
-            t_col = "type" if "type" in cols else "NULL"
-            tc_col = "time_created" if "time_created" in cols else "0"
-            where = "WHERE type IN ('assistant', 'compaction') OR instr(data, 'error') > 0 OR instr(data, '429') > 0" if "type" in cols else ""
-            msg_rows = conn.execute(f"SELECT id, session_id, {t_col}, {tc_col}, data FROM {msg_table} {where}").fetchall()
-    finally:
-        conn.close()
-
-    events: list[dict[str, Any]] = []
-    rls: list[float] = []
-    covered_sessions: set[str] = set()
-    days_by_session: dict[str, set[str]] = {}
-
-    for _mid, sid_raw, rtype, raw_tc, data_str in msg_rows:
-        sid = str(sid_raw or "")
-        try:
-            d = json.loads(data_str or "{}")
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(d, dict):
-            continue
-        tdict = d.get("time") if isinstance(d.get("time"), dict) else {}
-        c_val = tdict.get("created") if tdict.get("created") is not None else tdict.get("completed")
-        if isinstance(c_val, (int, float)) and c_val > 0:
-            mts = norm_epoch(c_val)
-        elif raw_tc and int(raw_tc) > 0:
-            mts = norm_epoch(int(raw_tc))
-        else:
-            mts = sess_v2.get(sid, (0, 0, 0, 0, 0, "", now_epoch))[6]
-
-        if (is_structured_rate_limit(d.get("error")) or has_structured_429_status(d)) and cutoff <= mts <= now_epoch:
-            rls.append(mts)
-
-        role = str(rtype or d.get("role") or d.get("type") or "").strip()
-        if role and role not in ("assistant", "compaction"):
-            continue
-        tok = d.get("tokens") if isinstance(d.get("tokens"), dict) else {}
-        cache = tok.get("cache") if isinstance(tok.get("cache"), dict) else {}
-        tin = max(0, int_or_zero(tok.get("input")))
-        tout = max(0, int_or_zero(tok.get("output"))) + max(0, int_or_zero(tok.get("reasoning")))
-        tcr = max(0, int_or_zero(cache.get("read")))
-        tcw = max(0, int_or_zero(cache.get("write")))
-        cost = float(d.get("cost") or 0.0) if isinstance(d.get("cost"), (int, float)) else 0.0
-        if tin == 0 and tout == 0 and tcr == 0 and tcw == 0 and cost <= 0.0:
-            continue
-        covered_sessions.add(sid)
-        if not (cutoff <= mts <= now_epoch):
-            continue
-
-        days_by_session.setdefault(sid, set()).add(utc_date_str(mts))
-        m_field = d.get("model")
-        if isinstance(m_field, dict):
-            model = str(m_field.get("id") or m_field.get("modelID") or "")
-        elif isinstance(m_field, str) and m_field:
-            model = m_field
-        else:
-            model = str(d.get("modelID") or sess_v2.get(sid, (0, 0, 0, 0, 0, "", 0.0))[5])
-
-        has_cost = cost > 0.0 or is_model_recognized(model)
-        events.append(
-            {
-                "vendor": "opencode",
-                "ts": mts,
-                "in": tin,
-                "cr": tcr,
-                "cw": tcw,
-                "out": tout,
-                "total": tin + tcr + tcw + tout,
-                "priced": 1 if has_cost else 0,
-                "unmatched": 0 if has_cost else 1,
-                "mismatch": False,
-            }
-        )
-
-    for sid, (cost, tin, tout, tcr, tcw, model, tupd) in sess_v2.items():
-        if sid in covered_sessions:
-            continue
-        if tin == 0 and tout == 0 and tcr == 0 and tcw == 0 and cost <= 0.0:
-            continue
-        if not (cutoff <= tupd <= now_epoch):
-            continue
-        has_cost = cost > 0.0 or is_model_recognized(model)
-        events.append(
-            {
-                "vendor": "opencode",
-                "ts": tupd,
-                "in": tin,
-                "cr": tcr,
-                "cw": tcw,
-                "out": tout,
-                "total": tin + tcr + tcw + tout,
-                "priced": 1 if has_cost else 0,
-                "unmatched": 0 if has_cost else 1,
-                "mismatch": False,
-            }
-        )
-
-    cross_day = sum(1 for ds in days_by_session.values() if len(ds) >= 2)
-    return (events, rls, cross_day)
-
-
-def ref_extract_vibe_ts(obj: dict[str, Any]) -> float | None:
-    for k in ("time_unix_ms", "timestamp", "created_at"):
-        v = obj.get(k)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
-            return norm_epoch(v)
-        if isinstance(v, str):
-            p = parse_iso_epoch(v)
-            if p is not None:
-                return p
-    payload = obj.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    det = (payload.get("input") or {}).get("determinism") if isinstance(payload.get("input"), dict) else None
-    if isinstance(det, dict):
-        ms = det.get("time_unix_ms")
-        if isinstance(ms, (int, float)) and ms > 0:
-            return norm_epoch(ms)
-    deltas = payload.get("delta")
-    if isinstance(deltas, list):
-        best_num = 0.0
-        best_iso: float | None = None
-        for d in deltas:
-            entry = d.get("entry") if isinstance(d, dict) else None
-            if not isinstance(entry, dict):
-                continue
-            for k in ("updatedAt", "createdAt"):
-                v = entry.get(k)
-                if isinstance(v, (int, float)) and v > best_num:
-                    best_num = float(v)
-                elif isinstance(v, str):
-                    p = parse_iso_epoch(v)
-                    if p is not None and (best_iso is None or p > best_iso):
-                        best_iso = p
-        if best_num > 0:
-            return norm_epoch(best_num)
-        if best_iso is not None:
-            return best_iso
-    sa = payload.get("session_api")
-    if isinstance(sa, dict) and isinstance(sa.get("turn_outcomes"), dict):
-        best = 0.0
-        for tout in sa["turn_outcomes"].values():
-            if isinstance(tout, dict) and isinstance(tout.get("completedAt"), (int, float)):
-                best = max(best, float(tout["completedAt"]))
-        if best > 0:
-            return norm_epoch(best)
+def resolve_zstd_bin() -> str | None:
+    found = shutil.which("zstd")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"):
+        if pathlib.Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 
-def ref_parse_relay_logs(ws_root: pathlib.Path) -> list[dict[str, Any]]:
-    if not ws_root.is_dir():
-        return []
-    candidates: list[pathlib.Path] = []
-    direct = ws_root / ".relay" / "LOG.md"
-    if direct.is_file():
-        candidates.append(direct)
-    for child in sorted(ws_root.iterdir(), key=lambda p: p.name):
-        if child.name.startswith("."):
-            continue
-        c = child / ".relay" / "LOG.md"
-        if c.is_file():
-            candidates.append(c)
-
-    step_re = re.compile(r"^#{2,3}\s+([^\s:]+):\s*(.+)$")
-    ts_re = re.compile(r"^(.*),\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)\s*$")
-    cost_re = re.compile(r"\bcost\s+\$([0-9]+(?:\.[0-9]+)?)")
-    tok_re = re.compile(r"\btokens\s+([0-9,]+)")
-    model_re = re.compile(r"\bmodel\s+(.+?)(?:,\s*(?:cost|tokens|session|outcome)\b|;|$)")
-    ignored = ("- prompt:", "- files changed:", "- final message:", "- checks:", "- command:", "- workspace:", "- output")
-    vmap = {"claude": "claude", "codex": "codex", "opencode": "opencode", "vibe": "vibe", "agy": "agy", "antigravity": "agy"}
-
-    runs: list[dict[str, Any]] = []
-    for log_p in candidates:
-        mtime = log_p.stat().st_mtime
-        steps: list[dict[str, Any]] = []
-        cur: dict[str, Any] | None = None
-        for line in log_p.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if line.startswith("#"):
-                if cur is not None:
-                    steps.append(cur)
-                    cur = None
-                m = step_re.match(line)
-                if not m:
-                    continue
-                sid, rest = m.group(1), m.group(2).strip()
-                vendor = next((vmap[pt] for pt in re.split(r"[-_]", sid.lower()) if pt in vmap), None)
-                tm = ts_re.match(rest)
-                ts_str = tm.group(2).strip() if tm else ""
-                cur = {"stepID": sid, "vendor": vendor, "ts_str": ts_str, "model": "", "cost": None, "tokens": None}
-                continue
-            if cur is None or not line.startswith("- "):
-                continue
-            low = line.lower()
-            if any(low.startswith(p) for p in ignored):
-                continue
-            mm = model_re.search(line)
-            if mm:
-                ms = mm.group(1).strip()
-                if ms and ms != "?" and not ms.startswith("? "):
-                    cur["model"] = ms
-            cm = cost_re.search(line)
-            if cm:
-                cur["cost"] = float(cm.group(1))
-            tkm = tok_re.search(line)
-            if tkm:
-                cur["tokens"] = int(tkm.group(1).replace(",", ""))
-        if cur is not None:
-            steps.append(cur)
-        if steps:
-            runs.append({"log_path": log_p, "mtime": mtime, "steps": steps})
-    return runs
+def run_cli(bin_path: pathlib.Path, subcmd: str, extra_args: list[str]) -> str:
+    cmd = [str(bin_path), "--cli", subcmd, *extra_args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"CLI failed ({proc.returncode}): {' '.join(cmd)}\nstderr: {proc.stderr}")
+    return proc.stdout
 
 
-def ref_parse_local_relay_ts(ts_str: str, fallback: float) -> float:
-    if not ts_str:
-        return fallback
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-        try:
-            naive = dt.datetime.strptime(ts_str, fmt)
-            return time.mktime(naive.timetuple())
-        except ValueError:
-            continue
-    return fallback
+def run_cli_json(bin_path: pathlib.Path, subcmd: str, extra_args: list[str]) -> dict[str, Any]:
+    return json.loads(run_cli(bin_path, subcmd, ["--json", *extra_args]))
 
 
-def ref_collect_vibe_and_agy(
-    home_dir: pathlib.Path, ws_root: pathlib.Path, cutoff: float, now_epoch: float
-) -> tuple[list[dict[str, Any]], list[float], list[dict[str, Any]], list[float]]:
-    vibe_dir = home_dir / ".vibe" / "logs" / "session" / "unified"
-    cfg_toml = home_dir / ".vibe" / "config.toml"
-    cfg_model = ""
-    if cfg_toml.is_file():
-        m_re = re.compile(r'^\s*active_model\s*=\s*"([^"]+)"')
-        for ln in cfg_toml.read_text(encoding="utf-8", errors="ignore").splitlines():
-            if ln.strip().startswith("["):
-                break
-            mm = m_re.match(ln)
-            if mm:
-                cfg_model = mm.group(1).strip()
-                break
-
-    vibe_events: list[dict[str, Any]] = []
-    vibe_rls: list[float] = []
-    unified_ids: set[str] = set()
-
-    if vibe_dir.is_dir():
-        for folder in sorted(vibe_dir.iterdir(), key=lambda p: p.name):
-            if not folder.is_dir() or folder.name.startswith("."):
-                continue
-            meta_p = folder / "meta.json"
-            meta = json.loads(meta_p.read_text(encoding="utf-8", errors="ignore")) if meta_p.is_file() else {}
-            sid = str(meta.get("session_id") or folder.name).strip()
-            unified_ids.add(sid)
-            start_t = parse_iso_epoch(meta.get("start_time") if isinstance(meta.get("start_time"), str) else None)
-            end_t = parse_iso_epoch(meta.get("end_time") if isinstance(meta.get("end_time"), str) else None)
-            fallback_t = start_t or end_t or folder.stat().st_mtime
-            m_cfg = meta.get("config") if isinstance(meta.get("config"), dict) else {}
-            s_model = str(m_cfg.get("active_model") or m_cfg.get("model_name") or meta.get("model") or cfg_model or "").strip()
-
-            jdir = folder / "journal"
-            emitted = False
-            if jdir.is_dir():
-                seen_ok: set[str] = set()
-                seen_err: set[str] = set()
-                run_t = start_t or end_t
-                for seg in sorted(jdir.glob("*.jsonl"), key=lambda p: p.name):
-                    for ln in seg.read_text(encoding="utf-8", errors="ignore").splitlines():
-                        try:
-                            obj = json.loads(ln)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(obj, dict):
-                            continue
-                        rt = ref_extract_vibe_ts(obj)
-                        if rt is not None:
-                            run_t = rt
-                        if obj.get("type") != "action_result":
-                            continue
-                        pl = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
-                        aid = str(pl.get("action_id") or "").strip()
-                        st = str(pl.get("state") or "")
-                        res = pl.get("result") if isinstance(pl.get("result"), dict) else {}
-                        ev_t = run_t if run_t is not None else fallback_t
-
-                        if st == "succeeded" and res.get("type") == "completion_succeeded":
-                            if aid:
-                                if aid in seen_ok:
-                                    continue
-                                seen_ok.add(aid)
-                            usage = (res.get("result") or {}).get("usage") if isinstance(res.get("result"), dict) else None
-                            if not isinstance(usage, dict):
-                                continue
-                            rin = max(0, int_or_zero(usage.get("input_tokens")))
-                            cin = max(0, int_or_zero(usage.get("cached_input_tokens")))
-                            cw = max(0, int_or_zero(usage.get("cache_write_tokens")))
-                            out = max(0, int_or_zero(usage.get("output_tokens")))
-                            uin = max(0, rin - cin)
-                            if (uin + cin + cw + out) <= 0:
-                                continue
-                            emitted = True
-                            if cutoff <= ev_t <= now_epoch:
-                                priced = 1 if is_model_recognized(s_model) else 0
-                                vibe_events.append(
-                                    {
-                                        "vendor": "vibe",
-                                        "ts": ev_t,
-                                        "in": uin,
-                                        "cr": cin,
-                                        "cw": cw,
-                                        "out": out,
-                                        "total": uin + cin + cw + out,
-                                        "priced": priced,
-                                        "unmatched": 0 if priced else 1,
-                                        "mismatch": False,
-                                    }
-                                )
-                        elif st == "failed":
-                            err_obj = res.get("error") if "error" in res else pl.get("error")
-                            if is_structured_rate_limit(err_obj):
-                                if aid:
-                                    if aid in seen_err:
-                                        continue
-                                    seen_err.add(aid)
-                                if cutoff <= ev_t <= now_epoch:
-                                    vibe_rls.append(ev_t)
-
-            if not emitted and isinstance(meta.get("stats"), dict) and cutoff <= fallback_t <= now_epoch:
-                st_d = meta["stats"]
-                it = int_or_zero(st_d.get("session_prompt_tokens")) + int_or_zero(st_d.get("prompt_tokens"))
-                ot = int_or_zero(st_d.get("session_completion_tokens")) + int_or_zero(st_d.get("completion_tokens"))
-                cs = float(st_d.get("session_cost") or 0.0)
-                if it > 0 or ot > 0 or cs > 0:
-                    vibe_events.append(
-                        {
-                            "vendor": "vibe",
-                            "ts": fallback_t,
-                            "in": 0,
-                            "cr": 0,
-                            "cw": 0,
-                            "out": 0,
-                            "total": it + ot,
-                            "priced": 1 if cs > 0 else 0,
-                            "unmatched": 0 if (cs > 0 or not s_model or is_model_recognized(s_model)) else 1,
-                            "mismatch": False,
-                        }
-                    )
-
-    runs = ref_parse_relay_logs(ws_root)
-    agy_events: list[dict[str, Any]] = []
-    for run in runs:
-        rdir = run["log_path"].parent
-        for st in run["steps"]:
-            tok = st["tokens"] or 0
-            cost = st["cost"] or 0.0
-            if tok <= 0 and cost <= 0.0:
-                continue
-            ts = ref_parse_local_relay_ts(st["ts_str"], run["mtime"])
-            if not (cutoff <= ts <= now_epoch):
-                continue
-            m = st["model"]
-            has_model = bool(m and m not in ("—", "unknown", "default", "?"))
-            unmatched = 1 if (cost <= 0.0 and has_model and not is_model_recognized(m)) else 0
-            if st["vendor"] == "vibe":
-                vibe_sid = None
-                for cand in (
-                    rdir / f"{st['stepID']}.vibe" / "export.json",
-                    rdir / f"{st['stepID']}.vibe" / "session" / "meta.json",
-                    rdir / f"{st['stepID']}.vibe" / "meta.json",
-                ):
-                    if cand.is_file():
-                        try:
-                            vibe_sid = str(json.loads(cand.read_text(encoding="utf-8")).get("session_id") or "").strip()
-                        except Exception:
-                            vibe_sid = None
-                        if vibe_sid:
-                            break
-                if vibe_sid and vibe_sid in unified_ids:
-                    continue
-                vibe_events.append(
-                    {
-                        "vendor": "vibe",
-                        "ts": ts,
-                        "in": 0,
-                        "cr": 0,
-                        "cw": 0,
-                        "out": 0,
-                        "total": tok,
-                        "priced": 1 if cost > 0 else 0,
-                        "unmatched": unmatched,
-                        "mismatch": False,
-                    }
-                )
-            elif st["vendor"] == "agy":
-                agy_events.append(
-                    {
-                        "vendor": "agy",
-                        "ts": ts,
-                        "in": 0,
-                        "cr": 0,
-                        "cw": 0,
-                        "out": 0,
-                        "total": tok,
-                        "priced": 1 if cost > 0 else 0,
-                        "unmatched": unmatched,
-                        "mismatch": False,
-                    }
-                )
-
-    agy_rls: list[float] = []
-    agy_log_dir = home_dir / ".gemini" / "antigravity-cli" / "log"
-    status_re = re.compile(r"(?:^|[\s,;(])(?:status|http_status|status_code)=429(?=$|[\s,;)])")
-    iso_lead_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))")
-    if agy_log_dir.is_dir():
-        for lf in sorted(agy_log_dir.glob("*.log"), key=lambda p: p.name):
-            mod = lf.stat().st_mtime
-            if mod < cutoff:
-                continue
-            for ln in lf.read_text(encoding="utf-8", errors="ignore").splitlines():
-                is429 = bool(status_re.search(ln))
-                if not is429 and ln.startswith("{"):
-                    try:
-                        o = json.loads(ln)
-                        is429 = isinstance(o, dict) and (has_structured_429_status(o) or is_structured_rate_limit(o.get("error")))
-                    except json.JSONDecodeError:
-                        pass
-                if is429:
-                    im = iso_lead_re.match(ln)
-                    rt = parse_iso_epoch(im.group(1)) if im else None
-                    ev_t = rt if rt is not None else mod
-                    if cutoff <= ev_t <= now_epoch:
-                        agy_rls.append(ev_t)
-
-    return (vibe_events, vibe_rls, agy_events, agy_rls)
+def iso_to_epoch_s(iso_str: str) -> int:
+    return int(dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp())
 
 
-def ref_collect_all_utc(home_dir: pathlib.Path, ws_root: pathlib.Path, now_epoch: int) -> dict[str, Any]:
-    cutoff = float(now_epoch - 30 * 86400)
-    now_f = float(now_epoch)
+def iso_to_epoch_ms(iso_str: str) -> int:
+    return int(round(dt.datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() * 1000))
 
-    c_ev, c_rl = ref_collect_claude(home_dir / ".claude" / "projects", cutoff, now_f)
-    x_ev, x_rl, x_cross = ref_collect_codex(home_dir / ".codex" / "state_5.sqlite", cutoff, now_f)
-    o_ev, o_rl, o_cross = ref_collect_opencode(home_dir / ".local" / "share" / "opencode" / "opencode.db", cutoff, now_f)
-    v_ev, v_rl, a_ev, a_rl = ref_collect_vibe_and_agy(home_dir, ws_root, cutoff, now_f)
 
-    all_events = c_ev + x_ev + o_ev + v_ev + a_ev
-    all_rls = [("claude", t) for t in c_rl] + [("codex", t) for t in x_rl] + [("opencode", t) for t in o_rl] + [("vibe", t) for t in v_rl] + [("agy", t) for t in a_rl]
+def rel_diff(cli_val: int, exp_val: int) -> float:
+    if cli_val == exp_val:
+        return 0.0
+    denom = max(1, abs(exp_val), abs(cli_val))
+    return abs(cli_val - exp_val) / float(denom)
 
-    today_utc = dt.datetime.fromtimestamp(now_epoch, tz=dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    day0 = today_utc - dt.timedelta(days=13)
-    days: dict[str, dict[str, Any]] = {}
-    for offset in range(14):
-        d_start = day0 + dt.timedelta(days=offset)
-        d_end = d_start + dt.timedelta(days=1)
-        s_ep, e_ep = d_start.timestamp(), d_end.timestamp()
-        d_key = d_start.strftime("%Y-%m-%d")
 
-        v_cells: dict[str, dict[str, Any]] = {}
-        for v in VENDORS:
-            ve = [e for e in all_events if e["vendor"] == v and s_ep <= e["ts"] < e_ep and e["ts"] <= now_f]
-            vrl = sum(1 for rv, rt in all_rls if rv == v and s_ep <= rt < e_ep and rt <= now_f)
-            v_cells[v] = {
-                "in": sum(e["in"] for e in ve),
-                "cr": sum(e["cr"] for e in ve),
-                "cw": sum(e["cw"] for e in ve),
-                "out": sum(e["out"] for e in ve),
-                "total": sum(e["total"] for e in ve),
-                "records": len(ve),
-                "priced": sum(e["priced"] for e in ve),
-                "unmatched": sum(e["unmatched"] for e in ve),
-                "mismatch": any(e["mismatch"] for e in ve),
-                "rl429": vrl,
-            }
-        days[d_key] = {
-            "vendors": v_cells,
-            "total": sum(c["total"] for c in v_cells.values()),
-            "priced": sum(c["priced"] for c in v_cells.values()),
-            "unmatched": sum(c["unmatched"] for c in v_cells.values()),
-            "codex_mismatch": v_cells["codex"]["mismatch"],
-            "rl429": sum(c["rl429"] for c in v_cells.values()),
-        }
+def assert_vendor_cell(
+    actual_cell: dict[str, Any],
+    expected_tuple: tuple[int, int, int, int, int, int],
+    ctx: str,
+    mismatches: list[str],
+) -> float:
+    """Compare (uncached_in, cached_in, cache_write, out, total, records) against literal tuple."""
+    exp_in, exp_cr, exp_cw, exp_out, exp_tot, exp_rec = expected_tuple
+    checks = (
+        ("uncachedInputTokens", exp_in),
+        ("cachedInputTokens", exp_cr),
+        ("cacheWriteTokens", exp_cw),
+        ("outputTokens", exp_out),
+        ("totalTokens", exp_tot),
+        ("recordCount", exp_rec),
+    )
+    max_d = 0.0
+    for field, exp_v in checks:
+        got_v = int(actual_cell[field])
+        d = rel_diff(got_v, exp_v)
+        max_d = max(max_d, d)
+        if got_v != exp_v:
+            mismatches.append(f"{ctx}.{field}: got={got_v}, expected={exp_v}")
+    return max_d
 
-    five_h_cutoff = now_f - 5 * 3600.0
-    five_h_by_vendor: dict[str, dict[str, int]] = {}
-    for v in VENDORS:
-        ve5 = [e for e in all_events if e["vendor"] == v and five_h_cutoff <= e["ts"] <= now_f]
-        five_h_by_vendor[v] = {
-            "total": sum(e["total"] for e in ve5),
-            "records": len(ve5),
-        }
 
-    return {
-        "days": days,
-        "five_hours": five_h_by_vendor,
-        "codex_cross_day_threads": x_cross,
-        "opencode_cross_day_sessions": o_cross,
-        "total_events": len(all_events),
+# ===========================================================================
+# Check 1a & 1b: Cross-Day Multi-Turn Sessions (Codex .jsonl & .jsonl.zst,
+#                OpenCode session_message + session_v2 fallback, Vibe multi-segment)
+# ===========================================================================
+
+
+def verify_row1_cross_day(bin_path: pathlib.Path) -> tuple[bool, str, bool | None, str]:
+    """
+    Returns (row1a_ok, row1a_msg, row1b_zst_ok_or_none_if_skipped, row1b_msg).
+    All expected values are hand-calculated literals right beside the fixture.
+    """
+    now_iso = "2026-11-15T18:00:00Z"
+    t_d12_ms = iso_to_epoch_ms("2026-11-12T09:00:00Z")
+    t_d13_s = iso_to_epoch_s("2026-11-13T10:00:00Z")
+    t_d14_s = iso_to_epoch_s("2026-11-14T10:00:00Z")
+    t_d15_s = iso_to_epoch_s("2026-11-15T10:00:00Z")
+    t_upd_s = iso_to_epoch_s("2026-11-15T17:50:00Z")
+
+    # Hand-calculated literal expected dictionary for Row 1a:
+    # Tuple layout: (uncached_in, cached_in, cache_write, output, total, records)
+    EXPECTED_ROW1A_BY_DAY: dict[str, dict[str, tuple[int, int, int, int, int, int]]] = {
+        "2026-11-12": {
+            # OpenCode ses-agg-12 has 0 session_message rows -> falls back to session_v2:
+            # 4,000 uncached + 12,000 cache_read + 0 cw + 500 out = 16,500 (1 record)
+            "codex": (0, 0, 0, 0, 0, 0),
+            "opencode": (4_000, 12_000, 0, 500, 16_500, 1),
+            "vibe": (0, 0, 0, 0, 0, 0),
+        },
+        "2026-11-13": {
+            # Codex turn 1 cumulative (in=100k, cr=80k, out=5k) + 1 zero-delta duplicate skipped:
+            # uncached = 100k - 80k = 20k; 20k + 80k + 0 + 5k = 105,000 (1 record)
+            "codex": (20_000, 80_000, 0, 5_000, 105_000, 1),
+            # OpenCode msg m1: 8k + 40k + 0 + 2k = 50,000 (1 record)
+            "opencode": (8_000, 40_000, 0, 2_000, 50_000, 1),
+            # Vibe journal a1 (in=12k, cached=8k, out=500): uncached = 12k - 8k = 4k -> 12,500 (1 record)
+            "vibe": (4_000, 8_000, 0, 500, 12_500, 1),
+        },
+        "2026-11-14": {
+            # Codex turn 2 cumulative (in=250k, cr=200k, out=12k) -> uncached_cum=50k:
+            # delta = (50k-20k=30k, 200k-80k=120k, 0, 12k-5k=7k) -> 30k + 120k + 7k = 157,000 (1 record)
+            "codex": (30_000, 120_000, 0, 7_000, 157_000, 1),
+            # OpenCode msg m2 (compaction): in=10k, cr=65k, cw=0, out=4500+reasoning 500=5k -> 80,000 (1 record)
+            "opencode": (10_000, 65_000, 0, 5_000, 80_000, 1),
+            # Vibe journal a2 (in=20k, cached=15k, cw=1k, out=1k; replayed in seg 20 -> deduped by action_id):
+            # uncached = 20k - 15k = 5k -> 5k + 15k + 1k + 1k = 22,000 (1 record)
+            "vibe": (5_000, 15_000, 1_000, 1_000, 22_000, 1),
+        },
+        "2026-11-15": {
+            # Codex turn 3 cumulative (in=310k, cr=240k, out=15k) -> uncached_cum=70k:
+            # delta = (70k-50k=20k, 240k-200k=40k, 0, 15k-12k=3k) -> 20k + 40k + 3k = 63,000 (1 record)
+            # Rollout 3-day total = 105k + 157k + 63k = 325,000 == threads.tokens_used
+            "codex": (20_000, 40_000, 0, 3_000, 63_000, 1),
+            # OpenCode msg m3: 12k + 75k + 0 + 3k = 90,000 (1 record)
+            "opencode": (12_000, 75_000, 0, 3_000, 90_000, 1),
+            # Vibe journal a3 (in=30k, cached=25k, cw=0, out=1k) + .relay/01-vibe.vibe/export.json dedup:
+            # uncached = 30k - 25k = 5k -> 5k + 25k + 0 + 1k = 31,000 (1 record; .relay 99,999 NOT double-counted)
+            "vibe": (5_000, 25_000, 0, 1_000, 31_000, 1),
+        },
     }
 
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row1a-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        (thome / ".codex").mkdir(parents=True)
+        (thome / ".local" / "share" / "opencode").mkdir(parents=True)
+        v_jdir = thome / ".vibe" / "logs" / "session" / "unified" / "vs-3d" / "journal"
+        r_vibe = tws / "demo-pipe" / ".relay" / "01-vibe.vibe"
+        v_jdir.mkdir(parents=True)
+        r_vibe.mkdir(parents=True)
 
-def rel_diff(cli_val: int, ref_val: int) -> float:
-    if cli_val == ref_val:
-        return 0.0
-    denom = max(1, abs(ref_val), abs(cli_val))
-    return abs(cli_val - ref_val) / float(denom)
-
-
-def compare_14d_matrix(cli_doc: dict[str, Any], ref_doc: dict[str, Any]) -> tuple[bool, float, int]:
-    max_diff = 0.0
-    cells_checked = 0
-    ok = True
-    cli_days = {d["date"]: d for d in cli_doc["dailyBreakdown"]}
-    if set(cli_days.keys()) != set(ref_doc["days"].keys()):
-        return (False, 1.0, 0)
-
-    for d_key, r_day in ref_doc["days"].items():
-        c_day = cli_days[d_key]
-        for v in VENDORS:
-            cells_checked += 1
-            cv = c_day["vendors"][v]
-            rv = r_day["vendors"][v]
-            for c_field, r_field in (
-                ("totalTokens", "total"),
-                ("uncachedInputTokens", "in"),
-                ("cachedInputTokens", "cr"),
-                ("cacheWriteTokens", "cw"),
-                ("outputTokens", "out"),
-                ("recordCount", "records"),
-            ):
-                d = rel_diff(int(cv[c_field]), int(rv[r_field]))
-                max_diff = max(max_diff, d)
-                if d >= 0.01:
-                    ok = False
-    return (ok, max_diff, cells_checked)
-
-
-def seed_rich_14d_5vendor_fixture(home_dir: pathlib.Path, ws_dir: pathlib.Path, now_epoch: int) -> None:
-    c_dir = home_dir / ".claude" / "projects" / "-tmp-synth14"
-    x_dir = home_dir / ".codex"
-    o_dir = home_dir / ".local" / "share" / "opencode"
-    v_root = home_dir / ".vibe"
-    v_uni = v_root / "logs" / "session" / "unified" / "vibe-14d" / "journal"
-    r_dir = ws_dir / "pipe14" / ".relay"
-    r_vibe_exp = r_dir / "01-vibe.vibe"
-    for d in (c_dir, x_dir, o_dir, v_uni, r_vibe_exp):
-        d.mkdir(parents=True, exist_ok=True)
-
-    today_utc = dt.datetime.fromtimestamp(now_epoch, tz=dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    day0 = today_utc - dt.timedelta(days=13)
-
-    # 1. Claude JSONL across all 14 days (including 2-chunk streaming dedup + 1 unknown model per odd day)
-    c_lines: list[str] = []
-    for i in range(14):
-        ts = (day0 + dt.timedelta(days=i, hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        c_lines.append(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": ts,
-                    "sessionId": f"cs-{i // 3}",
-                    "requestId": f"crq-{i}-a",
-                    "message": {
-                        "id": f"cm-{i}-a",
-                        "model": "claude-sonnet-5-5",
-                        "usage": {
-                            "input_tokens": 1000 * (i + 1),
-                            "output_tokens": 100,
-                            "cache_read_input_tokens": 4000 * (i + 1),
-                            "cache_creation_input_tokens": 200,
-                        },
-                    },
-                }
+        roll_3d = thome / ".codex" / "rollout-3d.jsonl"
+        roll_3d.write_text(
+            "\n".join(
+                [
+                    '{"timestamp":"2026-11-13T10:00:00Z","type":"turn_context","payload":{"model":"gpt-6-luna"}}',
+                    '{"timestamp":"2026-11-13T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100000,"cached_input_tokens":80000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":105000}}}}',
+                    '{"timestamp":"2026-11-13T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100000,"cached_input_tokens":80000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":105000}}}}',
+                    '{"timestamp":"2026-11-14T10:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-14T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250000,"cached_input_tokens":200000,"cache_write_input_tokens":0,"output_tokens":12000,"total_tokens":262000}}}}',
+                    '{"timestamp":"2026-11-15T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":310000,"cached_input_tokens":240000,"cache_write_input_tokens":0,"output_tokens":15000,"total_tokens":325000}}}}',
+                ]
             )
+            + "\n",
+            encoding="utf-8",
         )
-        c_lines.append(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "timestamp": ts,
-                    "sessionId": f"cs-{i // 3}",
-                    "requestId": f"crq-{i}-a",
-                    "message": {
-                        "id": f"cm-{i}-a",
-                        "model": "claude-sonnet-5-5",
-                        "usage": {
-                            "input_tokens": 1000 * (i + 1),
-                            "output_tokens": 300 * (i + 1),
-                            "cache_read_input_tokens": 4000 * (i + 1),
-                            "cache_creation_input_tokens": 200,
-                        },
-                    },
-                }
+        cx = sqlite3.connect(str(thome / ".codex" / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th-3d', '/tmp/p', 325000, ?, 'gpt-6.1-sol', ?)", (t_upd_s, str(roll_3d)))
+        cx.commit()
+        cx.close()
+
+        oc = sqlite3.connect(str(thome / ".local" / "share" / "opencode" / "opencode.db"))
+        oc.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)"
+        )
+        oc.execute(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)"
+        )
+        oc.execute("INSERT INTO session_v2 VALUES ('ses-agg-12', '/tmp/p', 0.02, 4000, 500, 0, 12000, 0, 'deepseek-v4.1-flash', ?)", (t_d12_ms,))
+        oc.execute("INSERT INTO session_v2 VALUES ('oc-3d', '/tmp/p', 0.30, 30000, 10000, 0, 180000, 0, 'deepseek-v4.1-flash', ?)", (t_upd_s * 1000,))
+        oc_msgs = [
+            ("m1", "assistant", 1, t_d13_s * 1000, {"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.08, "time": {"created": t_d13_s * 1000}, "tokens": {"input": 8000, "output": 2000, "reasoning": 0, "cache": {"read": 40000, "write": 0}}}),
+            ("m2", "compaction", 2, t_d14_s * 1000, {"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.10, "time": {"created": t_d14_s * 1000}, "tokens": {"input": 10000, "output": 4500, "reasoning": 500, "cache": {"read": 65000, "write": 0}}}),
+            ("m3", "assistant", 3, t_d15_s * 1000, {"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.12, "time": {"created": t_d15_s * 1000}, "tokens": {"input": 12000, "output": 3000, "reasoning": 0, "cache": {"read": 75000, "write": 0}}}),
+        ]
+        for mid, rtype, seq_i, ms, payload in oc_msgs:
+            oc.execute("INSERT INTO session_message VALUES (?, 'oc-3d', ?, ?, ?, ?, ?)", (mid, rtype, seq_i, ms, ms, json.dumps(payload)))
+        oc.commit()
+        oc.close()
+
+        (v_jdir.parent / "meta.json").write_text(
+            '{"session_id":"vs-3d","start_time":"2026-11-13T10:00:00Z","config":{"active_model":"deepseek-v4-1-flash-1017"}}\n',
+            encoding="utf-8",
+        )
+        (v_jdir / "0000000000000001.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"sequence": 1, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": t_d13_s * 1000}}}}),
+                    '{"sequence":2,"type":"action_result","payload":{"action_id":"a1","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":12000,"cached_input_tokens":8000,"cache_write_tokens":0,"output_tokens":500,"total_tokens":12500}}}}}',
+                    json.dumps({"sequence": 3, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": t_d14_s * 1000}}}}),
+                    '{"sequence":4,"type":"action_result","payload":{"action_id":"a2","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":20000,"cached_input_tokens":15000,"cache_write_tokens":1000,"output_tokens":1000,"total_tokens":22000}}}}}',
+                ]
             )
+            + "\n",
+            encoding="utf-8",
         )
-        if i % 2 == 1:
-            c_lines.append(
+        (v_jdir / "0000000000000020.jsonl").write_text(
+            "\n".join(
+                [
+                    '{"sequence":20,"type":"action_result","payload":{"action_id":"a2","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":20000,"cached_input_tokens":15000,"cache_write_tokens":1000,"output_tokens":1000,"total_tokens":22000}}}}}',
+                    json.dumps({"sequence": 21, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": t_d15_s * 1000}}}}),
+                    '{"sequence":22,"type":"action_result","payload":{"action_id":"a3","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":30000,"cached_input_tokens":25000,"cache_write_tokens":0,"output_tokens":1000,"total_tokens":31000}}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (r_vibe / "export.json").write_text('{"session_id":"vs-3d"}\n', encoding="utf-8")
+        (r_vibe.parent / "LOG.md").write_text(
+            "# Agent Relay Log\n\n## 01-vibe: ok, 35s, 2026-11-15 11:00\n- vibe: model deepseek-v4-1-flash-1017, tokens 99,999, cost $0.25\n",
+            encoding="utf-8",
+        )
+
+        doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso],
+        )
+        by_day = {d["date"]: d for d in doc["dailyBreakdown"]}
+        errs: list[str] = []
+        max_d = 0.0
+        for d_key, v_map in EXPECTED_ROW1A_BY_DAY.items():
+            for v_id, exp_t in v_map.items():
+                d = assert_vendor_cell(by_day[d_key]["vendors"][v_id], exp_t, f"Row1a[{d_key}].{v_id}", errs)
+                max_d = max(max_d, d)
+        if doc["vendors"]["codex"]["completeness"] != "complete":
+            errs.append(f"codex completeness={doc['vendors']['codex']['completeness']}")
+        if doc["vendors"]["vibe"]["completeness"] != "complete":
+            errs.append(f"vibe completeness={doc['vendors']['vibe']['completeness']}")
+
+        row1a_ok = len(errs) == 0
+        row1a_msg = (
+            f"Codex=[105k, 157k, 63k], OpenCode=[16.5k(fb), 50k, 80k, 90k], Vibe=[12.5k, 22k, 31k], max_diff={max_d:.4%}"
+            if row1a_ok
+            else "; ".join(errs[:5])
+        )
+
+    # Subcheck Row 1b: Archived Codex .jsonl.zst cross-day rollout
+    zstd_bin = resolve_zstd_bin()
+    if zstd_bin is None:
+        return (
+            row1a_ok,
+            row1a_msg,
+            None,
+            "zstd binary not installed on host; .jsonl.zst subcheck skipped (not counted as passed)",
+        )
+
+    # Hand-calculated literal expected dictionary for Row 1b (.jsonl.zst):
+    EXPECTED_ROW1B_ZST: dict[str, tuple[int, int, int, int, int, int]] = {
+        # Day 2026-11-14 cumulative (in=35k, cr=25k, out=5k) -> uncached=10k, cr=25k, out=5k, total=40k
+        "2026-11-14": (10_000, 25_000, 0, 5_000, 40_000, 1),
+        # Day 2026-11-15 cumulative (in=80k, cr=55k, out=10k) -> uncached_cum=25k;
+        # delta = (25k-10k=15k, 55k-25k=30k, 0, 10k-5k=5k) -> total=50k; 40k + 50k = 90,000 == sqlite
+        "2026-11-15": (15_000, 30_000, 0, 5_000, 50_000, 1),
+    }
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row1b-zst-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        (thome / ".codex").mkdir(parents=True)
+        tws.mkdir(parents=True)
+
+        plain_roll = thome / ".codex" / "rollout-2d.jsonl"
+        plain_roll.write_text(
+            "\n".join(
+                [
+                    '{"timestamp":"2026-11-14T11:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-14T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":35000,"cached_input_tokens":25000,"cache_write_input_tokens":0,"output_tokens":5000,"total_tokens":40000}}}}',
+                    '{"timestamp":"2026-11-15T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80000,"cached_input_tokens":55000,"cache_write_input_tokens":0,"output_tokens":10000,"total_tokens":90000}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run([zstd_bin, "-q", "-f", str(plain_roll)], check=True)
+        plain_roll.unlink()  # Only rollout-2d.jsonl.zst remains on disk
+
+        cx = sqlite3.connect(str(thome / ".codex" / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th-2d-zst', '/tmp/p', 90000, ?, 'gpt-6.1-sol', ?)", (t_upd_s, str(plain_roll)))
+        cx.commit()
+        cx.close()
+
+        zst_doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso],
+        )
+        nozst_doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "UTC", "--no-zstd", "--home", str(thome), "--workspace", str(tws), "--now", now_iso],
+        )
+        z_days = {d["date"]: d for d in zst_doc["dailyBreakdown"]}
+        z_errs: list[str] = []
+        for dk, exp_t in EXPECTED_ROW1B_ZST.items():
+            assert_vendor_cell(z_days[dk]["vendors"]["codex"], exp_t, f"Row1b[{dk}].codex", z_errs)
+        if zst_doc["vendors"]["codex"]["completeness"] != "complete":
+            z_errs.append(f"zst completeness={zst_doc['vendors']['codex']['completeness']}")
+        if nozst_doc["vendors"]["codex"]["completeness"] != "totalOnly":
+            z_errs.append(f"--no-zstd completeness={nozst_doc['vendors']['codex']['completeness']}")
+        if nozst_doc["vendors"]["codex"]["windows"]["thirtyDays"]["totalTokens"] != 90_000:
+            z_errs.append("--no-zstd 30d totalTokens != 90000")
+
+        zst_ok = len(z_errs) == 0
+        zst_msg = "Codex .jsonl.zst=[40k, 50k] complete & --no-zstd=totalOnly(90k)" if zst_ok else "; ".join(z_errs)
+        return (row1a_ok, row1a_msg, zst_ok, zst_msg)
+
+
+# ===========================================================================
+# Check 2: 14-Day x 5-Vendor Complete 70-Cell Daily Ledger (Literal Expected Table)
+# ===========================================================================
+
+
+def verify_row2_14d_70cells(bin_path: pathlib.Path) -> tuple[bool, str]:
+    """
+    Verifies all 14 days (2026-11-02 .. 2026-11-15) x 5 vendors = 70 cells against an explicit,
+    hand-calculated literal dictionary placed right beside the fixture. Zero self-authored collector logic.
+    """
+    now_iso = "2026-11-15T18:00:00Z"
+    ZERO = (0, 0, 0, 0, 0, 0)
+
+    # Explicit hand-calculated 70-cell table: date -> vendor -> (in, cr, cw, out, total, records)
+    EXPECTED_70_CELLS: dict[str, dict[str, tuple[int, int, int, int, int, int]]] = {
+        "2026-11-02": {
+            # Claude streaming 2-chunk max(out 100, 300)=300: 1000 + 4000 + 200 + 300 = 5,500
+            "claude": (1_000, 4_000, 200, 300, 5_500, 1),
+            # Codex missing-rollout fallback thread th-fb-02 (tokens_used=9,000 -> unsplit totalOnly: breakdown=0s, total=9000)
+            "codex": (0, 0, 0, 0, 9_000, 1),
+            # OpenCode session_v2-only fallback ses-fb-02: 3000 + 9000 + 0 + 600 = 12,600
+            "opencode": (3_000, 9_000, 0, 600, 12_600, 1),
+            # Vibe journal seg1 va-02 (in=7000, cr=5000 -> uncached=2000, cw=100, out=400): 2000+5000+100+400 = 7,500
+            "vibe": (2_000, 5_000, 100, 400, 7_500, 1),
+            # AGY .relay/LOG.md step 02-agy (unsplit tokens 50,000)
+            "agy": (0, 0, 0, 0, 50_000, 1),
+        },
+        "2026-11-03": {
+            # Claude turn (2000 + 5000 + 0 + 400 = 7,400) + unknown model (500 + 0 + 0 + 50 = 550) -> 7,950 (2 records)
+            "claude": (2_500, 5_000, 0, 450, 7_950, 2),
+            # Codex th-long turn 1: uncached=5000, cr=15000, cw=0, out=1000 -> 21,000
+            "codex": (5_000, 15_000, 0, 1_000, 21_000, 1),
+            "opencode": ZERO,
+            "vibe": ZERO,
+            "agy": ZERO,
+        },
+        "2026-11-04": {
+            "claude": ZERO,
+            # Codex th-long turn 2 delta: uncached=6000, cr=20000, cw=0, out=1500 -> 27,500
+            "codex": (6_000, 20_000, 0, 1_500, 27_500, 1),
+            # OpenCode msg om-04: 4000 + 16000 + 100 + 800 = 20,900
+            "opencode": (4_000, 16_000, 100, 800, 20_900, 1),
+            "vibe": ZERO,
+            # AGY .relay/LOG.md step 04-agy: 60,000
+            "agy": (0, 0, 0, 0, 60_000, 1),
+        },
+        "2026-11-05": {
+            # Claude: 3000 + 6000 + 300 + 500 = 9,800
+            "claude": (3_000, 6_000, 300, 500, 9_800, 1),
+            "codex": ZERO,
+            "opencode": ZERO,
+            # Vibe journal seg1 va-05 (in=9000, cr=6000 -> uncached=3000, cw=0, out=500): 9,500
+            "vibe": (3_000, 6_000, 0, 500, 9_500, 1),
+            "agy": ZERO,
+        },
+        "2026-11-06": {
+            "claude": ZERO,
+            # Codex th-long counter reset (new segment cumulative smaller than prev!):
+            # uncached=4000, cr=10000, cw=0, out=800 -> 14,800
+            "codex": (4_000, 10_000, 0, 800, 14_800, 1),
+            # OpenCode msg om-06 (compaction): 5000 + 20000 + 0 + (900+100=1000) = 26,000
+            "opencode": (5_000, 20_000, 0, 1_000, 26_000, 1),
+            "vibe": ZERO,
+            "agy": ZERO,
+        },
+        "2026-11-07": {
+            # Claude: 4000 + 8000 + 0 + 600 = 12,600
+            "claude": (4_000, 8_000, 0, 600, 12_600, 1),
+            "codex": ZERO,
+            "opencode": ZERO,
+            # Vibe unlinked .relay/LOG.md step 07-vibe (unsplit tokens 18,000)
+            "vibe": (0, 0, 0, 0, 18_000, 1),
+            # AGY .relay/LOG.md step 07-agy: 70,000
+            "agy": (0, 0, 0, 0, 70_000, 1),
+        },
+        "2026-11-08": {
+            "claude": ZERO,
+            # Codex th-long post-reset delta: uncached=7000, cr=18000, cw=0, out=1200 -> 26,200
+            "codex": (7_000, 18_000, 0, 1_200, 26_200, 1),
+            # OpenCode msg om-08: 6000 + 24000 + 200 + 1100 = 31,300
+            "opencode": (6_000, 24_000, 200, 1_100, 31_300, 1),
+            "vibe": ZERO,
+            "agy": ZERO,
+        },
+        "2026-11-09": {
+            # Claude: 5000 + 10000 + 400 + 700 = 16,100
+            "claude": (5_000, 10_000, 400, 700, 16_100, 1),
+            "codex": ZERO,
+            "opencode": ZERO,
+            # Vibe journal seg2 va-09 (in=11000, cr=7500 -> uncached=3500, cw=200, out=600): 11,800
+            "vibe": (3_500, 7_500, 200, 600, 11_800, 1),
+            "agy": ZERO,
+        },
+        "2026-11-10": {
+            "claude": ZERO,
+            "codex": ZERO,
+            # OpenCode msg om-10: 7000 + 28000 + 0 + 1400 = 36,400
+            "opencode": (7_000, 28_000, 0, 1_400, 36_400, 1),
+            "vibe": ZERO,
+            # AGY .relay/LOG.md step 10-agy: 80,000
+            "agy": (0, 0, 0, 0, 80_000, 1),
+        },
+        "2026-11-11": {
+            # Claude: 6000 + 12000 + 0 + 800 = 18,800
+            "claude": (6_000, 12_000, 0, 800, 18_800, 1),
+            # Codex th-long delta: uncached=8000, cr=22000, cw=0, out=1600 -> 31,600
+            "codex": (8_000, 22_000, 0, 1_600, 31_600, 1),
+            "opencode": ZERO,
+            "vibe": ZERO,
+            "agy": ZERO,
+        },
+        "2026-11-12": {
+            "claude": ZERO,
+            "codex": ZERO,
+            # OpenCode msg om-12: 8000 + 32000 + 300 + 1600 = 41,900
+            "opencode": (8_000, 32_000, 300, 1_600, 41_900, 1),
+            # Vibe journal seg2 va-12 (in=14000, cr=10000 -> uncached=4000, cw=0, out=700): 14,700
+            "vibe": (4_000, 10_000, 0, 700, 14_700, 1),
+            "agy": ZERO,
+        },
+        "2026-11-13": {
+            # Claude: 7000 + 14000 + 500 + 900 = 22,400
+            "claude": (7_000, 14_000, 500, 900, 22_400, 1),
+            "codex": ZERO,
+            "opencode": ZERO,
+            "vibe": ZERO,
+            # AGY .relay/LOG.md step 13-agy: 90,000
+            "agy": (0, 0, 0, 0, 90_000, 1),
+        },
+        "2026-11-14": {
+            "claude": ZERO,
+            # Codex th-long delta: uncached=9000, cr=25000, cw=0, out=1900 -> 35,900
+            "codex": (9_000, 25_000, 0, 1_900, 35_900, 1),
+            # OpenCode msg om-14: 9000 + 36000 + 0 + 1800 = 46,800
+            "opencode": (9_000, 36_000, 0, 1_800, 46_800, 1),
+            "vibe": ZERO,
+            "agy": ZERO,
+        },
+        "2026-11-15": {
+            # Claude: 8000 + 16000 + 600 + 1000 = 25,600
+            "claude": (8_000, 16_000, 600, 1_000, 25_600, 1),
+            # Codex th-long final delta: uncached=10000, cr=30000, cw=0, out=2000 -> 42,000
+            # th-long total across both reset segments = (21000+27500) + (14800+26200+31600+35900+42000) = 48500 + 150500 = 199,000 == sqlite
+            "codex": (10_000, 30_000, 0, 2_000, 42_000, 1),
+            # OpenCode msg om-15: 10000 + 40000 + 400 + 2000 = 52,400
+            "opencode": (10_000, 40_000, 400, 2_000, 52_400, 1),
+            # Vibe journal seg2 va-15 (in=16000, cr=11000 -> uncached=5000, cw=300, out=800): 17,100
+            "vibe": (5_000, 11_000, 300, 800, 17_100, 1),
+            # AGY .relay/LOG.md step 15-agy: 100,000 (cli-*.log contributes 0 tokens!)
+            "agy": (0, 0, 0, 0, 100_000, 1),
+        },
+    }
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row2-70cells-") as tmpdir:
+        shome = pathlib.Path(tmpdir) / "home"
+        sws = pathlib.Path(tmpdir) / "ws"
+        c_dir = shome / ".claude" / "projects" / "-tmp-14d"
+        x_dir = shome / ".codex"
+        o_dir = shome / ".local" / "share" / "opencode"
+        v_jdir = shome / ".vibe" / "logs" / "session" / "unified" / "vibe-14d" / "journal"
+        agy_log_dir = shome / ".gemini" / "antigravity-cli" / "log"
+        r_dir = sws / "pipe14" / ".relay" / "01-vibe-linked.vibe"
+        for d in (c_dir, x_dir, o_dir, v_jdir, agy_log_dir, r_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # 1. Claude JSONL
+        (c_dir / "s14.jsonl").write_text(
+            "\n".join(
+                [
+                    # 2026-11-02: 2 streaming chunks for (cm-02, crq-02) -> max out=300
+                    '{"type":"assistant","timestamp":"2026-11-02T10:00:00Z","sessionId":"cs1","requestId":"crq-02","message":{"id":"cm-02","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":4000,"cache_creation_input_tokens":200}}}',
+                    '{"type":"assistant","timestamp":"2026-11-02T10:00:01Z","sessionId":"cs1","requestId":"crq-02","message":{"id":"cm-02","model":"claude-sonnet-5-5","usage":{"input_tokens":1000,"output_tokens":300,"cache_read_input_tokens":4000,"cache_creation_input_tokens":200}}}',
+                    # 2026-11-03: priced + unknown model
+                    '{"type":"assistant","timestamp":"2026-11-03T10:00:00Z","sessionId":"cs1","requestId":"crq-03a","message":{"id":"cm-03a","model":"claude-sonnet-5-5","usage":{"input_tokens":2000,"output_tokens":400,"cache_read_input_tokens":5000,"cache_creation_input_tokens":0}}}',
+                    '{"type":"assistant","timestamp":"2026-11-03T10:05:00Z","sessionId":"cs1","requestId":"crq-03u","message":{"id":"cm-03u","model":"claude-fable-5-1","usage":{"input_tokens":500,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}',
+                    # 2026-11-05, 07, 09, 11, 13, 15
+                    '{"type":"assistant","timestamp":"2026-11-05T10:00:00Z","sessionId":"cs2","requestId":"crq-05","message":{"id":"cm-05","model":"claude-sonnet-5-5","usage":{"input_tokens":3000,"output_tokens":500,"cache_read_input_tokens":6000,"cache_creation_input_tokens":300}}}',
+                    '{"type":"assistant","timestamp":"2026-11-07T10:00:00Z","sessionId":"cs2","requestId":"crq-07","message":{"id":"cm-07","model":"claude-sonnet-5-5","usage":{"input_tokens":4000,"output_tokens":600,"cache_read_input_tokens":8000,"cache_creation_input_tokens":0}}}',
+                    '{"type":"assistant","timestamp":"2026-11-09T10:00:00Z","sessionId":"cs3","requestId":"crq-09","message":{"id":"cm-09","model":"claude-sonnet-5-5","usage":{"input_tokens":5000,"output_tokens":700,"cache_read_input_tokens":10000,"cache_creation_input_tokens":400}}}',
+                    '{"type":"assistant","timestamp":"2026-11-11T10:00:00Z","sessionId":"cs3","requestId":"crq-11","message":{"id":"cm-11","model":"claude-sonnet-5-5","usage":{"input_tokens":6000,"output_tokens":800,"cache_read_input_tokens":12000,"cache_creation_input_tokens":0}}}',
+                    '{"type":"assistant","timestamp":"2026-11-13T10:00:00Z","sessionId":"cs4","requestId":"crq-13","message":{"id":"cm-13","model":"claude-sonnet-5-5","usage":{"input_tokens":7000,"output_tokens":900,"cache_read_input_tokens":14000,"cache_creation_input_tokens":500}}}',
+                    '{"type":"assistant","timestamp":"2026-11-15T10:00:00Z","sessionId":"cs4","requestId":"crq-15","message":{"id":"cm-15","model":"claude-sonnet-5-5","usage":{"input_tokens":8000,"output_tokens":1000,"cache_read_input_tokens":16000,"cache_creation_input_tokens":600}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # 2. Codex: th-fb-02 (missing rollout on 2026-11-02) + th-long (with counter reset on 2026-11-06)
+        roll_long = x_dir / "rollout-long.jsonl"
+        roll_long.write_text(
+            "\n".join(
+                [
+                    # Segment 1 before counter reset:
+                    # 2026-11-03: uncached=5k, cr=15k, out=1k -> cum in=20k, cr=15k, out=1k, tot=21k
+                    '{"timestamp":"2026-11-03T11:00:00Z","type":"turn_context","payload":{"model":"gpt-6-luna"}}',
+                    '{"timestamp":"2026-11-03T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":15000,"cache_write_input_tokens":0,"output_tokens":1000,"total_tokens":21000}}}}',
+                    # 2026-11-04: +uncached=6k(11k), +cr=20k(35k), +out=1.5k(2.5k) -> cum in=46k, cr=35k, out=2.5k, tot=48.5k
+                    '{"timestamp":"2026-11-04T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":46000,"cached_input_tokens":35000,"cache_write_input_tokens":0,"output_tokens":2500,"total_tokens":48500}}}}',
+                    # Segment 2 after counter reset on 2026-11-06 (cumulative drops below previous!):
+                    # 2026-11-06: uncached=4k, cr=10k, out=800 -> cum in=14k, cr=10k, out=800, tot=14.8k
+                    '{"timestamp":"2026-11-06T11:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-06T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":14000,"cached_input_tokens":10000,"cache_write_input_tokens":0,"output_tokens":800,"total_tokens":14800}}}}',
+                    # 2026-11-08: +uncached=7k(11k), +cr=18k(28k), +out=1.2k(2k) -> cum in=39k, cr=28k, out=2k, tot=41k
+                    '{"timestamp":"2026-11-08T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":39000,"cached_input_tokens":28000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":41000}}}}',
+                    # 2026-11-11: +uncached=8k(19k), +cr=22k(50k), +out=1.6k(3.6k) -> cum in=69k, cr=50k, out=3.6k, tot=72.6k
+                    '{"timestamp":"2026-11-11T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":69000,"cached_input_tokens":50000,"cache_write_input_tokens":0,"output_tokens":3600,"total_tokens":72600}}}}',
+                    # 2026-11-14: +uncached=9k(28k), +cr=25k(75k), +out=1.9k(5.5k) -> cum in=103k, cr=75k, out=5.5k, tot=108.5k
+                    '{"timestamp":"2026-11-14T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":103000,"cached_input_tokens":75000,"cache_write_input_tokens":0,"output_tokens":5500,"total_tokens":108500}}}}',
+                    # 2026-11-15: +uncached=10k(38k), +cr=30k(105k), +out=2k(7.5k) -> cum in=143k, cr=105k, out=7.5k, tot=150.5k
+                    '{"timestamp":"2026-11-15T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":143000,"cached_input_tokens":105000,"cache_write_input_tokens":0,"output_tokens":7500,"total_tokens":150500}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cx = sqlite3.connect(str(x_dir / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute(
+            "INSERT INTO threads VALUES ('th-fb-02', '/tmp/p', 9000, ?, 'gpt-6-luna', '/nonexistent/missing-02.jsonl')",
+            (iso_to_epoch_s("2026-11-02T12:00:00Z"),),
+        )
+        cx.execute(
+            "INSERT INTO threads VALUES ('th-long', '/tmp/p', 199000, ?, 'gpt-6.1-sol', ?)",
+            (iso_to_epoch_s("2026-11-15T12:00:00Z"), str(roll_long)),
+        )
+        cx.commit()
+        cx.close()
+
+        # 3. OpenCode: ses-fb-02 (fallback on 2026-11-02) + ses-msgs across 04, 06, 08, 10, 12, 14, 15
+        oc = sqlite3.connect(str(o_dir / "opencode.db"))
+        oc.execute(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)"
+        )
+        oc.execute(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)"
+        )
+        oc.execute(
+            "INSERT INTO session_v2 VALUES ('ses-fb-02', '/tmp/p', 0.03, 3000, 600, 0, 9000, 0, 'deepseek-v4.1-flash', ?)",
+            (iso_to_epoch_ms("2026-11-02T09:00:00Z"),),
+        )
+        oc.execute(
+            "INSERT INTO session_v2 VALUES ('ses-msgs', '/tmp/p', 0.50, 49000, 9700, 0, 196000, 1000, 'deepseek-v4.1-flash', ?)",
+            (iso_to_epoch_ms("2026-11-15T15:00:00Z"),),
+        )
+        oc_rows = [
+            ("om-04", "assistant", 1, "2026-11-04T09:30:00Z", 4000, 800, 0, 16000, 100),
+            ("om-06", "compaction", 2, "2026-11-06T09:30:00Z", 5000, 900, 100, 20000, 0),
+            ("om-08", "assistant", 3, "2026-11-08T09:30:00Z", 6000, 1100, 0, 24000, 200),
+            ("om-10", "assistant", 4, "2026-11-10T09:30:00Z", 7000, 1400, 0, 28000, 0),
+            ("om-12", "assistant", 5, "2026-11-12T09:30:00Z", 8000, 1600, 0, 32000, 300),
+            ("om-14", "assistant", 6, "2026-11-14T09:30:00Z", 9000, 1800, 0, 36000, 0),
+            ("om-15", "assistant", 7, "2026-11-15T09:30:00Z", 10000, 2000, 0, 40000, 400),
+        ]
+        for mid, rtype, seq_i, ts_s, tin, tout, treas, tcr, tcw in oc_rows:
+            ms = iso_to_epoch_ms(ts_s)
+            data = {
+                "model": {"id": "deepseek-v4.1-flash"},
+                "cost": 0.05,
+                "time": {"created": ms},
+                "tokens": {"input": tin, "output": tout, "reasoning": treas, "cache": {"read": tcr, "write": tcw}},
+            }
+            oc.execute("INSERT INTO session_message VALUES (?, 'ses-msgs', ?, ?, ?, ?, ?)", (mid, rtype, seq_i, ms, ms, json.dumps(data)))
+        oc.commit()
+        oc.close()
+
+        # 4. Vibe: 2 journal segments + 1 linked export.json (deduped) + 1 unlinked relay step on 2026-11-07
+        (shome / ".vibe" / "config.toml").write_text('active_model = "deepseek-v4-1-flash-1017"\n', encoding="utf-8")
+        (v_jdir.parent / "meta.json").write_text('{"session_id":"vibe-14d","start_time":"2026-11-02T08:00:00Z","config":{}}\n', encoding="utf-8")
+        (v_jdir / "0000000000000001.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"sequence": 1, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-02T08:00:00Z")}}}}),
+                    '{"sequence":2,"type":"action_result","payload":{"action_id":"va-02","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":7000,"cached_input_tokens":5000,"cache_write_tokens":100,"output_tokens":400,"total_tokens":7500}}}}}',
+                    json.dumps({"sequence": 3, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-05T08:00:00Z")}}}}),
+                    '{"sequence":4,"type":"action_result","payload":{"action_id":"va-05","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":9000,"cached_input_tokens":6000,"cache_write_tokens":0,"output_tokens":500,"total_tokens":9500}}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (v_jdir / "0000000000000050.jsonl").write_text(
+            "\n".join(
+                [
+                    # Replay va-05 across segment boundary -> must be deduplicated
+                    '{"sequence":50,"type":"action_result","payload":{"action_id":"va-05","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":9000,"cached_input_tokens":6000,"cache_write_tokens":0,"output_tokens":500,"total_tokens":9500}}}}}',
+                    json.dumps({"sequence": 51, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-09T08:00:00Z")}}}}),
+                    '{"sequence":52,"type":"action_result","payload":{"action_id":"va-09","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":11000,"cached_input_tokens":7500,"cache_write_tokens":200,"output_tokens":600,"total_tokens":11800}}}}}',
+                    json.dumps({"sequence": 53, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-12T08:00:00Z")}}}}),
+                    '{"sequence":54,"type":"action_result","payload":{"action_id":"va-12","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":14000,"cached_input_tokens":10000,"cache_write_tokens":0,"output_tokens":700,"total_tokens":14700}}}}}',
+                    json.dumps({"sequence": 55, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-15T08:00:00Z")}}}}),
+                    '{"sequence":56,"type":"action_result","payload":{"action_id":"va-15","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":16000,"cached_input_tokens":11000,"cache_write_tokens":300,"output_tokens":800,"total_tokens":17100}}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (r_dir / "export.json").write_text('{"session_id":"vibe-14d"}\n', encoding="utf-8")
+
+        # 5. Antigravity cli-*.log (active model only, 0 tokens) + .relay/LOG.md
+        (agy_log_dir / "cli-1.log").write_text('INFO override to backend: label="gemini-4-carbon-high"\n', encoding="utf-8")
+        (r_dir.parent / "LOG.md").write_text(
+            "\n".join(
+                [
+                    "# Agent Relay Log",
+                    "",
+                    "## 01-vibe-linked: ok, 30s, 2026-11-15 08:05",
+                    "- vibe: model deepseek-v4-1-flash-1017, tokens 77,777, cost $0.20",
+                    "",
+                    "## 02-agy: ok, 40s, 2026-11-02 14:00",
+                    "- agy: model gemini-4-carbon-high, tokens 50,000",
+                    "",
+                    "## 04-agy: ok, 40s, 2026-11-04 14:00",
+                    "- agy: model gemini-4-carbon-high, tokens 60,000",
+                    "",
+                    "## 07-vibe: ok, 25s, 2026-11-07 13:00",
+                    "- vibe: model deepseek-v4-1-flash-1017, tokens 18,000, cost $0.04",
+                    "",
+                    "## 07-agy: ok, 40s, 2026-11-07 14:00",
+                    "- agy: model gemini-4-carbon-high, tokens 70,000",
+                    "",
+                    "## 10-agy: ok, 40s, 2026-11-10 14:00",
+                    "- agy: model gemini-4-carbon-high, tokens 80,000",
+                    "",
+                    "## 13-agy: ok, 40s, 2026-11-13 14:00",
+                    "- agy: model gemini-4-carbon-high, tokens 90,000",
+                    "",
+                    "## 15-agy: ok, 40s, 2026-11-15 14:00:30",
+                    "- agy: model gemini-4-carbon-high, tokens 100,000",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        daily_doc = run_cli_json(
+            bin_path,
+            "daily",
+            ["--lang", "en", "--tz", "UTC", "--home", str(shome), "--workspace", str(sws), "--now", now_iso],
+        )
+        cli_days = {d["date"]: d for d in daily_doc["dailyBreakdown"]}
+        errs: list[str] = []
+        if set(cli_days.keys()) != set(EXPECTED_70_CELLS.keys()):
+            return (False, f"date keys mismatch: got={sorted(cli_days.keys())}")
+
+        max_d = 0.0
+        cells = 0
+        for dk, v_map in EXPECTED_70_CELLS.items():
+            row_tot_exp = sum(t[4] for t in v_map.values())
+            row_rec_exp = sum(t[5] for t in v_map.values())
+            if int(cli_days[dk]["totalTokens"]) != row_tot_exp:
+                errs.append(f"{dk}.totalTokens: got={cli_days[dk]['totalTokens']}, expected={row_tot_exp}")
+            if int(cli_days[dk]["recordCount"]) != row_rec_exp:
+                errs.append(f"{dk}.recordCount: got={cli_days[dk]['recordCount']}, expected={row_rec_exp}")
+            for v_id in VENDORS:
+                cells += 1
+                d = assert_vendor_cell(cli_days[dk]["vendors"][v_id], v_map[v_id], f"Row2[{dk}].{v_id}", errs)
+                max_d = max(max_d, d)
+
+        ok = len(errs) == 0 and max_d == 0.0
+        msg = (
+            f"{cells}/70 day x vendor cells matched literal hand-calculated ledger with max_diff={max_d:.4%}"
+            if ok
+            else "; ".join(errs[:6])
+        )
+        return (ok, msg)
+
+
+# ===========================================================================
+# Check 3 (Row 3 + BR3): Rolling fiveHours [now - 5h, now] & Exact Second Boundaries
+# ===========================================================================
+
+
+def verify_row3_and_br3_exact_boundaries(bin_path: pathlib.Path) -> tuple[bool, str]:
+    """
+    Places events at exact 1-second boundary offsets around thirtyDaysAgo, sevenDaysAgo,
+    prevDayStart, startOfToday, fiveHoursAgo, and now (with session updated_at = 10m ago).
+    """
+    # Frozen now = 2026-11-15T12:00:00Z
+    #   thirtyDaysAgo = 2026-10-16T12:00:00Z
+    #   sevenDaysAgo  = 2026-11-08T12:00:00Z
+    #   prevDayStart  = 2026-11-14T00:00:00Z
+    #   startOfToday  = 2026-11-15T00:00:00Z (== nextDayStart of 2026-11-14)
+    #   fiveHoursAgo  = 2026-11-15T07:00:00Z (now - 18,000s)
+    now_iso = "2026-11-15T12:00:00Z"
+    upd_10m_s = iso_to_epoch_s("2026-11-15T11:50:00Z")
+
+    # Hand-calculated literal expected values:
+    EXPECTED_CLAUDE_WINDOWS = {
+        # fiveHours [07:00:00Z, 12:00:00Z]: 256,000 + 512,000 = 768,000 (excludes 128k at 06:59:59Z & 1,024k at 12:00:01Z)
+        "fiveHours": (768_000, 2),
+        # today [00:00:00Z, 12:00:00Z]: 64,000 + 128,000 + 256,000 + 512,000 = 960,000 (excludes 32k at 23:59:59Z)
+        "today": (960_000, 4),
+        # sevenDays [2026-11-08T12:00:00Z, 12:00:00Z]: 8,000 + 16,000 + 32,000 + 960,000 = 1,016,000 (excludes 4k at 11:59:59Z)
+        "sevenDays": (1_016_000, 7),
+        # thirtyDays [2026-10-16T12:00:00Z, 12:00:00Z]: 2,000 + 4,000 + 1,016,000 = 1,022,000 (excludes 1k at 11:59:59Z)
+        "thirtyDays": (1_022_000, 9),
+    }
+    EXPECTED_CLAUDE_DAYS = {
+        "2026-11-13": 0,       # Must NOT get prevDayStart (16,000)
+        "2026-11-14": 48_000,  # 16,000 + 32,000 = 48,000 (Must NOT get startOfToday = 64,000)
+        "2026-11-15": 960_000, # 64,000 + 128,000 + 256,000 + 512,000 = 960,000 (excludes future 1,024,000)
+    }
+    EXPECTED_OTHER_5H = {
+        # Each vendor has 1 turn at 06:59:59Z (fiveHoursAgo - 1s, excluded) and 1 turn at 07:00:00Z (fiveHoursAgo, included)
+        "codex": 40_000,     # excludes 50k at 06:59:59Z, includes 40k delta at 07:00:00Z
+        "opencode": 30_000,  # excludes 25k at 06:59:59Z, includes 30k at 07:00:00Z
+        "vibe": 9_000,       # excludes 15k at 06:59:59Z, includes 9k at 07:00:00Z
+    }
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row3-br3-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        c_p = thome / ".claude" / "projects" / "-tmp-br3"
+        x_p = thome / ".codex"
+        o_p = thome / ".local" / "share" / "opencode"
+        v_p = thome / ".vibe" / "logs" / "session" / "unified" / "v-5h" / "journal"
+        for d in (c_p, x_p, o_p, v_p, tws):
+            d.mkdir(parents=True, exist_ok=True)
+
+        claude_events = [
+            ("2026-10-16T11:59:59Z", 1_000),
+            ("2026-10-16T12:00:00Z", 2_000),
+            ("2026-11-08T11:59:59Z", 4_000),
+            ("2026-11-08T12:00:00Z", 8_000),
+            ("2026-11-14T00:00:00Z", 16_000),
+            ("2026-11-14T23:59:59Z", 32_000),
+            ("2026-11-15T00:00:00Z", 64_000),
+            ("2026-11-15T06:59:59Z", 128_000),
+            ("2026-11-15T07:00:00Z", 256_000),
+            ("2026-11-15T12:00:00Z", 512_000),
+            ("2026-11-15T12:00:01Z", 1_024_000),
+        ]
+        (c_p / "br3.jsonl").write_text(
+            "\n".join(
                 json.dumps(
                     {
                         "type": "assistant",
-                        "timestamp": ts,
-                        "sessionId": f"cs-{i // 3}",
-                        "requestId": f"crq-{i}-u",
-                        "message": {
-                            "id": f"cm-{i}-u",
-                            "model": "claude-fable-5-1",
-                            "usage": {"input_tokens": 500, "output_tokens": 50},
-                        },
+                        "timestamp": ts_s,
+                        "sessionId": "s-br3",
+                        "requestId": f"rq-{i}",
+                        "message": {"id": f"m-{i}", "model": "claude-sonnet-5-5", "usage": {"input_tokens": tok, "output_tokens": 0}},
                     }
                 )
+                for i, (ts_s, tok) in enumerate(claude_events)
             )
-    (c_dir / "s14.jsonl").write_text("\n".join(c_lines) + "\n", encoding="utf-8")
-
-    # 2. Codex single cross-day rollout spanning all 14 days (with duplicate zero-delta events & turn_context model switch)
-    roll_p = x_dir / "rollout-14d.jsonl"
-    x_lines: list[str] = []
-    cum_in = cum_cr = cum_out = 0
-    for i in range(14):
-        ts = (day0 + dt.timedelta(days=i, hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        model = "gpt-6-luna" if i < 7 else "gpt-6.1-sol"
-        x_lines.append(json.dumps({"timestamp": ts, "type": "turn_context", "payload": {"model": model}}))
-        d_unc = 1500 * (i + 1)
-        d_cr = 6000 * (i + 1)
-        d_out = 250 * (i + 1)
-        cum_in += d_unc + d_cr
-        cum_cr += d_cr
-        cum_out += d_out
-        tot = cum_in + cum_out
-        ev = {
-            "timestamp": ts,
-            "type": "event_msg",
-            "payload": {
-                "type": "token_count",
-                "info": {
-                    "total_token_usage": {
-                        "input_tokens": cum_in,
-                        "cached_input_tokens": cum_cr,
-                        "cache_write_input_tokens": 0,
-                        "output_tokens": cum_out,
-                        "total_tokens": tot,
-                    }
-                },
-            },
-        }
-        x_lines.append(json.dumps(ev))
-        if i % 4 == 0:
-            x_lines.append(json.dumps(ev))  # duplicate consecutive zero-delta event
-    roll_p.write_text("\n".join(x_lines) + "\n", encoding="utf-8")
-
-    cx_conn = sqlite3.connect(str(x_dir / "state_5.sqlite"))
-    cx_conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
-    cx_conn.execute("INSERT INTO threads VALUES ('th-14d', '/tmp/p', ?, ?, 'gpt-6.1-sol', ?)", (cum_in + cum_out, now_epoch - 120, str(roll_p)))
-    cx_conn.commit()
-    cx_conn.close()
-
-    # 3. OpenCode cross-day session_message across days 1..13 + fallback session_v2 on day 0
-    oc_conn = sqlite3.connect(str(o_dir / "opencode.db"))
-    oc_conn.execute(
-        "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)"
-    )
-    oc_conn.execute(
-        "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)"
-    )
-    d0_ms = int((day0 + dt.timedelta(hours=1)).timestamp() * 1000)
-    oc_conn.execute("INSERT INTO session_v2 VALUES ('ses-fb', '/tmp/p', 0.05, 4000, 500, 0, 12000, 0, 'deepseek-v4.1-flash', ?)", (d0_ms,))
-    oc_conn.execute("INSERT INTO session_v2 VALUES ('ses-13d', '/tmp/p', 1.20, 90000, 15000, 2000, 300000, 1000, 'deepseek-v4.1-flash', ?)", ((now_epoch - 60) * 1000,))
-    for i in range(1, 14):
-        ms = int((day0 + dt.timedelta(days=i, hours=2, minutes=30)).timestamp() * 1000)
-        rtype = "compaction" if i == 6 else "assistant"
-        data_json = json.dumps(
-            {
-                "model": {"id": "deepseek-v4.1-flash", "providerID": "opencode-go"},
-                "cost": 0.02 * i,
-                "time": {"created": ms},
-                "tokens": {"input": 2000 * i, "output": 300 * i, "reasoning": 50, "cache": {"read": 8000 * i, "write": 100}},
-            }
+            + "\n",
+            encoding="utf-8",
         )
-        oc_conn.execute("INSERT INTO session_message VALUES (?, 'ses-13d', ?, ?, ?, ?, ?)", (f"om-{i}", rtype, i, ms, ms, data_json))
-    oc_conn.commit()
-    oc_conn.close()
 
-    # 4. Mistral Vibe unified session with 2 journal segments spanning all 14 days + relay export.json dedup
-    (v_root / "config.toml").write_text('active_model = "deepseek-v4-1-flash-1017"\n', encoding="utf-8")
-    (v_uni.parent / "meta.json").write_text(
-        json.dumps({"session_id": "vibe-14d", "start_time": day0.strftime("%Y-%m-%dT%H:%M:%SZ"), "config": {}}),
-        encoding="utf-8",
-    )
-    seg1: list[str] = []
-    seg2: list[str] = []
-    seq = 1
-    for i in range(14):
-        ms = int((day0 + dt.timedelta(days=i, hours=1, minutes=45)).timestamp() * 1000)
-        target = seg1 if i < 7 else seg2
-        target.append(json.dumps({"sequence": seq, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": ms}}}}))
-        seq += 1
-        rec = json.dumps(
-            {
-                "sequence": seq,
-                "type": "action_result",
-                "payload": {
-                    "action_id": f"va-{i}",
-                    "state": "succeeded",
-                    "result": {
-                        "type": "completion_succeeded",
-                        "result": {
-                            "usage": {
-                                "input_tokens": 10000 + i * 500,
-                                "cached_input_tokens": 7000 + i * 300,
-                                "cache_write_tokens": 100,
-                                "output_tokens": 400 + i * 20,
-                                "reasoning_tokens": 80,
-                                "total_tokens": 10500 + i * 520,
-                            }
-                        },
-                    },
-                },
-            }
+        roll5 = x_p / "roll5.jsonl"
+        roll5.write_text(
+            "\n".join(
+                [
+                    '{"timestamp":"2026-11-15T06:59:59Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-15T06:59:59Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":48000,"cached_input_tokens":40000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":50000}}}}',
+                    '{"timestamp":"2026-11-15T07:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":86000,"cached_input_tokens":70000,"cache_write_input_tokens":0,"output_tokens":4000,"total_tokens":90000}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
         )
-        target.append(rec)
-        if i == 6:
-            seg2.append(rec)  # duplicate action_id replayed across segment boundary
-        seq += 1
-    (v_uni / "0000000000000001.jsonl").write_text("\n".join(seg1) + "\n", encoding="utf-8")
-    (v_uni / "0000000000000050.jsonl").write_text("\n".join(seg2) + "\n", encoding="utf-8")
-    (r_vibe_exp / "export.json").write_text('{"session_id":"vibe-14d"}\n', encoding="utf-8")
+        cx = sqlite3.connect(str(x_p / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th5', '/tmp/p', 90000, ?, 'gpt-6.1-sol', ?)", (upd_10m_s, str(roll5)))
+        cx.commit()
+        cx.close()
 
-    # 5. Antigravity steps in .relay/LOG.md + 01-vibe step deduplicated via 01-vibe.vibe/export.json
-    r_lines = [
-        "# Agent Relay Log",
-        "",
-        f"## 01-vibe: ok, 40s, {(today_utc + dt.timedelta(hours=1)).strftime('%Y-%m-%d %H:%M')}",
-        "- vibe: model deepseek-v4-1-flash-1017, tokens 99,999, cost $0.25",
-        "",
-    ]
-    for i in range(2, 12):
-        local_dt = dt.datetime.fromtimestamp((day0 + dt.timedelta(days=i, hours=2)).timestamp())
-        r_lines += [
-            f"## {i:02d}-agy: ok, 55s, {local_dt.strftime('%Y-%m-%d %H:%M')}",
-            f"- agy: model gemini-4-carbon-high, tokens {80000 + i * 1000:,}",
-            "",
-        ]
-    (r_dir / "LOG.md").write_text("\n".join(r_lines) + "\n", encoding="utf-8")
+        oc = sqlite3.connect(str(o_p / "opencode.db"))
+        oc.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)")
+        oc.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+        oc.execute("INSERT INTO session_v2 VALUES ('s5', '/tmp/p', 0.1, 10000, 5000, 0, 40000, 0, 'deepseek-v4.1-flash', ?)", (upd_10m_s * 1000,))
+        for i, (ts_s, cr_tok) in enumerate([("2026-11-15T06:59:59Z", 20_000), ("2026-11-15T07:00:00Z", 25_000)], start=1):
+            ms = iso_to_epoch_ms(ts_s)
+            oc.execute(
+                "INSERT INTO session_message VALUES (?, 's5', 'assistant', ?, ?, ?, ?)",
+                (f"om-{i}", i, ms, ms, json.dumps({"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.05, "time": {"created": ms}, "tokens": {"input": 3000, "output": 2000, "reasoning": 0, "cache": {"read": cr_tok, "write": 0}}})),
+            )
+        oc.commit()
+        oc.close()
+
+        (v_p.parent / "meta.json").write_text(
+            '{"session_id":"v-5h","start_time":"2026-11-15T06:59:59Z","end_time":"2026-11-15T11:50:00Z","config":{"active_model":"deepseek-v4-1-flash-1017"}}\n',
+            encoding="utf-8",
+        )
+        (v_p / "0000000000000001.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"sequence": 1, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-15T06:59:59Z")}}}}),
+                    '{"sequence":2,"type":"action_result","payload":{"action_id":"v1","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":14000,"cached_input_tokens":10000,"cache_write_tokens":0,"output_tokens":1000,"total_tokens":15000}}}}}',
+                    json.dumps({"sequence": 3, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": iso_to_epoch_ms("2026-11-15T07:00:00Z")}}}}),
+                    '{"sequence":4,"type":"action_result","payload":{"action_id":"v2","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":8000,"cached_input_tokens":6000,"cache_write_tokens":0,"output_tokens":1000,"total_tokens":9000}}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso],
+        )
+        errs: list[str] = []
+        cw = doc["vendors"]["claude"]["windows"]
+        for w_name, (exp_tok, exp_rec) in EXPECTED_CLAUDE_WINDOWS.items():
+            if cw[w_name]["totalTokens"] != exp_tok or cw[w_name]["recordCount"] != exp_rec:
+                errs.append(f"claude.{w_name}: got=({cw[w_name]['totalTokens']},{cw[w_name]['recordCount']}), exp=({exp_tok},{exp_rec})")
+        c_days = {d["date"]: d["vendors"]["claude"]["totalTokens"] for d in doc["dailyBreakdown"]}
+        for dk, exp_tok in EXPECTED_CLAUDE_DAYS.items():
+            if c_days[dk] != exp_tok:
+                errs.append(f"claude.day[{dk}]: got={c_days[dk]}, exp={exp_tok}")
+        for v_id, exp_5h in EXPECTED_OTHER_5H.items():
+            got_5h = doc["vendors"][v_id]["windows"]["fiveHours"]["totalTokens"]
+            if got_5h != exp_5h:
+                errs.append(f"{v_id}.fiveHours: got={got_5h}, exp={exp_5h}")
+
+        ok = len(errs) == 0
+        msg = (
+            "Exact second boundaries verified: claude(5h=768k, today=960k, 7d=1,016k, 30d=1,022k, d13=0, d14=48k, d15=960k), "
+            "codex_5h=40k, opencode_5h=30k, vibe_5h=9k"
+            if ok
+            else "; ".join(errs)
+        )
+        return (ok, msg)
 
 
-def run_m1_scripted_mutations() -> tuple[bool, str]:
-    """W1: Copy Package.swift + Sources + Tests to an isolated temp dir, run 5 M1-specific mutations, verify each fails its named test."""
+# ===========================================================================
+# Check 4 (Row 4): Per-Day B14 Pricing, Per-Day B15 Mismatch, Structured B7 429
+# ===========================================================================
+
+
+def verify_row4_b14_b15_b7(bin_path: pathlib.Path) -> tuple[bool, str]:
+    now_iso = "2026-11-15T12:00:00Z"
+    t_curr_s = iso_to_epoch_s("2026-11-15T09:00:00Z")
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row4-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        c_p = thome / ".claude" / "projects" / "-tmp-r4"
+        x_p = thome / ".codex"
+        r_p = tws / "p4" / ".relay"
+        for d in (c_p, x_p, r_p):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # 2026-11-14: 1 priced Sonnet ($4.50) + 2 unknown models + prose 429 traps -> 0 rate limits!
+        # 2026-11-15: 1 structured Claude 429
+        (c_p / "r4.jsonl").write_text(
+            "\n".join(
+                [
+                    '{"type":"assistant","timestamp":"2026-11-14T10:00:00Z","sessionId":"s","requestId":"r1","message":{"id":"m1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"frame rate is 429 fps; corporate tax rate limit discussion"}],"usage":{"input_tokens":1000000,"output_tokens":100000}}}',
+                    '{"type":"assistant","timestamp":"2026-11-14T10:05:00Z","sessionId":"s","requestId":"r2","message":{"id":"m2","model":"claude-fable-5-1","usage":{"input_tokens":50000,"output_tokens":5000}}}',
+                    '{"type":"assistant","timestamp":"2026-11-14T10:10:00Z","sessionId":"s","requestId":"r3","message":{"id":"m3","model":"glm-5-3","usage":{"input_tokens":50000,"output_tokens":5000}}}',
+                    '{"type":"assistant","isApiErrorMessage":true,"error":"invalid_request_error","timestamp":"2026-11-14T10:15:00Z","sessionId":"s","requestId":"r-non429","message":{"content":[{"type":"text","text":"rate limit 429 in body"}]}}',
+                    '{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"2026-11-15T09:00:00Z","sessionId":"s","requestId":"r-real429"}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # 2026-11-15: Codex rollout=12,000 vs sqlite=50,000 mismatch + 1 structured Codex 429
+        rmis = x_p / "rmis.jsonl"
+        rmis.write_text(
+            "\n".join(
+                [
+                    '{"timestamp":"2026-11-15T09:00:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-11-15T09:01:00Z","type":"event_msg","payload":{"type":"error","error":{"type":"rate_limit_error","status":429}}}',
+                    '{"timestamp":"2026-11-15T09:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"cache_write_input_tokens":0,"output_tokens":2000,"total_tokens":12000}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cx = sqlite3.connect(str(x_p / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th-mis-15', '/tmp/p', 50000, ?, 'gpt-6.1-sol', ?)", (t_curr_s, str(rmis)))
+        cx.commit()
+        cx.close()
+
+        (r_p / "LOG.md").write_text(
+            "# Agent Relay Log\n\n## 01-agy: ok, 20s, 2026-11-15 09:30\n- agy: model gemini-4-carbon-high, tokens 25,000\n",
+            encoding="utf-8",
+        )
+
+        r4_en = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso])
+        r4_zh = run_cli_json(bin_path, "snapshot", ["--lang", "zh", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso])
+        en_days = {d["date"]: d for d in r4_en["dailyBreakdown"]}
+        zh_days = {d["date"]: d for d in r4_zh["dailyBreakdown"]}
+
+        ok = (
+            en_days["2026-11-14"]["pricedRecordCount"] == 1
+            and en_days["2026-11-14"]["unmatchedModelCount"] == 2
+            and en_days["2026-11-14"]["costNote"] == "Covers 1 priced records only; 2 unknown-model records excluded"
+            and zh_days["2026-11-14"]["costNote"] == "只含已计价的 1 条，另有 2 条未知型号未计入"
+            and en_days["2026-11-14"]["hasCodexRolloutMismatch"] is False
+            and en_days["2026-11-14"]["rateLimit429Count"] == 0
+            and en_days["2026-11-15"]["hasCodexRolloutMismatch"] is True
+            and "th-mis-15: rollout=12000 vs sqlite=50000" in (en_days["2026-11-15"]["codexMismatchNote"] or "")
+            and "th-mis-15: rollout=12000 vs sqlite=50000" in (zh_days["2026-11-15"]["codexMismatchNote"] or "")
+            and en_days["2026-11-15"]["rateLimit429Count"] == 2
+            and r4_en["vendors"]["agy"]["completeness"] == "relayOnly"
+            and r4_zh["vendors"]["agy"]["completeness"] != "complete"
+        )
+        msg = "prose_429=0, structured_429=2, per-day costNote & mismatchNote EN/ZH verified, agy=relayOnly(!=complete)"
+        return (ok, msg)
+
+
+# ===========================================================================
+# Check 5 (Row 5 + BR3 + BR1): 8 Scripted Isolated Mutations
+# ===========================================================================
+
+
+def verify_row5_scripted_mutations() -> tuple[bool, str]:
+    """Copy Package.swift + Sources + Tests to an isolated temp dir, run 8 targeted mutations, verify each fails RED."""
     mutations = [
         (
-            "M1-codex-session-ts",
+            "M1-br3-day-upper-le",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
-            "let evTS = ev.timestamp ?? ts",
-            "let evTS = ts",
+            "let daySlice = timedSamples.filter { $0.timestamp! >= dayStart && $0.timestamp! < dayEnd && $0.timestamp! <= now }",
+            "let daySlice = timedSamples.filter { $0.timestamp! >= dayStart && $0.timestamp! <= dayEnd && $0.timestamp! <= now }",
+            "AgentBarCoreTests.CollectorsTests/exactSecondWindowAndDayBoundaries",
+            "M1 BR3: Exact boundary second checks for dayStart, nextDayStart, fiveHoursAgo, sevenDaysAgo, thirtyDaysAgo, and now",
+        ),
+        (
+            "M2-br3-fivehours-gt",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "let fiveHourSlice = vSamples.filter { $0.timestamp! >= fiveHoursAgo && $0.timestamp! <= now }",
+            "let fiveHourSlice = vSamples.filter { $0.timestamp! > fiveHoursAgo && $0.timestamp! <= now }",
+            "AgentBarCoreTests.CollectorsTests/exactSecondWindowAndDayBoundaries",
+            "M1 BR3: Exact boundary second checks for dayStart, nextDayStart, fiveHoursAgo, sevenDaysAgo, thirtyDaysAgo, and now",
+        ),
+        (
+            "M3-br3-sevendays-gt",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "let sevenDaySlice = vSamples.filter { $0.timestamp! >= sevenDaysAgo && $0.timestamp! <= now }",
+            "let sevenDaySlice = vSamples.filter { $0.timestamp! > sevenDaysAgo && $0.timestamp! <= now }",
+            "AgentBarCoreTests.CollectorsTests/exactSecondWindowAndDayBoundaries",
+            "M1 BR3: Exact boundary second checks for dayStart, nextDayStart, fiveHoursAgo, sevenDaysAgo, thirtyDaysAgo, and now",
+        ),
+        (
+            "M4-br1-claude-ts-now",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "timestamp: parsedTS,",
+            "timestamp: parsedTS ?? now,",
+            "AgentBarCoreTests.CollectorsTests/missingAndCorruptTimestampsRouteStrictlyToUntimestamped",
+            "M1 BR1: Missing or malformed timestamps across all 5 sources contribute 0 to windows and dated rows and tally strictly in untimestamped",
+        ),
+        (
+            "M5-codex-session-ts",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "timestamp: ev.timestamp,",
+            "timestamp: sessionTS,",
             "AgentBarCoreTests.CollectorsTests/codexCrossDayRolloutEventsAndPerDayMismatch",
             "M1 B3+B15: Codex cross-day rollout splits turns by event timestamp",
         ),
         (
-            "M2-opencode-ignore-messages",
+            "M6-opencode-ignore-messages",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
             "if let msgTable {",
             "if false, let msgTable {",
@@ -1277,7 +1048,7 @@ def run_m1_scripted_mutations() -> tuple[bool, str]:
             "M1 B3: OpenCode cross-day session_message splits events by per-message timestamp",
         ),
         (
-            "M3-vibe-no-action-dedup",
+            "M7-vibe-no-action-dedup",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
             "guard seenActionIDs.insert(actionID).inserted else { return }",
             "_ = seenActionIDs.insert(actionID)",
@@ -1285,29 +1056,26 @@ def run_m1_scripted_mutations() -> tuple[bool, str]:
             "M1 B5: Mistral Vibe unified journal multi-segment reader deduplicates action_id",
         ),
         (
-            "M4-prose-429-false-positive",
+            "M8-prose-429-false-positive",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
-            "if isStructured429 {",
-            'if isStructured429 || line.localizedCaseInsensitiveContains("rate") {',
+            "if isStructured429, let rlTS = parsedTS",
+            'if (isStructured429 || line.localizedCaseInsensitiveContains("rate")), let rlTS = parsedTS',
             "AgentBarCoreTests.CollectorsTests/structured429RateLimitCountingIgnoresProse",
             "M1 B7: Counts 429 rate limits strictly from structured status/error codes",
-        ),
-        (
-            "M5-drop-daily-b15-mismatch",
-            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
-            "hasCodexRolloutMismatch: codexDay.hasRolloutMismatch,",
-            "hasCodexRolloutMismatch: false,",
-            "AgentBarCoreTests.CLITests/dailyBreakdownCarriesPerDayB14PricingAndB15Mismatch",
-            "M1 Part 2: Exposes 14-day dailyBreakdown in --cli snapshot and --cli daily",
         ),
     ]
 
     with tempfile.TemporaryDirectory(prefix="agentbar-m1-mutations-") as tmpdir:
         mut_root = pathlib.Path(tmpdir) / "repo"
+        iso_home = pathlib.Path(tmpdir) / "empty_home"
         mut_root.mkdir(parents=True)
+        iso_home.mkdir(parents=True)
         shutil.copy2(REPO_ROOT / "Package.swift", mut_root / "Package.swift")
         shutil.copytree(REPO_ROOT / "Sources", mut_root / "Sources")
         shutil.copytree(REPO_ROOT / "Tests", mut_root / "Tests")
+
+        env = dict(os.environ)
+        env["HOME"] = str(iso_home)
 
         details: list[str] = []
         for label, rel_file, target, replacement, test_filter, test_display in mutations:
@@ -1320,6 +1088,7 @@ def run_m1_scripted_mutations() -> tuple[bool, str]:
                 proc = subprocess.run(
                     ["swift", "test", "--no-parallel", "--filter", test_filter],
                     cwd=str(mut_root),
+                    env=env,
                     capture_output=True,
                     text=True,
                     check=False,
@@ -1350,6 +1119,7 @@ def run_m1_scripted_mutations() -> tuple[bool, str]:
                 "AgentBarCoreTests.CLITests",
             ],
             cwd=str(mut_root),
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -1360,395 +1130,490 @@ def run_m1_scripted_mutations() -> tuple[bool, str]:
         return (True, ", ".join(details))
 
 
-def main() -> int:
-    mtime_start = plist_mtime()
-    bin_path = resolve_agentbar_bin()
-    now_epoch = int(time.time())
-    failures: list[str] = []
+# ===========================================================================
+# Check 6 (BR1): Missing & Malformed Timestamps -> Strictly `untimestamped`
+# ===========================================================================
 
-    rel_bin = bin_path.relative_to(REPO_ROOT) if bin_path.is_relative_to(REPO_ROOT) else pathlib.Path(bin_path.name)
-    print("=" * 78)
-    print(f"AgentBar M1 Independent Acceptance Ledger (measurement date: {dt.date.today().isoformat()})")
-    print(f"Binary: {rel_bin}")
-    print(f"Frozen evaluation epoch (--now): {now_epoch} (UTC day={utc_date_str(now_epoch)})")
-    print("=" * 78)
 
-    # ------------------------------------------------------------------
-    # Row 1: Cross-day long session per-event splitting (Codex, OpenCode, Vibe)
-    # ------------------------------------------------------------------
-    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row1-") as tmpdir:
+def verify_row6_br1_untimestamped(bin_path: pathlib.Path) -> tuple[bool, str]:
+    now_iso = "2026-11-15T12:00:00Z"
+
+    # Hand-calculated literal expected untimestamped counts per vendor: (totalTokens, recordCount)
+    EXPECTED_UNTIMESTAMPED_BY_VENDOR: dict[str, tuple[int, int]] = {
+        # Claude: missing ts (800+200=1,000) + malformed ts "not-a-date" (1,000+310=1,310) = 2,310 (2 records)
+        "claude": (2_310, 2),
+        # Codex: rollout event missing ts (1,100; must NOT borrow threads.updated_at!) + session-only updated_at=0 (400) = 1,500 (2 records)
+        "codex": (1_500, 2),
+        # OpenCode: session_message missing ts (50+27=77; must NOT borrow session_v2.time_updated!) + session_v2-only time_updated=0 (200+30=230) = 307 (2 records)
+        "opencode": (307, 2),
+        # Vibe: journal no-ts action (500) + journal corrupt-ts action (250) + .relay/LOG.md no-ts step (600) = 1,350 (3 records)
+        "vibe": (1_350, 3),
+        # AGY: .relay/LOG.md no-ts step (900) + .relay/LOG.md invalid calendar date 2026-99-99 99:99 (350) = 1,250 (2 records)
+        "agy": (1_250, 2),
+    }
+    # Hand sum across all 5 vendors: 2,310 + 1,500 + 307 + 1,350 + 1,250 = 6,717 tokens across 11 records
+    EXPECTED_TOP_UNTIMESTAMPED = (6_717, 11)
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-br1-") as tmpdir:
         thome = pathlib.Path(tmpdir) / "home"
         tws = pathlib.Path(tmpdir) / "ws"
-        (thome / ".codex").mkdir(parents=True)
-        (thome / ".local" / "share" / "opencode").mkdir(parents=True)
-        v_jdir = thome / ".vibe" / "logs" / "session" / "unified" / "vs-3d" / "journal"
-        v_jdir.mkdir(parents=True)
-        tws.mkdir(parents=True)
-
-        today_utc = dt.datetime.fromtimestamp(now_epoch, tz=dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        d_m2 = today_utc - dt.timedelta(days=2)
-        d_m1 = today_utc - dt.timedelta(days=1)
-        d_0 = today_utc
-        # Pick timestamps guaranteed <= now_epoch on d_0
-        t_d2 = d_m2.timestamp() + 3600
-        t_d1 = d_m1.timestamp() + 3600
-        t_d0 = min(float(now_epoch - 30), d_0.timestamp() + max(1.0, (now_epoch - d_0.timestamp()) * 0.5))
-
-        iso_d2 = dt.datetime.fromtimestamp(t_d2, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        iso_d1 = dt.datetime.fromtimestamp(t_d1, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        iso_d0 = dt.datetime.fromtimestamp(t_d0, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # 3-day Codex rollout (105k, 157k, 63k -> sum=325k)
-        roll_3d = thome / ".codex" / "rollout-3d.jsonl"
-        roll_3d.write_text(
-            "\n".join(
-                [
-                    json.dumps({"timestamp": iso_d2, "type": "turn_context", "payload": {"model": "gpt-6-luna"}}),
-                    json.dumps({"timestamp": iso_d2, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100000, "cached_input_tokens": 80000, "cache_write_input_tokens": 0, "output_tokens": 5000, "total_tokens": 105000}}}}),
-                    json.dumps({"timestamp": iso_d2, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100000, "cached_input_tokens": 80000, "cache_write_input_tokens": 0, "output_tokens": 5000, "total_tokens": 105000}}}}),
-                    json.dumps({"timestamp": iso_d1, "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}),
-                    json.dumps({"timestamp": iso_d1, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 250000, "cached_input_tokens": 200000, "cache_write_input_tokens": 0, "output_tokens": 12000, "total_tokens": 262000}}}}),
-                    json.dumps({"timestamp": iso_d0, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 310000, "cached_input_tokens": 240000, "cache_write_input_tokens": 0, "output_tokens": 15000, "total_tokens": 325000}}}}),
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        cx_c = sqlite3.connect(str(thome / ".codex" / "state_5.sqlite"))
-        cx_c.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
-        cx_c.execute("INSERT INTO threads VALUES ('th-3d', '/tmp/p', 325000, ?, 'gpt-6.1-sol', ?)", (int(t_d0), str(roll_3d)))
-        cx_c.commit()
-        cx_c.close()
-
-        # 3-day OpenCode session_message (50k, 80k, 90k -> 220k)
-        oc_c = sqlite3.connect(str(thome / ".local" / "share" / "opencode" / "opencode.db"))
-        oc_c.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)")
-        oc_c.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
-        oc_c.execute("INSERT INTO session_v2 VALUES ('oc-3d', '/tmp/p', 0.30, 30000, 10000, 0, 180000, 0, 'deepseek-v4.1-flash', ?)", (int(t_d0 * 1000),))
-        for seq_i, (ep, tot_cr) in enumerate([(t_d2, 40000), (t_d1, 65000), (t_d0, 75000)], start=1):
-            ms = int(ep * 1000)
-            oc_c.execute(
-                "INSERT INTO session_message VALUES (?, 'oc-3d', 'assistant', ?, ?, ?, ?)",
-                (f"m{seq_i}", seq_i, ms, ms, json.dumps({"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.1, "time": {"created": ms}, "tokens": {"input": 8000 if seq_i == 1 else (10000 if seq_i == 2 else 12000), "output": 2000 if seq_i == 1 else (5000 if seq_i == 2 else 3000), "reasoning": 0, "cache": {"read": tot_cr, "write": 0}}})),
-            )
-        oc_c.commit()
-        oc_c.close()
-
-        # 3-day Vibe unified multi-segment journal (12.5k, 22k, 31k)
-        (v_jdir.parent / "meta.json").write_text(json.dumps({"session_id": "vs-3d", "start_time": iso_d2, "config": {"active_model": "deepseek-v4-1-flash-1017"}}), encoding="utf-8")
-        (v_jdir / "0000000000000001.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"sequence": 1, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": int(t_d2 * 1000)}}}}),
-                    json.dumps({"sequence": 2, "type": "action_result", "payload": {"action_id": "a1", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 12000, "cached_input_tokens": 8000, "cache_write_tokens": 0, "output_tokens": 500, "total_tokens": 12500}}}}}),
-                    json.dumps({"sequence": 3, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": int(t_d1 * 1000)}}}}),
-                    json.dumps({"sequence": 4, "type": "action_result", "payload": {"action_id": "a2", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 20000, "cached_input_tokens": 15000, "cache_write_tokens": 1000, "output_tokens": 1000, "total_tokens": 22000}}}}}),
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        (v_jdir / "0000000000000020.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"sequence": 20, "type": "action_result", "payload": {"action_id": "a2", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 20000, "cached_input_tokens": 15000, "cache_write_tokens": 1000, "output_tokens": 1000, "total_tokens": 22000}}}}}),
-                    json.dumps({"sequence": 21, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": int(t_d0 * 1000)}}}}),
-                    json.dumps({"sequence": 22, "type": "action_result", "payload": {"action_id": "a3", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 30000, "cached_input_tokens": 25000, "cache_write_tokens": 0, "output_tokens": 1000, "total_tokens": 31000}}}}}),
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        r1_cli = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
-        r1_ref = ref_collect_all_utc(thome, tws, now_epoch)
-        row1_ok, row1_max_diff, _ = compare_14d_matrix(r1_cli, r1_ref)
-        k2, k1, k0 = d_m2.strftime("%Y-%m-%d"), d_m1.strftime("%Y-%m-%d"), d_0.strftime("%Y-%m-%d")
-        c_by_day = {d["date"]: d for d in r1_cli["dailyBreakdown"]}
-        row1_ok = (
-            row1_ok
-            and row1_max_diff == 0.0
-            and c_by_day[k2]["vendors"]["codex"]["totalTokens"] == 105000
-            and c_by_day[k1]["vendors"]["codex"]["totalTokens"] == 157000
-            and c_by_day[k0]["vendors"]["codex"]["totalTokens"] == 63000
-            and c_by_day[k2]["vendors"]["opencode"]["totalTokens"] == 50000
-            and c_by_day[k1]["vendors"]["opencode"]["totalTokens"] == 80000
-            and c_by_day[k0]["vendors"]["opencode"]["totalTokens"] == 90000
-            and c_by_day[k2]["vendors"]["vibe"]["totalTokens"] == 12500
-            and c_by_day[k1]["vendors"]["vibe"]["totalTokens"] == 22000
-            and c_by_day[k0]["vendors"]["vibe"]["totalTokens"] == 31000
-        )
-
-    if not row1_ok:
-        failures.append("Row 1 (Cross-day per-event timestamp splitting)")
-    print(
-        f"[Row 1] {'PASS' if row1_ok else 'FAIL'} | Cross-day 3d sessions ({k2}..{k0}): "
-        f"Codex=[105k, 157k, 63k], OpenCode=[50k, 80k, 90k], Vibe=[12.5k, 22k, 31k], max_diff={row1_max_diff:.4%}"
-    )
-
-    # ------------------------------------------------------------------
-    # Row 2: 14-day x 5-vendor daily ledger (< 1% diff; synthetic + live host)
-    # ------------------------------------------------------------------
-    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row2-synth-") as tmpdir:
-        shome = pathlib.Path(tmpdir) / "home"
-        sws = pathlib.Path(tmpdir) / "ws"
-        seed_rich_14d_5vendor_fixture(shome, sws, now_epoch)
-        synth_daily_cli = run_cli_json(bin_path, "daily", ["--lang", "en", "--tz", "UTC", "--home", str(shome), "--workspace", str(sws), "--now", str(now_epoch)])
-        synth_daily_ref = ref_collect_all_utc(shome, sws, now_epoch)
-        synth14_ok, synth14_max_diff, synth14_cells = compare_14d_matrix(synth_daily_cli, synth_daily_ref)
-
-    live_ws = EFFECTIVE_HOME / "Projects"
-    live_cli_en = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "UTC", "--now", str(now_epoch)])
-    live_cli_zh = run_cli_json(bin_path, "snapshot", ["--lang", "zh", "--tz", "UTC", "--now", str(now_epoch)])
-    live_ref = ref_collect_all_utc(EFFECTIVE_HOME, live_ws, now_epoch)
-    live14_ok, live14_max_diff, live14_cells = compare_14d_matrix(live_cli_en, live_ref)
-
-    if live_ref["total_events"] > 0:
-        v_14d_totals = {
-            v: sum(int(d["vendors"][v]["totalTokens"]) for d in live_cli_en["dailyBreakdown"])
-            for v in VENDORS
-        }
-        live_summary = (
-            f"live {live14_cells} cells max_diff={live14_max_diff:.4%} "
-            f"(cross-day threads: codex={live_ref['codex_cross_day_threads']}, opencode={live_ref['opencode_cross_day_sessions']}; "
-            f"14d tokens: claude={v_14d_totals['claude']:,}, codex={v_14d_totals['codex']:,}, "
-            f"opencode={v_14d_totals['opencode']:,}, vibe={v_14d_totals['vibe']:,}, agy={v_14d_totals['agy']:,})"
-        )
-    else:
-        live_summary = f"empty HOME -> all {live14_cells} cells=0 (max_diff={live14_max_diff:.4%})"
-
-    row2_ok = synth14_ok and live14_ok
-    if not row2_ok:
-        failures.append(f"Row 2 (14d x 5-vendor daily ledger: synth_diff={synth14_max_diff:.4%}, live_diff={live14_max_diff:.4%})")
-    print(
-        f"[Row 2] {'PASS' if row2_ok else 'FAIL'} | 14d x 5-vendor ledger: "
-        f"synth {synth14_cells} cells max_diff={synth14_max_diff:.4%}; {live_summary}"
-    )
-
-    # ------------------------------------------------------------------
-    # Row 3: Rolling 5-hour window (`fiveHours`: [now - 5h, now])
-    # ------------------------------------------------------------------
-    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row3-5h-") as tmpdir:
-        thome = pathlib.Path(tmpdir) / "home"
-        tws = pathlib.Path(tmpdir) / "ws"
-        c_p = thome / ".claude" / "projects" / "-tmp-5h"
+        c_p = thome / ".claude" / "projects" / "-tmp-br1"
         x_p = thome / ".codex"
         o_p = thome / ".local" / "share" / "opencode"
-        v_p = thome / ".vibe" / "logs" / "session" / "unified" / "v-5h" / "journal"
-        for d in (c_p, x_p, o_p, v_p, tws):
+        v_p = thome / ".vibe" / "logs" / "session" / "unified" / "vs-br1" / "journal"
+        a_log = thome / ".gemini" / "antigravity-cli" / "log"
+        r_p = tws / "pipe-br1" / ".relay"
+        for d in (c_p, x_p, o_p, v_p, a_log, r_p):
             d.mkdir(parents=True, exist_ok=True)
 
-        t_8h = now_epoch - 8 * 3600
-        t_outside = now_epoch - 5 * 3600 - 120
-        t_inside = now_epoch - 5 * 3600 + 120
-        t_1h = now_epoch - 3600
-        upd_10m = now_epoch - 600
-
-        fmt_z = lambda ep: dt.datetime.fromtimestamp(ep, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Claude: 2 old turns (10k each) + 2 turns inside 5h (7k + 3k = 10k)
-        (c_p / "c5h.jsonl").write_text(
-            "\n".join(
-                json.dumps({"type": "assistant", "timestamp": fmt_z(ep), "sessionId": "sc", "requestId": f"r{idx}", "message": {"id": f"m{idx}", "model": "claude-sonnet-5-5", "usage": {"input_tokens": tok - 1000, "output_tokens": 1000}}})
-                for idx, (ep, tok) in enumerate([(t_8h, 10000), (t_outside, 10000), (t_inside, 7000), (t_1h, 3000)])
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        # Codex: updated_at = 10m ago; turns at 8h (50k), outside (40k), inside (25k), 1h (15k) -> 5h = 40k, total = 130k
-        roll5 = x_p / "roll5.jsonl"
-        roll5.write_text(
+        c_file = c_p / "br1.jsonl"
+        c_file.write_text(
             "\n".join(
                 [
-                    json.dumps({"timestamp": fmt_z(t_8h), "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}),
-                    json.dumps({"timestamp": fmt_z(t_8h), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 48000, "cached_input_tokens": 40000, "cache_write_input_tokens": 0, "output_tokens": 2000, "total_tokens": 50000}}}}),
-                    json.dumps({"timestamp": fmt_z(t_outside), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 86000, "cached_input_tokens": 70000, "cache_write_input_tokens": 0, "output_tokens": 4000, "total_tokens": 90000}}}}),
-                    json.dumps({"timestamp": fmt_z(t_inside), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 110000, "cached_input_tokens": 90000, "cache_write_input_tokens": 0, "output_tokens": 5000, "total_tokens": 115000}}}}),
-                    json.dumps({"timestamp": fmt_z(t_1h), "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 124000, "cached_input_tokens": 100000, "cache_write_input_tokens": 0, "output_tokens": 6000, "total_tokens": 130000}}}}),
+                    '{"type":"assistant","sessionId":"sc1","requestId":"r1","cwd":"/tmp/br1","message":{"id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":800,"output_tokens":200}}}',
+                    '{"type":"assistant","timestamp":"not-a-date","sessionId":"sc1","requestId":"r2","cwd":"/tmp/br1","message":{"id":"m2","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":310}}}',
+                    '{"type":"assistant","isApiErrorMessage":true,"error":"rate_limit","timestamp":"not-a-date","sessionId":"sc1","requestId":"r429"}',
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
-        cxc = sqlite3.connect(str(x_p / "state_5.sqlite"))
-        cxc.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
-        cxc.execute("INSERT INTO threads VALUES ('th5', '/tmp/p', 130000, ?, 'gpt-6.1-sol', ?)", (upd_10m, str(roll5)))
-        cxc.commit()
-        cxc.close()
+        old_ep = iso_to_epoch_s("2026-08-01T00:00:00Z")
+        os.utime(c_file, (old_ep, old_ep))
 
-        # OpenCode: time_updated = 10m ago; 2 outside turns (30k each) + 2 inside turns (18k + 12k = 30k)
-        occ = sqlite3.connect(str(o_p / "opencode.db"))
-        occ.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)")
-        occ.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
-        occ.execute("INSERT INTO session_v2 VALUES ('s5', '/tmp/p', 0.2, 20000, 4000, 0, 66000, 0, 'deepseek-v4.1-flash', ?)", (upd_10m * 1000,))
-        for idx, (ep, tok) in enumerate([(t_8h, 30000), (t_outside, 30000), (t_inside, 18000), (t_1h, 12000)], start=1):
-            ms = ep * 1000
-            occ.execute(
-                "INSERT INTO session_message VALUES (?, 's5', 'assistant', ?, ?, ?, ?)",
-                (f"om{idx}", idx, ms, ms, json.dumps({"model": {"id": "deepseek-v4.1-flash"}, "cost": 0.05, "time": {"created": ms}, "tokens": {"input": 2000, "output": 1000, "reasoning": 0, "cache": {"read": tok - 3000, "write": 0}}})),
+        roll_nots = x_p / "roll-nots.jsonl"
+        roll_nots.write_text(
+            "\n".join(
+                [
+                    '{"type":"turn_context","payload":{"model":"gpt-5.4"}}',
+                    '{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":100,"total_tokens":1100}}}}',
+                ]
             )
-        occ.commit()
-        occ.close()
+            + "\n",
+            encoding="utf-8",
+        )
+        cx = sqlite3.connect(str(x_p / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, created_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th-nots', '/tmp/br1', 1100, ?, ?, 'gpt-5.4', ?)", (iso_to_epoch_s("2026-11-14T12:00:00Z"), iso_to_epoch_s("2026-11-14T12:00:00Z"), str(roll_nots)))
+        cx.execute("INSERT INTO threads VALUES ('th-agg0', '/tmp/br1', 400, 0, 0, 'gpt-5.4', '/nonexistent/missing.jsonl')")
+        cx.commit()
+        cx.close()
 
-        # Vibe: 1 outside turn (15k) + 1 inside turn (9k)
-        (v_p.parent / "meta.json").write_text(json.dumps({"session_id": "v-5h", "start_time": fmt_z(t_8h), "end_time": fmt_z(upd_10m), "config": {"active_model": "deepseek-v4-1-flash-1017"}}), encoding="utf-8")
+        oc = sqlite3.connect(str(o_p / "opencode.db"))
+        oc.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)")
+        oc.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+        oc.execute("INSERT INTO session_v2 VALUES ('oc-nots', '/tmp/br1', 0.01, 50, 27, 0, 0, 0, 'claude-sonnet-4-6', ?)", (iso_to_epoch_ms("2026-11-13T12:00:00Z"),))
+        oc.execute("INSERT INTO session_v2 VALUES ('oc-agg0', '/tmp/br1', 0.02, 200, 30, 0, 0, 0, 'claude-sonnet-4-6', 0)")
+        oc.execute(
+            "INSERT INTO session_message VALUES ('m-nots', 'oc-nots', 'assistant', 1, 0, 0, ?)",
+            ('{"model":{"id":"claude-sonnet-4-6"},"tokens":{"input":50,"output":27,"reasoning":0,"cache":{"read":0,"write":0}}}',),
+        )
+        oc.commit()
+        oc.close()
+
+        (v_p.parent / "meta.json").write_text('{"session_id":"vs-br1","start_time":"2026-11-12T12:00:00Z","config":{"active_model":"deepseek-v4"}}\n', encoding="utf-8")
         (v_p / "0000000000000001.jsonl").write_text(
             "\n".join(
                 [
-                    json.dumps({"sequence": 1, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": t_outside * 1000}}}}),
-                    json.dumps({"sequence": 2, "type": "action_result", "payload": {"action_id": "v1", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 14000, "cached_input_tokens": 10000, "cache_write_tokens": 0, "output_tokens": 1000, "total_tokens": 15000}}}}}),
-                    json.dumps({"sequence": 3, "type": "core_input", "payload": {"input": {"determinism": {"time_unix_ms": t_1h * 1000}}}}),
-                    json.dumps({"sequence": 4, "type": "action_result", "payload": {"action_id": "v2", "state": "succeeded", "result": {"type": "completion_succeeded", "result": {"usage": {"input_tokens": 8000, "cached_input_tokens": 6000, "cache_write_tokens": 0, "output_tokens": 1000, "total_tokens": 9000}}}}}),
+                    '{"sequence":1,"type":"action_result","payload":{"action_id":"a-nots","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":400,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":100,"total_tokens":500}}}}}',
+                    '{"sequence":2,"type":"core_input","payload":{"input":{"determinism":{"time_unix_ms":"corrupt-ts"}}}}',
+                    '{"sequence":3,"type":"action_result","payload":{"action_id":"a-badts","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":200,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":50,"total_tokens":250}}}}}',
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
 
-        s5_cli = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
-        synth5h_ok = (
-            s5_cli["vendors"]["claude"]["windows"]["fiveHours"]["totalTokens"] == 10000
-            and s5_cli["vendors"]["codex"]["windows"]["fiveHours"]["totalTokens"] == 40000
-            and s5_cli["vendors"]["opencode"]["windows"]["fiveHours"]["totalTokens"] == 30000
-            and s5_cli["vendors"]["vibe"]["windows"]["fiveHours"]["totalTokens"] == 9000
+        (a_log / "cli-br1.log").write_text("WARN request failed status=429 reason=rate_limit\n", encoding="utf-8")
+        (r_p / "LOG.md").write_text(
+            "\n".join(
+                [
+                    "# Agent Relay Log",
+                    "",
+                    "## 01-vibe: ok, 12s",
+                    "- vibe: model deepseek-v4, tokens 600, cost $0.02",
+                    "",
+                    "## 02-agy: ok, 20s",
+                    "- agy: model gemini-2.5-pro, tokens 900, cost $0.03",
+                    "",
+                    "## 03-agy: ok, 15s, 2026-99-99 99:99",
+                    "- agy: model gemini-2.5-pro, tokens 350, cost $0.01",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
-    live5h_max_diff = 0.0
-    live5h_ok = True
-    for v in VENDORS:
-        cli_5h_tok = int(live_cli_en["vendors"][v]["windows"]["fiveHours"]["totalTokens"] or 0)
-        ref_5h_tok = int(live_ref["five_hours"][v]["total"])
-        d = rel_diff(cli_5h_tok, ref_5h_tok)
-        live5h_max_diff = max(live5h_max_diff, d)
-        if d >= 0.01:
-            live5h_ok = False
+        common = ["--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso]
+        en_doc = run_cli_json(bin_path, "snapshot", ["--lang", "en", *common])
+        zh_doc = run_cli_json(bin_path, "daily", ["--lang", "zh", *common])
+        en_txt = run_cli(bin_path, "daily", ["--lang", "en", *common])
+        zh_txt = run_cli(bin_path, "daily", ["--lang", "zh", *common])
 
-    row3_ok = synth5h_ok and live5h_ok
-    if not row3_ok:
-        failures.append("Row 3 (fiveHours rolling window event filtering)")
-    print(
-        f"[Row 3] {'PASS' if row3_ok else 'FAIL'} | fiveHours [now-5h, now]: "
-        f"synth boundary (claude=10k, codex=40k, opencode=30k, vibe=9k) exact; live 5-vendor max_diff={live5h_max_diff:.4%}"
-    )
+        errs: list[str] = []
+        for v_id, (exp_tok, exp_rec) in EXPECTED_UNTIMESTAMPED_BY_VENDOR.items():
+            v_obj = en_doc["vendors"][v_id]
+            if v_obj["rateLimitHits24h"] != 0:
+                errs.append(f"{v_id}.rateLimitHits24h={v_obj['rateLimitHits24h']}")
+            for w_key in ("fiveHours", "today", "sevenDays", "thirtyDays"):
+                wt = v_obj["windows"][w_key]["totalTokens"] or 0
+                wr = v_obj["windows"][w_key]["recordCount"]
+                if wt != 0 or wr != 0:
+                    errs.append(f"{v_id}.{w_key} leaked ({wt},{wr})")
+            u_obj = v_obj["untimestamped"]
+            if u_obj["totalTokens"] != exp_tok or u_obj["recordCount"] != exp_rec:
+                errs.append(f"{v_id}.untimestamped=({u_obj['totalTokens']},{u_obj['recordCount']}), exp=({exp_tok},{exp_rec})")
 
-    # ------------------------------------------------------------------
-    # Row 4: Part 2 per-day B14, per-day B15, and structured B7 (429)
-    # ------------------------------------------------------------------
-    with tempfile.TemporaryDirectory(prefix="agentbar-m1-row4-") as tmpdir:
+        for d_row in en_doc["dailyBreakdown"]:
+            if d_row["totalTokens"] != 0 or d_row["recordCount"] != 0:
+                errs.append(f"dated row {d_row['date']} leaked ({d_row['totalTokens']},{d_row['recordCount']})")
+
+        top_en = en_doc["untimestamped"]
+        top_zh = zh_doc["untimestamped"]
+        if (top_en["date"], top_en["totalTokens"], top_en["recordCount"]) != ("No timestamp", *EXPECTED_TOP_UNTIMESTAMPED):
+            errs.append(f"top_en={top_en}")
+        if (top_zh["date"], top_zh["totalTokens"], top_zh["recordCount"]) != ("没有时间", *EXPECTED_TOP_UNTIMESTAMPED):
+            errs.append(f"top_zh={top_zh}")
+        if "No timestamp |" not in en_txt or "没有时间 |" not in zh_txt:
+            errs.append("human-readable daily text missing 'No timestamp |' or '没有时间 |'")
+
+        ok = len(errs) == 0
+        msg = (
+            "0 tokens leaked into 5h/today/7d/30d/14d-dated rows; untimestamped=6,717 tok (11 records) "
+            "labeled 'No timestamp' (EN) & '没有时间' (ZH)"
+            if ok
+            else "; ".join(errs[:5])
+        )
+        return (ok, msg)
+
+
+# ===========================================================================
+# Check 7 (BR2): --tz Pacific/Auckland NZDT Start (23h), NZDT End (25h), Cross-Midnight
+# ===========================================================================
+
+
+def verify_row7_br2_pacific_auckland(bin_path: pathlib.Path) -> tuple[bool, str]:
+    errs: list[str] = []
+
+    # --- 7a. NZDT Start Day: 2026-09-27 (spring-forward 23-hour day: 01:59:59 +12:00 -> 03:00:00 +13:00) ---
+    # Hand-calculated literal expected day totals under --tz Pacific/Auckland --now 2026-09-28T05:00:00Z:
+    #   2026-09-26: claude 100 (23:59:59 +12:00) = 100
+    #   2026-09-27: claude (200 + 400 + 800 + 1600 + 3200 + 6400 = 12,600)
+    #             + codex  (1000 pre-jump 01:30 + 2000 post-jump 03:30 = 3,000)
+    #             + agy    (300 at 01:30 + 500 at 03:30 = 800)
+    #             = 16,400
+    #   2026-09-28: claude 12,800 (00:00:00 +13:00) + codex 4,000 (00:00:00 +13:00) = 16,800
+    #   untimestamped: agy 999 (non-existent local wall time 2026-09-27 02:30 during spring-forward jump!)
+    EXPECTED_NZDT_START_DAYS = {
+        "2026-09-26": 100,
+        "2026-09-27": 16_400,
+        "2026-09-28": 16_800,
+    }
+    EXPECTED_NZDT_START_UNTIMESTAMPED = 999
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-nz-start-") as tmpdir:
         thome = pathlib.Path(tmpdir) / "home"
         tws = pathlib.Path(tmpdir) / "ws"
-        c_p = thome / ".claude" / "projects" / "-tmp-r4"
+        c_p = thome / ".claude" / "projects" / "-tmp-nzs"
         x_p = thome / ".codex"
-        for d in (c_p, x_p, tws):
+        r_p = tws / "nzs" / ".relay"
+        for d in (c_p, x_p, r_p):
             d.mkdir(parents=True, exist_ok=True)
 
-        today_utc = dt.datetime.fromtimestamp(now_epoch, tz=dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        d_prev = today_utc - dt.timedelta(days=1)
-        k_prev = d_prev.strftime("%Y-%m-%d")
-        k_curr = today_utc.strftime("%Y-%m-%d")
-        t_prev = d_prev.timestamp() + 3600
-        t_curr = min(float(now_epoch - 30), today_utc.timestamp() + max(1.0, (now_epoch - today_utc.timestamp()) * 0.5))
-        iso_prev = dt.datetime.fromtimestamp(t_prev, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        iso_curr = dt.datetime.fromtimestamp(t_curr, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Prose 429 traps on k_prev + 1 priced + 2 unknown models; structured 429 on k_curr
-        (c_p / "r4.jsonl").write_text(
+        spring_claude = [
+            ("2026-09-26T11:59:59Z", 100),   # 2026-09-26 23:59:59 +12:00 -> 2026-09-26
+            ("2026-09-26T12:00:00Z", 200),   # 2026-09-27 00:00:00 +12:00 -> 2026-09-27
+            ("2026-09-26T13:30:00Z", 400),   # 2026-09-27 01:30:00 +12:00 -> 2026-09-27 (pre-jump)
+            ("2026-09-26T13:59:59Z", 800),   # 2026-09-27 01:59:59 +12:00 -> 2026-09-27 (1s before jump)
+            ("2026-09-26T14:00:00Z", 1_600), # 2026-09-27 03:00:00 +13:00 -> 2026-09-27 (jump landing)
+            ("2026-09-26T14:30:00Z", 3_200), # 2026-09-27 03:30:00 +13:00 -> 2026-09-27 (post-jump)
+            ("2026-09-27T10:59:59Z", 6_400), # 2026-09-27 23:59:59 +13:00 -> 2026-09-27 (end of 23h day)
+            ("2026-09-27T11:00:00Z", 12_800),# 2026-09-28 00:00:00 +13:00 -> 2026-09-28
+        ]
+        (c_p / "nzs.jsonl").write_text(
+            "\n".join(
+                json.dumps({"type": "assistant", "timestamp": ts_s, "sessionId": "snz", "requestId": f"r{i}", "message": {"id": f"m{i}", "model": "claude-sonnet-5-5", "usage": {"input_tokens": tok, "output_tokens": 0}}})
+                for i, (ts_s, tok) in enumerate(spring_claude)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        roll_nzs = x_p / "roll-nzs.jsonl"
+        roll_nzs.write_text(
             "\n".join(
                 [
-                    json.dumps({"type": "assistant", "timestamp": iso_prev, "sessionId": "s", "requestId": "r1", "message": {"id": "m1", "model": "claude-sonnet-5-5", "content": [{"type": "text", "text": "frame rate is 429 fps; corporate tax rate limit discussion"}], "usage": {"input_tokens": 1000000, "output_tokens": 100000}}}),
-                    json.dumps({"type": "assistant", "timestamp": iso_prev, "sessionId": "s", "requestId": "r2", "message": {"id": "m2", "model": "claude-fable-5-1", "usage": {"input_tokens": 50000, "output_tokens": 5000}}}),
-                    json.dumps({"type": "assistant", "timestamp": iso_prev, "sessionId": "s", "requestId": "r3", "message": {"id": "m3", "model": "glm-5-3", "usage": {"input_tokens": 50000, "output_tokens": 5000}}}),
-                    json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "invalid_request_error", "timestamp": iso_prev, "sessionId": "s", "requestId": "r-non429", "message": {"content": [{"type": "text", "text": "rate limit 429 in body"}]}}),
-                    json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit", "timestamp": iso_curr, "sessionId": "s", "requestId": "r-real429"}),
+                    '{"timestamp":"2026-09-26T13:30:00Z","type":"turn_context","payload":{"model":"gpt-6.1-sol"}}',
+                    '{"timestamp":"2026-09-26T13:30:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_tokens":1000}}}}',
+                    '{"timestamp":"2026-09-26T14:30:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_tokens":3000}}}}',
+                    '{"timestamp":"2026-09-27T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":7000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_tokens":7000}}}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cx = sqlite3.connect(str(x_p / "state_5.sqlite"))
+        cx.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
+        cx.execute("INSERT INTO threads VALUES ('th-nzs', '/tmp/nz', 7000, ?, 'gpt-6.1-sol', ?)", (iso_to_epoch_s("2026-09-27T12:00:00Z"), str(roll_nzs)))
+        cx.commit()
+        cx.close()
+
+        (r_p / "LOG.md").write_text(
+            "\n".join(
+                [
+                    "# Agent Relay Log",
+                    "",
+                    "## 01-agy: ok, 10s, 2026-09-27 01:30",
+                    "- agy: model gemini-4-carbon-high, tokens 300",
+                    "",
+                    "## 02-agy: ok, 10s, 2026-09-27 02:30",
+                    "- agy: model gemini-4-carbon-high, tokens 999",
+                    "",
+                    "## 03-agy: ok, 10s, 2026-09-27 03:30",
+                    "- agy: model gemini-4-carbon-high, tokens 500",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
 
-        # Codex mismatch ONLY on k_curr (rollout=12000 vs sqlite=50000) + structured Codex 429 on k_curr
-        rmis = x_p / "rmis.jsonl"
-        rmis.write_text(
+        nzs_doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "Pacific/Auckland", "--home", str(thome), "--workspace", str(tws), "--now", "2026-09-28T05:00:00Z"],
+        )
+        nzs_days = {d["date"]: d["totalTokens"] for d in nzs_doc["dailyBreakdown"]}
+        for dk, exp_tok in EXPECTED_NZDT_START_DAYS.items():
+            if nzs_days.get(dk) != exp_tok:
+                errs.append(f"NZDT-start[{dk}]: got={nzs_days.get(dk)}, exp={exp_tok}")
+        if nzs_doc["untimestamped"]["totalTokens"] != EXPECTED_NZDT_START_UNTIMESTAMPED:
+            errs.append(f"NZDT-start untimestamped: got={nzs_doc['untimestamped']['totalTokens']}, exp={EXPECTED_NZDT_START_UNTIMESTAMPED}")
+
+    # --- 7b. NZDT End Day: 2027-04-04 (fall-back 25-hour day: 02:00-02:59 repeats in +13:00 then +12:00) ---
+    # Hand-calculated literal expected values:
+    #   At --now 2027-04-03T18:00:00Z (2027-04-04 06:00:00 +12:00; fiveHoursAgo = 2027-04-03T13:00:00Z = 02:00:00 +13:00):
+    #     claude.fiveHours = 800 (13:00Z) + 1600 (1st 02:30 at 13:30Z) + 3200 (2nd 02:30 at 14:30Z) = 5,600 (excludes 400 at 12:59:59Z)
+    #     claude.today     = 200 (11:00Z) + 400 (12:59:59Z) + 5,600 = 6,200
+    #     opencode.fiveHours = 500 (1st 02:30) + 700 (2nd 02:30) = 1,200
+    #   At --now 2027-04-04T13:00:00Z (2027-04-05 01:00:00 +12:00):
+    #     2027-04-03 = 100
+    #     2027-04-04 = claude (200+400+800+1600+3200+6400 = 12,600) + opencode (500+700 = 1,200) = 13,800
+    #     2027-04-05 = 12,800
+    EXPECTED_NZDT_END_5H = {"claude_5h": 5_600, "claude_today": 6_200, "opencode_5h": 1_200}
+    EXPECTED_NZDT_END_DAYS = {"2027-04-03": 100, "2027-04-04": 13_800, "2027-04-05": 12_800}
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-nz-end-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        c_p = thome / ".claude" / "projects" / "-tmp-nze"
+        o_p = thome / ".local" / "share" / "opencode"
+        for d in (c_p, o_p, tws):
+            d.mkdir(parents=True, exist_ok=True)
+
+        fall_claude = [
+            ("2027-04-03T10:59:59Z", 100),   # 2027-04-03 23:59:59 +13:00 -> 2027-04-03
+            ("2027-04-03T11:00:00Z", 200),   # 2027-04-04 00:00:00 +13:00 -> 2027-04-04
+            ("2027-04-03T12:59:59Z", 400),   # 2027-04-04 01:59:59 +13:00 -> 2027-04-04 (18:00Z - 18001s, outside 5h)
+            ("2027-04-03T13:00:00Z", 800),   # 2027-04-04 02:00:00 +13:00 -> 2027-04-04 (18:00Z - 18000s, inside 5h)
+            ("2027-04-03T13:30:00Z", 1_600), # 2027-04-04 02:30:00 +13:00 -> 2027-04-04 (1st 02:30, inside 5h)
+            ("2027-04-03T14:30:00Z", 3_200), # 2027-04-04 02:30:00 +12:00 -> 2027-04-04 (2nd 02:30, inside 5h)
+            ("2027-04-04T11:59:59Z", 6_400), # 2027-04-04 23:59:59 +12:00 -> 2027-04-04 (end of 25h day)
+            ("2027-04-04T12:00:00Z", 12_800),# 2027-04-05 00:00:00 +12:00 -> 2027-04-05
+        ]
+        (c_p / "nze.jsonl").write_text(
+            "\n".join(
+                json.dumps({"type": "assistant", "timestamp": ts_s, "sessionId": "snze", "requestId": f"r{i}", "message": {"id": f"m{i}", "model": "claude-sonnet-5-5", "usage": {"input_tokens": tok, "output_tokens": 0}}})
+                for i, (ts_s, tok) in enumerate(fall_claude)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        oc = sqlite3.connect(str(o_p / "opencode.db"))
+        oc.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER)")
+        oc.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+        oc.execute("INSERT INTO session_v2 VALUES ('oc-nze', '/tmp/nz', 0.02, 1200, 0, 0, 0, 0, 'deepseek-v4.1-flash', ?)", (iso_to_epoch_ms("2027-04-03T15:00:00Z"),))
+        for i, (ts_s, tok) in enumerate([("2027-04-03T13:30:00Z", 500), ("2027-04-03T14:30:00Z", 700)], start=1):
+            ms = iso_to_epoch_ms(ts_s)
+            oc.execute(
+                "INSERT INTO session_message VALUES (?, 'oc-nze', 'assistant', ?, ?, ?, ?)",
+                (f"m{i}", i, ms, ms, json.dumps({"model": {"id": "deepseek-v4.1-flash"}, "time": {"created": ms}, "tokens": {"input": tok, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}})),
+            )
+        oc.commit()
+        oc.close()
+
+        nze_5h = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "Pacific/Auckland", "--home", str(thome), "--workspace", str(tws), "--now", "2027-04-03T18:00:00Z"],
+        )
+        if nze_5h["vendors"]["claude"]["windows"]["fiveHours"]["totalTokens"] != EXPECTED_NZDT_END_5H["claude_5h"]:
+            errs.append(f"NZDT-end claude 5h={nze_5h['vendors']['claude']['windows']['fiveHours']['totalTokens']}")
+        if nze_5h["vendors"]["claude"]["windows"]["today"]["totalTokens"] != EXPECTED_NZDT_END_5H["claude_today"]:
+            errs.append(f"NZDT-end claude today={nze_5h['vendors']['claude']['windows']['today']['totalTokens']}")
+        if nze_5h["vendors"]["opencode"]["windows"]["fiveHours"]["totalTokens"] != EXPECTED_NZDT_END_5H["opencode_5h"]:
+            errs.append(f"NZDT-end opencode 5h={nze_5h['vendors']['opencode']['windows']['fiveHours']['totalTokens']}")
+
+        nze_full = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "Pacific/Auckland", "--home", str(thome), "--workspace", str(tws), "--now", "2027-04-04T13:00:00Z"],
+        )
+        nze_days = {d["date"]: d["totalTokens"] for d in nze_full["dailyBreakdown"]}
+        for dk, exp_tok in EXPECTED_NZDT_END_DAYS.items():
+            if nze_days.get(dk) != exp_tok:
+                errs.append(f"NZDT-end[{dk}]: got={nze_days.get(dk)}, exp={exp_tok}")
+
+    # --- 7c. Cross-Midnight Cases in Pacific/Auckland (+13:00) ---
+    # Same UTC date (2026-11-14T10:59:59Z vs 2026-11-14T11:00:00Z) splits across 2026-11-14 and 2026-11-15 in NZ,
+    # AND different UTC dates (2026-11-14T11:30:00Z and 2026-11-15T10:30:00Z) both land on 2026-11-15 in NZ:
+    #   2026-11-14: claude 300 (10:59:59Z) + agy 410 (23:59:59 local) = 710
+    #   2026-11-15: claude (700 + 1500 + 3100 = 5,300) + agy 820 (00:00:00 local) = 6,120
+    EXPECTED_NZ_CROSS_MIDNIGHT = {"2026-11-14": 710, "2026-11-15": 6_120}
+
+    with tempfile.TemporaryDirectory(prefix="agentbar-m1-nz-mid-") as tmpdir:
+        thome = pathlib.Path(tmpdir) / "home"
+        tws = pathlib.Path(tmpdir) / "ws"
+        c_p = thome / ".claude" / "projects" / "-tmp-nzm"
+        r_p = tws / "nzm" / ".relay"
+        for d in (c_p, r_p):
+            d.mkdir(parents=True, exist_ok=True)
+
+        mid_claude = [
+            ("2026-11-14T10:59:59Z", 300),
+            ("2026-11-14T11:00:00Z", 700),
+            ("2026-11-14T11:30:00Z", 1_500),
+            ("2026-11-15T10:30:00Z", 3_100),
+        ]
+        (c_p / "nzm.jsonl").write_text(
+            "\n".join(
+                json.dumps({"type": "assistant", "timestamp": ts_s, "sessionId": "snzm", "requestId": f"r{i}", "message": {"id": f"m{i}", "model": "claude-sonnet-5-5", "usage": {"input_tokens": tok, "output_tokens": 0}}})
+                for i, (ts_s, tok) in enumerate(mid_claude)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (r_p / "LOG.md").write_text(
             "\n".join(
                 [
-                    json.dumps({"timestamp": iso_curr, "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}),
-                    json.dumps({"timestamp": iso_curr, "type": "event_msg", "payload": {"type": "error", "error": {"type": "rate_limit_error", "status": 429}}}),
-                    json.dumps({"timestamp": iso_curr, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10000, "cached_input_tokens": 8000, "cache_write_input_tokens": 0, "output_tokens": 2000, "total_tokens": 12000}}}}),
+                    "# Agent Relay Log",
+                    "",
+                    "## 01-agy: ok, 10s, 2026-11-14 23:59:59",
+                    "- agy: model gemini-4-carbon-high, tokens 410",
+                    "",
+                    "## 02-agy: ok, 10s, 2026-11-15 00:00:00",
+                    "- agy: model gemini-4-carbon-high, tokens 820",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
-        cxc = sqlite3.connect(str(x_p / "state_5.sqlite"))
-        cxc.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT)")
-        cxc.execute("INSERT INTO threads VALUES ('th-mis-curr', '/tmp/p', 50000, ?, 'gpt-6.1-sol', ?)", (int(t_curr), str(rmis)))
-        cxc.commit()
-        cxc.close()
-
-        r4_en = run_cli_json(bin_path, "daily", ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
-        r4_zh = run_cli_json(bin_path, "daily", ["--lang", "zh", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
-        en_days = {d["date"]: d for d in r4_en["dailyBreakdown"]}
-        zh_days = {d["date"]: d for d in r4_zh["dailyBreakdown"]}
-
-        synth_r4_ok = (
-            en_days[k_prev]["pricedRecordCount"] == 1
-            and en_days[k_prev]["unmatchedModelCount"] == 2
-            and en_days[k_prev]["costNote"] == "Covers 1 priced records only; 2 unknown-model records excluded"
-            and zh_days[k_prev]["costNote"] == "只含已计价的 1 条，另有 2 条未知型号未计入"
-            and en_days[k_prev]["hasCodexRolloutMismatch"] is False
-            and en_days[k_prev]["rateLimit429Count"] == 0
-            and en_days[k_curr]["hasCodexRolloutMismatch"] is True
-            and "th-mis-curr: rollout=12000 vs sqlite=50000" in (en_days[k_curr]["codexMismatchNote"] or "")
-            and "th-mis-curr: rollout=12000 vs sqlite=50000" in (zh_days[k_curr]["codexMismatchNote"] or "")
-            and en_days[k_curr]["rateLimit429Count"] == 2
+        nzm_doc = run_cli_json(
+            bin_path,
+            "snapshot",
+            ["--lang", "en", "--tz", "Pacific/Auckland", "--home", str(thome), "--workspace", str(tws), "--now", "2026-11-15T11:00:00Z"],
         )
+        nzm_days = {d["date"]: d["totalTokens"] for d in nzm_doc["dailyBreakdown"]}
+        for dk, exp_tok in EXPECTED_NZ_CROSS_MIDNIGHT.items():
+            if nzm_days.get(dk) != exp_tok:
+                errs.append(f"NZ-midnight[{dk}]: got={nzm_days.get(dk)}, exp={exp_tok}")
 
-    # Live host per-day B14/B15/B7 exact match against Python oracle
-    live_meta_ok = True
-    for d_entry in live_cli_en["dailyBreakdown"]:
-        dk = d_entry["date"]
-        rd = live_ref["days"][dk]
-        if (
-            int(d_entry["pricedRecordCount"]) != rd["priced"]
-            or int(d_entry["unmatchedModelCount"]) != rd["unmatched"]
-            or bool(d_entry["hasCodexRolloutMismatch"]) != rd["codex_mismatch"]
-            or int(d_entry["rateLimit429Count"]) != rd["rl429"]
-        ):
-            live_meta_ok = False
-            break
+    ok = len(errs) == 0
+    msg = (
+        "Pacific/Auckland verified: NZDT start 2026-09-27 (23h)=16,400 (02:30 gap->untimestamped=999), "
+        "NZDT end 2027-04-04 (25h)=13,800 (both 02:30s summed, 5h=5,600/1,200), cross-midnight=[710, 6,120]"
+        if ok
+        else "; ".join(errs)
+    )
+    return (ok, msg)
 
-    live_14d_unmatched = sum(int(d["unmatchedModelCount"]) for d in live_cli_en["dailyBreakdown"])
-    live_14d_429 = sum(int(d["rateLimit429Count"]) for d in live_cli_en["dailyBreakdown"])
-    live_14d_mis_days = sum(1 for d in live_cli_en["dailyBreakdown"] if d["hasCodexRolloutMismatch"])
-    agy_not_complete = live_cli_en["vendors"]["agy"]["completeness"] != "complete" and live_cli_zh["vendors"]["agy"]["completeness"] != "complete"
 
-    row4_ok = synth_r4_ok and live_meta_ok and agy_not_complete
-    if not row4_ok:
-        failures.append("Row 4 (Per-day B14/B15 & structured B7 429 counting)")
-    print(
-        f"[Row 4] {'PASS' if row4_ok else 'FAIL'} | Per-day B14/B15 + structured B7: "
-        f"prose_429=0, structured_429=2, per-day costNote & mismatchNote EN/ZH verified; "
-        f"live 14d unmatched={live_14d_unmatched}, 429s={live_14d_429}, mismatch_days={live_14d_mis_days}, agy={live_cli_en['vendors']['agy']['completeness']}"
+# ===========================================================================
+# Check 8 (Opt-In): Read-Only Live-Host Structural Smoke Check (AGENTBAR_LIVE_HOST=1)
+# ===========================================================================
+
+
+def verify_row8_optional_live_host(bin_path: pathlib.Path) -> tuple[bool | None, str]:
+    if os.environ.get("AGENTBAR_LIVE_HOST") != "1":
+        return (
+            None,
+            "AGENTBAR_LIVE_HOST != 1; live-host read-only smoke check skipped (counted as skipped, never as passed)",
+        )
+    doc = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "Pacific/Auckland"])
+    ok = (
+        doc.get("schemaVersion") == "1.1"
+        and len(doc.get("dailyBreakdown", [])) == 14
+        and "untimestamped" in doc
+        and doc["vendors"]["agy"]["completeness"] != "complete"
+    )
+    tot_14d = sum(int(d["totalTokens"]) for d in doc["dailyBreakdown"])
+    u_tok = int(doc["untimestamped"]["totalTokens"])
+    return (
+        ok,
+        f"live-host Pacific/Auckland schemaVersion=1.1, 14d_tokens={tot_14d:,}, untimestamped={u_tok:,}, agy={doc['vendors']['agy']['completeness']}",
     )
 
-    # ------------------------------------------------------------------
-    # Row 5: W1 Scripted isolated M1 mutations
-    # ------------------------------------------------------------------
-    mut_ok, mut_summary = run_m1_scripted_mutations()
-    if not mut_ok:
-        failures.append(f"Row 5 ({mut_summary})")
-    print(f"[Row 5] {'PASS' if mut_ok else 'FAIL'} | Scripted isolated M1 mutations: {mut_summary}")
+
+def main() -> int:
+    mtime_start = plist_mtime()
+    bin_path = resolve_agentbar_bin()
+    rel_bin = bin_path.relative_to(REPO_ROOT) if bin_path.is_relative_to(REPO_ROOT) else pathlib.Path(bin_path.name)
+
+    print("=" * 78)
+    print(f"AgentBar M1 Independent Acceptance Ledger (measurement date: {dt.date.today().isoformat()})")
+    print(f"Binary: {rel_bin}")
+    print("Oracle mode: Hand-calculated literal expected tables beside fixtures (zero collector re-implementation)")
+    print("=" * 78)
+
+    passed = 0
+    skipped = 0
+    failures: list[str] = []
+
+    def record(row_label: str, status: bool | None, detail: str) -> None:
+        nonlocal passed, skipped
+        if status is None:
+            skipped += 1
+            print(f"[{row_label}] SKIP | {detail}")
+        elif status:
+            passed += 1
+            print(f"[{row_label}] PASS | {detail}")
+        else:
+            failures.append(f"{row_label} ({detail})")
+            print(f"[{row_label}] FAIL | {detail}")
+
+    r1a_ok, r1a_msg, r1b_ok, r1b_msg = verify_row1_cross_day(bin_path)
+    record("Row 1a", r1a_ok, f"Cross-day 3d sessions (.jsonl/SQLite/journal): {r1a_msg}")
+    record("Row 1b", r1b_ok, f"Cross-day archived Codex .jsonl.zst: {r1b_msg}")
+
+    r2_ok, r2_msg = verify_row2_14d_70cells(bin_path)
+    record("Row 2 ", r2_ok, f"14d x 5-vendor 70-cell literal ledger: {r2_msg}")
+
+    r3_ok, r3_msg = verify_row3_and_br3_exact_boundaries(bin_path)
+    record("Row 3 ", r3_ok, f"fiveHours [now-5h, now] & BR3 exact-second boundaries: {r3_msg}")
+
+    r4_ok, r4_msg = verify_row4_b14_b15_b7(bin_path)
+    record("Row 4 ", r4_ok, f"Per-day B14/B15 + structured B7 429: {r4_msg}")
+
+    r5_ok, r5_msg = verify_row5_scripted_mutations()
+    record("Row 5 ", r5_ok, f"Scripted isolated M1 + BR1/BR3 mutations (8): {r5_msg}")
+
+    r6_ok, r6_msg = verify_row6_br1_untimestamped(bin_path)
+    record("Row 6 ", r6_ok, f"BR1 missing/corrupt timestamps -> untimestamped: {r6_msg}")
+
+    r7_ok, r7_msg = verify_row7_br2_pacific_auckland(bin_path)
+    record("Row 7 ", r7_ok, f"BR2 --tz Pacific/Auckland DST & cross-midnight: {r7_msg}")
+
+    r8_ok, r8_msg = verify_row8_optional_live_host(bin_path)
+    record("Row 8 ", r8_ok, f"Optional live-host smoke check: {r8_msg}")
 
     mtime_end = plist_mtime()
     if mtime_start != mtime_end:
         failures.append(f"Preference plist mtime changed ({mtime_start} -> {mtime_end})")
 
     print("=" * 78)
+    print(f"SUMMARY: passed={passed}, skipped={skipped}, failed={len(failures)} (skipped checks are never counted as passed)")
     if failures:
         print(f"RESULT: FAILED ({len(failures)} check(s): {', '.join(failures)})")
         return 1
-    print("RESULT: ALL 5 M1 ACCEPTANCE ROWS + PART 2 PER-DAY B14/B15 + STRUCTURED B7 + W1 PASSED (read-only verified).")
+    print(f"RESULT: PASSED ({passed} passed, {skipped} skipped, 0 failed; plist untouched).")
     return 0
 
 

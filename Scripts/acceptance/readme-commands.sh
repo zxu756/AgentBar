@@ -291,4 +291,4 @@ if [ "$MTIME_BEFORE" != "$MTIME_AFTER" ]; then
 fi
 
 echo ""
-echo "RESULT: ALL $CMD_COUNT README COMMANDS VERIFIED ($EXECUTED executed, $SKIPPED explicitly skipped; plist untouched)."
+echo "RESULT: README COMMAND REPLAY PASSED (passed=$EXECUTED/$CMD_COUNT README commands + 1 negative check, skipped=$SKIPPED/$CMD_COUNT not counted as passed, failed=0; plist untouched)."

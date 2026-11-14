@@ -391,6 +391,148 @@ struct CLITests {
         #expect(dailyHumanZH.stdout.contains("只含已计价的 1 条，另有 2 条未知型号未计入"))
         #expect(dailyHumanZH.stdout.contains("2026-11-14"))
         #expect(dailyHumanZH.stdout.contains("th-d14: rollout=12000 vs sqlite=50000"))
+        #expect(!dailyHumanZH.stdout.contains("没有时间 |"))
+    }
+
+    @Test("M1 BR1: CLI --json and EN/ZH text surface untimestamped ('No timestamp' / '没有时间') separately from all windows and dated rows")
+    func cliSurfacesUntimestampedBucketInJSONAndBilingualText() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-cli-br1-\(UUID().uuidString)")
+        let homeDir = tmp.appendingPathComponent("home")
+        let wsDir = tmp.appendingPathComponent("ws")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-br1")
+        let codexDir = homeDir.appendingPathComponent(".codex")
+        let ocDir = homeDir.appendingPathComponent(".local/share/opencode")
+        let vibeJournal = homeDir.appendingPathComponent(".vibe/logs/session/unified/s-vibe-br1/journal")
+        let relayDir = wsDir.appendingPathComponent("pipe/.relay")
+
+        for d in [claudeProj, codexDir, ocDir, vibeJournal, relayDir] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        // Claude: 1 missing timestamp (1000 tok) + 1 malformed timestamp (1310 tok) = 2310 untimestamped; 0 dated
+        try """
+        {"type":"assistant","sessionId":"sc1","requestId":"r1","cwd":"/tmp/br1","message":{"id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":800,"output_tokens":200}}}
+        {"type":"assistant","timestamp":"not-a-date","sessionId":"sc1","requestId":"r2","cwd":"/tmp/br1","message":{"id":"m2","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":310}}}
+        """.write(to: claudeProj.appendingPathComponent("s1.jsonl"), atomically: true, encoding: .utf8)
+
+        // Codex: rollout event missing timestamp (1100 tok; thread updated_at = 2026-11-14T12:00:00Z = 1794657600)
+        let rolloutURL = codexDir.appendingPathComponent("rollout-br1.jsonl")
+        try """
+        {"type":"turn_context","payload":{"model":"gpt-5.4"}}
+        {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":100,"total_tokens":1100}}}}
+        """.write(to: rolloutURL, atomically: true, encoding: .utf8)
+        try execSQL(at: codexDir.appendingPathComponent("state_5.sqlite"), sql: """
+        CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, tokens_used INTEGER, updated_at INTEGER, model TEXT, rollout_path TEXT);
+        INSERT INTO threads VALUES ('th-br1', '/tmp/br1', 1100, 1794657600, 'gpt-5.4', '\(rolloutURL.path)');
+        """)
+
+        // OpenCode: session_message missing timestamp (77 tok; session_v2.time_updated = 2026-11-13T12:00:00Z = 1794571200000)
+        try execSQL(at: ocDir.appendingPathComponent("opencode.db"), sql: """
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, cost REAL, tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, tokens_cache_write INTEGER, model TEXT, time_updated INTEGER);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+        INSERT INTO session_v2 VALUES ('oc-br1', '/tmp/br1', 0.01, 50, 27, 0, 0, 0, 'claude-sonnet-4-6', 1794571200000);
+        INSERT INTO session_message VALUES ('m-br1', 'oc-br1', 'assistant', 1, 0, 0,
+            '{"model":{"id":"claude-sonnet-4-6"},"tokens":{"input":50,"output":27,"reasoning":0,"cache":{"read":0,"write":0}}}');
+        """)
+
+        // Vibe: journal action_result without preceding timestamp (500 tok)
+        try """
+        {"session_id":"s-vibe-br1","start_time":"2026-11-12T12:00:00Z","config":{"active_model":"deepseek-v4"}}
+        """.write(to: vibeJournal.deletingLastPathComponent().appendingPathComponent("meta.json"), atomically: true, encoding: .utf8)
+        try """
+        {"sequence":1,"type":"action_result","payload":{"action_id":"a-br1","state":"succeeded","result":{"type":"completion_succeeded","result":{"usage":{"input_tokens":400,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":100,"total_tokens":500}}}}}
+        """.write(to: vibeJournal.appendingPathComponent("0000000000000001.jsonl"), atomically: true, encoding: .utf8)
+
+        // Relay LOG.md: AGY step without timestamp (900 tok)
+        try """
+        # Agent Relay Log
+
+        ## 01-agy: ok, 30s
+        - agy: model gemini-2.5-pro, tokens 900, cost $0.0300
+        """.write(to: relayDir.appendingPathComponent("LOG.md"), atomically: true, encoding: .utf8)
+
+        let nowStr = "2026-11-15T12:00:00Z"
+
+        let jsonEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--json", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(jsonEN.exitCode == 0)
+        let rootEN = try #require(try JSONSerialization.jsonObject(with: Data(jsonEN.stdout.utf8)) as? [String: Any])
+        let vendorsEN = try #require(rootEN["vendors"] as? [String: Any])
+
+        let expectedUntimestamped: [String: (tok: Int, rec: Int)] = [
+            "claude": (2_310, 2),
+            "codex": (1_100, 1),
+            "opencode": (77, 1),
+            "vibe": (500, 1),
+            "agy": (900, 1)
+        ]
+        for (vKey, exp) in expectedUntimestamped {
+            let vObj = try #require(vendorsEN[vKey] as? [String: Any])
+            let wins = try #require(vObj["windows"] as? [String: Any])
+            for wKey in ["fiveHours", "today", "sevenDays", "thirtyDays"] {
+                let wObj = try #require(wins[wKey] as? [String: Any])
+                let wTok = (wObj["totalTokens"] as? Int) ?? 0
+                #expect(wTok == 0, "\(vKey).windows.\(wKey) leaked \(wTok) tokens")
+                #expect(wObj["recordCount"] as? Int == 0)
+            }
+            let uObj = try #require(vObj["untimestamped"] as? [String: Any])
+            #expect(uObj["totalTokens"] as? Int == exp.tok)
+            #expect(uObj["recordCount"] as? Int == exp.rec)
+        }
+
+        let dailyArr = try #require(rootEN["dailyBreakdown"] as? [[String: Any]])
+        #expect(dailyArr.count == 14)
+        for dRow in dailyArr {
+            #expect(dRow["totalTokens"] as? Int == 0)
+            #expect(dRow["recordCount"] as? Int == 0)
+        }
+
+        let topUntimestampedEN = try #require(rootEN["untimestamped"] as? [String: Any])
+        #expect(topUntimestampedEN["date"] as? String == "No timestamp")
+        // 2310 + 1100 + 77 + 500 + 900 = 4887 tokens across 6 records
+        #expect(topUntimestampedEN["totalTokens"] as? Int == 4_887)
+        #expect(topUntimestampedEN["recordCount"] as? Int == 6)
+
+        let jsonZH = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--json", "--lang", "zh", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(jsonZH.exitCode == 0)
+        let rootZH = try #require(try JSONSerialization.jsonObject(with: Data(jsonZH.stdout.utf8)) as? [String: Any])
+        let topUntimestampedZH = try #require(rootZH["untimestamped"] as? [String: Any])
+        #expect(topUntimestampedZH["date"] as? String == "没有时间")
+        #expect(topUntimestampedZH["totalTokens"] as? Int == 4_887)
+
+        let snapTextZH = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "zh", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(snapTextZH.exitCode == 0)
+        #expect(snapTextZH.stdout.contains("没有时间:"))
+
+        let snapTextEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(snapTextEN.exitCode == 0)
+        #expect(snapTextEN.stdout.contains("No timestamp:"))
+
+        let dailyTextZH = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--lang", "zh", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(dailyTextZH.exitCode == 0)
+        #expect(dailyTextZH.stdout.contains("没有时间 |"))
+
+        let dailyTextEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(dailyTextEN.exitCode == 0)
+        #expect(dailyTextEN.stdout.contains("No timestamp |"))
     }
 
     private func execSQL(at url: URL, sql: String) throws {
