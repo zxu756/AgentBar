@@ -6,7 +6,7 @@
 
 **零网络请求 · `SQLITE_OPEN_READONLY` 严格只读 · 零固定比例估算 · 实时 `中文 / EN` 双语界面与无头 `--cli` · 零第三方依赖 (`macOS 14.0+`)**
 
-> **发布状态说明（未发布（v0.2.0 之后））**：当前 Homebrew Cask 已发布的 `v0.2.0` 仅包含初版菜单栏界面；无头命令行 `--cli snapshot` 与 `--cli daily`、`--tz` / `--home` / `--workspace` / `--now` / `--no-zstd`、`Scripts/test.sh`、五级完整度（`complete` / `mismatch` / `totalOnly` / `relayOnly` / `noData`）、`Claude` / `Codex` / `OpenCode` / `Mistral Vibe` 逐事件时间戳归桶、结构化 `429` 限流计数、按窗口及按日的已计价/未知型号条数说明及流式去重均属 **未发布（v0.2.0 之后）**，请按下方源码方式编译使用。
+> **发布状态说明（v0.3.0 起）**：此前发布的 Homebrew Cask `v0.2.0` 仅包含初版菜单栏界面；无头命令行 `--cli snapshot` 与 `--cli daily`、`--tz` / `--home` / `--workspace` / `--now` / `--no-zstd`、`Scripts/test.sh`、五级完整度（`complete` / `mismatch` / `totalOnly` / `relayOnly` / `noData`）、`Claude` / `Codex` / `OpenCode` / `Mistral Vibe` 逐事件时间戳归桶、结构化 `429` 限流计数、按窗口及按日的已计价/未知型号条数说明及流式去重均自 **v0.3.0 起** 提供（可按下方用 Homebrew 安装 `v0.3.0`，或从源码编译）。
 
 ![AgentBar 中文主账本面板 — DEMO 演示数据](docs/screenshot-dashboard-zh.png)
 *`[DEMO / 演示数据]` 上图由确定性合成预览数据（`--demo` / `--export-screenshots`）渲染生成，绝不包含任何个人真实本地日志。*
@@ -21,7 +21,7 @@
 
 ## AgentBar 统计什么（以及不猜测什么）
 
-同时使用多款本地 AI 编程 CLI（`claude`、`codex`、`opencode`、`vibe`、`agy`）时，用量分散在包月滚动窗口、API 预付额度与多工具文件接力记录中。**AgentBar** 通过原生菜单栏界面与无头命令行（`AgentBar --cli snapshot|daily [--json]`，未发布（v0.2.0 之后））以严格只读方式汇总本地真实记录：
+同时使用多款本地 AI 编程 CLI（`claude`、`codex`、`opencode`、`vibe`、`agy`）时，用量分散在包月滚动窗口、API 预付额度与多工具文件接力记录中。**AgentBar** 通过原生菜单栏界面与无头命令行（`AgentBar --cli snapshot|daily [--json]`，v0.3.0 起）以严格只读方式汇总本地真实记录：
 
 - **逐事件时间戳归桶与「没有时间」隔离（`最近 5 小时`、`今天`、`7 天`、`14 天按日`、`30 天`、`没有时间`）**：将跨天长会话按每轮真实事件时间戳拆分——涵盖 `Claude Code` 单轮 JSONL、`Codex` rollout `token_count` 累计差值、`OpenCode` `session_message` 逐消息行以及 `Mistral Vibe` `unified/*/journal/*.jsonl` 动作记录。会话级更新时间（`threads.updated_at` / `session_v2.time_updated`）**仅**用于完全没有逐事件记录且会话时间戳有效的聚合会话；缺失或损坏时间戳的逐事件记录（以及会话时间戳缺失/为 `0` 的聚合会话）绝不退回 `now`、会话 `updated_at` 或文件修改时间 `mtime`，对 `5h` / `今天` / `7d` / `30d` 及有日期按日行贡献为 `0`，统一单独计入 `untimestamped`（`没有时间` / `No timestamp`）。
 - **流式内容块去重统计（`Claude Code`）**：按 `(message.id, requestId)` 对同一轮回复的多条流式块（`thinking`、`text`、`tool_use`）去重并取最终最大用量，消除多块重复累加。
@@ -111,7 +111,7 @@ swift build
 open build/AgentBar.app
 ```
 
-### Homebrew Cask 安装（`v0.2.0` — M0 前已发布界面版本）
+### Homebrew Cask 安装（`v0.3.0`）
 
 ```bash
 brew install --cask zxu756/tap/agentbar
@@ -121,7 +121,7 @@ brew install --cask zxu756/tap/agentbar
 
 ---
 
-## 无头命令行（Headless CLI）与验收复现（未发布（v0.2.0 之后））
+## 无头命令行（Headless CLI）与验收复现（v0.3.0 起）
 
 `AgentBar` 在进入 `AppKit` 事件循环前处理 `--cli`，与菜单栏界面共用同一套采集函数，不弹窗、不写 `~/Library/Preferences`。可通过 `--tz UTC`（或 `--tz local` / IANA 时区名）固定跨脚本对账的自然日边界。若显式传入不存在的 `--home <目录>` 或 `--workspace <目录>`，命令将向 `stderr` 输出错误并以退出码 `2` 退出；默认 `HOME` 下某款 CLI 未安装则显示 `没有数据`：
 

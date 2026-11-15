@@ -1,6 +1,6 @@
-# AgentBar Technical Specification (`M1` — Unreleased after `v0.2.0`)
+# AgentBar Technical Specification (`M1` — since `v0.3.0`)
 
-This specification defines the data-collection contracts, per-event timestamp attribution, five-level completeness taxonomy, structured `429` rate-limit detection, API-equivalent pricing table, and headless CLI schema (`schemaVersion: "1.1"`) for **AgentBar** (`Unreleased (after v0.2.0)`, branch `m1/real`).
+This specification defines the data-collection contracts, per-event timestamp attribution, five-level completeness taxonomy, structured `429` rate-limit detection, API-equivalent pricing table, and headless CLI schema (`schemaVersion: "1.1"`) for **AgentBar** (since `v0.3.0`).
 
 ---
 
@@ -167,7 +167,7 @@ Rates below were inherited from the offline baseline without live network verifi
 
 ---
 
-## 6. Headless CLI Contract (`schemaVersion = "1.1"`, `Unreleased (after v0.2.0)`)
+## 6. Headless CLI Contract (`schemaVersion = "1.1"`, `since v0.3.0`)
 
 ```text
 AgentBar --cli snapshot [--json] [--lang en|zh] [--tz <UTC|local|tzID>] [--home <dir>] [--workspace <dir>] [--now <ISO8601|epoch>] [--no-zstd] [--demo]

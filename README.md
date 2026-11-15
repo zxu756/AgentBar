@@ -6,7 +6,7 @@
 
 **Zero network calls · `SQLITE_OPEN_READONLY` · Zero fixed-ratio estimates · Live `中文 / EN` UI & Headless `--cli` · Zero third-party dependencies (`macOS 14.0+`)**
 
-> **Release status (`Unreleased (after v0.2.0)`)**: Published Homebrew Cask `v0.2.0` contains the initial menu bar UI only. Headless `--cli snapshot` & `--cli daily`, `--tz` / `--home` / `--workspace` / `--now` / `--no-zstd`, `Scripts/test.sh`, five-level completeness (`complete` / `mismatch` / `totalOnly` / `relayOnly` / `noData`), per-event timestamp bucketing across `Claude` / `Codex` / `OpenCode` / `Mistral Vibe`, structured `429` rate-limit detection, explicit per-window & per-day priced-vs-excluded cost notes, and streaming deduplication are **`Unreleased (after v0.2.0)`**—build from source below to use them.
+> **Release status (`since v0.3.0`)**: The earlier Homebrew Cask `v0.2.0` contains the initial menu bar UI only. Headless `--cli snapshot` & `--cli daily`, `--tz` / `--home` / `--workspace` / `--now` / `--no-zstd`, `Scripts/test.sh`, five-level completeness (`complete` / `mismatch` / `totalOnly` / `relayOnly` / `noData`), per-event timestamp bucketing across `Claude` / `Codex` / `OpenCode` / `Mistral Vibe`, structured `429` rate-limit detection, explicit per-window & per-day priced-vs-excluded cost notes, and streaming deduplication are **available since v0.3.0** (install `v0.3.0` via Homebrew below, or build from source).
 
 ![AgentBar Dashboard — DEMO preview fixture](docs/screenshot-dashboard.png)
 *`[DEMO]` Dashboard rendered from deterministic synthetic preview data (`--demo` / `--export-screenshots`), never from personal local logs.*
@@ -21,7 +21,7 @@
 
 ## What AgentBar Measures (and What It Does Not Guess)
 
-Developers working across multiple coding CLIs (`claude`, `codex`, `opencode`, `vibe`, `agy`) split sessions across subscription burst windows, prepaid API credits, and file-handoff relays. **AgentBar** aggregates local telemetry strictly read-only in both a native SwiftUI menu bar app and a headless CLI (`AgentBar --cli snapshot|daily [--json]`, `Unreleased (after v0.2.0)`):
+Developers working across multiple coding CLIs (`claude`, `codex`, `opencode`, `vibe`, `agy`) split sessions across subscription burst windows, prepaid API credits, and file-handoff relays. **AgentBar** aggregates local telemetry strictly read-only in both a native SwiftUI menu bar app and a headless CLI (`AgentBar --cli snapshot|daily [--json]`, `since v0.3.0`):
 
 - **Per-Event Timestamp Attribution & `No timestamp` Isolation (`5h`, `Today`, `7d`, `14d Daily`, `30d`, `No timestamp`)**: Splits multi-day sessions into exact turn/message timestamps across `Claude Code` JSONL turns, `Codex` rollout `token_count` cumulative deltas, `OpenCode` `session_message` rows, and `Mistral Vibe` `unified/*/journal/*.jsonl` actions. Session-level timestamps (`threads.updated_at` / `session_v2.time_updated`) are used **only** for aggregate-only sessions that have zero per-event token records and a valid session timestamp; per-event records with missing or malformed timestamps (or aggregate-only sessions with missing/`0` timestamps) never fall back to `now`, session `updated_at`, or file `mtime`, contribute `0` to `5h` / `Today` / `7d` / `30d` and dated `dailyBreakdown` rows, and are tallied separately in `untimestamped` (`No timestamp` / `没有时间`).
 - **Deduplicated Streaming Turn Accounting (`Claude Code`)**: Deduplicates multi-block streaming JSONL lines by `(message.id, requestId)` (taking final per-turn max usage) so thinking/text/tool chunks are never double-counted.
@@ -111,7 +111,7 @@ swift build
 open build/AgentBar.app
 ```
 
-### Homebrew Cask (`v0.2.0` — pre-M0 GUI release)
+### Homebrew Cask (`v0.3.0`)
 
 ```bash
 brew install --cask zxu756/tap/agentbar
@@ -121,7 +121,7 @@ brew install --cask zxu756/tap/agentbar
 
 ---
 
-## Headless CLI & Verification Commands (`Unreleased (after v0.2.0)`)
+## Headless CLI & Verification Commands (`since v0.3.0`)
 
 `AgentBar` handles `--cli` before initializing `AppKit`, reading the same collector pipeline as the menu bar UI without opening windows or touching `~/Library/Preferences`. Pass `--tz UTC` (or `--tz local` / an IANA identifier) for deterministic day boundaries across scripts. Passing a non-existent `--home <dir>` or `--workspace <dir>` exits with code `2` and an error on `stderr`; omitting `--home` scans `$HOME` and reports `No data` for uninstalled CLIs:
 
