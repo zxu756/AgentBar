@@ -1052,6 +1052,10 @@ public enum TelemetryFormatter {
         return language == .zhHans ? "未知" : "Unknown"
     }
 
+    public static func englishCount(_ count: Int, singular: String, plural: String) -> String {
+        "\(count) \(count == 1 ? singular : plural)"
+    }
+
     public static func costCoverageNote(
         pricedCount: Int,
         unmatchedCount: Int,
@@ -1064,7 +1068,9 @@ public enum TelemetryFormatter {
             }
             return "含已计价的 \(pricedCount) 条，0 条未知型号未计入"
         case .en:
-            return "Covers \(pricedCount) priced records only; \(unmatchedCount) unknown-model records excluded"
+            let pricedPhrase = englishCount(pricedCount, singular: "priced record", plural: "priced records")
+            let unmatchedPhrase = englishCount(unmatchedCount, singular: "unknown-model record", plural: "unknown-model records")
+            return "Covers \(pricedPhrase) only; \(unmatchedPhrase) excluded"
         }
     }
 }

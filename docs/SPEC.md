@@ -112,8 +112,8 @@ Otherwise `cacheHitRate` is `null`.
 
 ### Priced vs Excluded Unknown-Model Coverage (`B14`)
 
-Every window tracks `pricedRecordCount` ($N$) and `unmatchedModelCount` / `unknownModelRecordCount` ($M$) separately and emits `costNote` alongside every cost figure:
-- English: `Covers N priced records only; M unknown-model records excluded`
+Every window and daily entry tracks `pricedRecordCount` ($N$) and `unmatchedModelCount` ($M$, plus vendor-level `unmatchedModelCount30d`) separately and emits `costNote` alongside every cost figure:
+- English: `Covers N priced record(s) only; M unknown-model record(s) excluded` (singular `record` when count is `1`, plural `records` otherwise)
 - Simplified Chinese ($M > 0$): `只含已计价的 N 条，另有 M 条未知型号未计入`
 - Simplified Chinese ($M = 0$): `含已计价的 N 条，0 条未知型号未计入`
 

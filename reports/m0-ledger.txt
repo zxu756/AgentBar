@@ -1,13 +1,15 @@
 ==============================================================================
 AgentBar M0 Independent Acceptance Ledger (measurement date: 2026-11-15)
 Binary: .build/debug/AgentBar
-Frozen evaluation epoch (--now): 1794655433
+Frozen evaluation epoch (--now): 1794708265
 ==============================================================================
-[Row 1] PASS | Claude 30d: live raw_lines=21996 -> dedup_records=9104 (ref=9104, diff=0.0000%), totalTokens=2,672,515,682 (ref=2,672,515,682, diff=0.0000%), priced=7487, unmatchedModels=1617; synthetic 2->1 dedup=5,900 tok
-[Row 2] PASS | Codex 30d: live 4730 rollouts: in=19,617,608, cacheRead=849,549,824, out=2,001,037, hitRate=0.9774; synth rollout=complete(hitRate=0.9600), missing-rollout=totalOnly(nulls), mismatch(12000!=50000)=mismatch('总量不一致')
-[Row 3] PASS | .relay/LOG.md: live rea-lol 126/126 steps, 88-verify vendor=None, recordedCost=$5.4971; synthetic 126/126 verified
+[Row 1] PASS | Claude 30d: empty HOME -> completeness=noData; synthetic 2->1 streaming dedup=5,900 tok verified
+[Row 2] PASS | Codex 30d: empty HOME -> noData; synth rollout=complete(hitRate=0.9600), missing-rollout=totalOnly(nulls), mismatch(12000!=50000)=mismatch('总量不一致')
+[Row 3] PASS | .relay/LOG.md: synthetic 126/126 verified
 [Row 4] PASS | Collector/pricing scan for 0.85|0.15: 0 matches; mistralVibe UI color=0.85 (0.848 hits=0)
-[Row 5] PASS | Scripted isolated mutations: M1-claude-dedup=RED(rc=1), M2-cache-hit-denom=RED(rc=1), M3-relay-heading-bleed=RED(rc=1), M4-codex-missing-rollout-split=RED(rc=1), M5-codex-mismatch-ignored=RED(rc=1), restored=GREEN(rc=0)
-[Row 6] PASS | vibe=complete ('Complete'/'完整'), agy=relayOnly ('Relay logs only'/'只有接力里的部分'), pricingVersion=unverified, b11_hits=0, b13_zh_source=ok, b14_note=ok, b16_bad_home_exit=2, opencode_30d_tokens=4,866,444,113 (records=20329)
+[Row 5] PASS | Scripted isolated mutations: M1-claude-dedup=RED(rc=1), M2-cache-hit-denom=RED(rc=1), M3-relay-heading-bleed=RED(rc=1), M4-codex-missing-rollout-split=RED(rc=1), B12-pricing-unverified=RED(rc=1), B13-zh-datasource-english=RED(rc=1), B14-unmatched-model-count=RED(rc=1), B15-codex-mismatch-ignored=RED(rc=1), B16-nonexistent-home-exit-zero=RED(rc=1), B17-singular-plural-grammar=RED(rc=1), restored=GREEN(rc=0,git_diff=empty)
+[Row 6] PASS | vibe=noData ('No data'/'没有数据'), agy=noData ('No data'/'没有数据'), pricingVersion=unverified, b11_hits=0, b13_zh_source=ok, b14_note=ok, b16_bad_home_exit=2, opencode_30d_tokens=null (records=0)
+[Row 7] SKIP | Optional live-host parity check: AGENTBAR_LIVE_HOST != 1; live-host reads skipped (counted as skipped, never as passed)
 ==============================================================================
-RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B16 + W1/W4 PASSED (read-only verified).
+SUMMARY: passed=6, skipped=1, failed=0 (skipped checks are never counted as passed)
+RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B17 + W1/W4 PASSED (passed=6, skipped=1, failed=0; read-only verified).

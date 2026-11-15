@@ -18,10 +18,10 @@ duplicate collector implementation:
   Row 4:         Per-day B14 (pricedRecordCount, unmatchedModelCount, bilingual costNote),
                  per-day B15 (hasCodexRolloutMismatch, codexMismatchNote), B7 structured 429
                  vs prose traps, and Antigravity completeness != "complete".
-  Row 5 + BR3:   8 scripted isolated mutations in a clean temp workspace (including < -> <=
+  Row 5 + BR3:   14 scripted isolated mutations in a clean temp workspace (including < -> <=
                  on dayEnd, >= -> > on fiveHoursAgo & sevenDaysAgo, BR1 parsedTS ?? now,
-                 Codex session-ts, OpenCode message skip, Vibe action_id dedup removal, and
-                 prose 429 match) — all 8 compile, run, and FAIL (RED), then restore GREEN.
+                 Codex session-ts, OpenCode message skip, Vibe action_id dedup removal,
+                 prose 429 match, and B12-B17 guards) — all 14 compile, run, and FAIL (RED), then restore GREEN.
   Row 6 (BR1):   Missing & malformed timestamps across all 5 sources contribute 0 tokens and
                  0 records to 5h/today/7d/30d and all 14 dated rows, routing strictly to
                  untimestamped ("No timestamp" / "没有时间").
@@ -928,11 +928,14 @@ def verify_row4_b14_b15_b7(bin_path: pathlib.Path) -> tuple[bool, str]:
         for d in (c_p, x_p, r_p):
             d.mkdir(parents=True, exist_ok=True)
 
+        # 2026-11-13: 1 priced Sonnet ($4.50) + 1 unknown model -> singular/singular costNote
         # 2026-11-14: 1 priced Sonnet ($4.50) + 2 unknown models + prose 429 traps -> 0 rate limits!
         # 2026-11-15: 1 structured Claude 429
         (c_p / "r4.jsonl").write_text(
             "\n".join(
                 [
+                    '{"type":"assistant","timestamp":"2026-11-13T10:00:00Z","sessionId":"s13","requestId":"r0a","message":{"id":"m0a","model":"claude-sonnet-5-5","usage":{"input_tokens":1000000,"output_tokens":100000}}}',
+                    '{"type":"assistant","timestamp":"2026-11-13T10:05:00Z","sessionId":"s13","requestId":"r0b","message":{"id":"m0b","model":"claude-fable-5-1","usage":{"input_tokens":50000,"output_tokens":5000}}}',
                     '{"type":"assistant","timestamp":"2026-11-14T10:00:00Z","sessionId":"s","requestId":"r1","message":{"id":"m1","model":"claude-sonnet-5-5","content":[{"type":"text","text":"frame rate is 429 fps; corporate tax rate limit discussion"}],"usage":{"input_tokens":1000000,"output_tokens":100000}}}',
                     '{"type":"assistant","timestamp":"2026-11-14T10:05:00Z","sessionId":"s","requestId":"r2","message":{"id":"m2","model":"claude-fable-5-1","usage":{"input_tokens":50000,"output_tokens":5000}}}',
                     '{"type":"assistant","timestamp":"2026-11-14T10:10:00Z","sessionId":"s","requestId":"r3","message":{"id":"m3","model":"glm-5-3","usage":{"input_tokens":50000,"output_tokens":5000}}}',
@@ -968,15 +971,28 @@ def verify_row4_b14_b15_b7(bin_path: pathlib.Path) -> tuple[bool, str]:
             encoding="utf-8",
         )
 
-        r4_en = run_cli_json(bin_path, "snapshot", ["--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso])
+        r4_en_raw = run_cli(bin_path, "snapshot", ["--json", "--lang", "en", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso])
+        r4_en = json.loads(r4_en_raw)
         r4_zh = run_cli_json(bin_path, "snapshot", ["--lang", "zh", "--tz", "UTC", "--home", str(thome), "--workspace", str(tws), "--now", now_iso])
         en_days = {d["date"]: d for d in r4_en["dailyBreakdown"]}
         zh_days = {d["date"]: d for d in r4_zh["dailyBreakdown"]}
+        c_vendor = r4_en["vendors"]["claude"]
+        c_w30 = c_vendor["windows"]["thirtyDays"]
 
         ok = (
-            en_days["2026-11-14"]["pricedRecordCount"] == 1
+            "unknownModelRecordCount" not in r4_en_raw
+            and c_vendor["unmatchedModelCount30d"] == 3
+            and "unknownModelRecordCount30d" not in c_vendor
+            and c_w30["pricedRecordCount"] == 2
+            and c_w30["unmatchedModelCount"] == 3
+            and "unknownModelRecordCount" not in c_w30
+            and c_w30["costNote"] == "Covers 2 priced records only; 3 unknown-model records excluded"
+            and en_days["2026-11-13"]["pricedRecordCount"] == 1
+            and en_days["2026-11-13"]["unmatchedModelCount"] == 1
+            and en_days["2026-11-13"]["costNote"] == "Covers 1 priced record only; 1 unknown-model record excluded"
+            and en_days["2026-11-14"]["pricedRecordCount"] == 1
             and en_days["2026-11-14"]["unmatchedModelCount"] == 2
-            and en_days["2026-11-14"]["costNote"] == "Covers 1 priced records only; 2 unknown-model records excluded"
+            and en_days["2026-11-14"]["costNote"] == "Covers 1 priced record only; 2 unknown-model records excluded"
             and zh_days["2026-11-14"]["costNote"] == "只含已计价的 1 条，另有 2 条未知型号未计入"
             and en_days["2026-11-14"]["hasCodexRolloutMismatch"] is False
             and en_days["2026-11-14"]["rateLimit429Count"] == 0
@@ -987,17 +1003,17 @@ def verify_row4_b14_b15_b7(bin_path: pathlib.Path) -> tuple[bool, str]:
             and r4_en["vendors"]["agy"]["completeness"] == "relayOnly"
             and r4_zh["vendors"]["agy"]["completeness"] != "complete"
         )
-        msg = "prose_429=0, structured_429=2, per-day costNote & mismatchNote EN/ZH verified, agy=relayOnly(!=complete)"
+        msg = "prose_429=0, structured_429=2, canonical unmatchedModelCount, EN/ZH singular/plural costNote & mismatchNote verified, agy=relayOnly(!=complete)"
         return (ok, msg)
 
 
 # ===========================================================================
-# Check 5 (Row 5 + BR3 + BR1): 8 Scripted Isolated Mutations
+# Check 5 (Row 5 + BR3 + BR1 + B12-B17): 14 Scripted Isolated Mutations
 # ===========================================================================
 
 
 def verify_row5_scripted_mutations() -> tuple[bool, str]:
-    """Copy Package.swift + Sources + Tests to an isolated temp dir, run 8 targeted mutations, verify each fails RED."""
+    """Copy Package.swift + Sources + Tests to an isolated temp dir, run 14 targeted mutations (M1-M8 + B12-B17), verify each fails RED."""
     mutations = [
         (
             "M1-br3-day-upper-le",
@@ -1063,7 +1079,64 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
             "AgentBarCoreTests.CollectorsTests/structured429RateLimitCountingIgnoresProse",
             "M1 B7: Counts 429 rate limits strictly from structured status/error codes",
         ),
+        (
+            "B12-pricing-unverified",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            'public static let pricingVersion = "unverified"',
+            'public static let pricingVersion = "2026-11"',
+            "AgentBarCoreTests.PricingTests/pricingCatalog2026_11ExactArithmeticAndDisclaimer",
+            "Every PriceCatalog model row carries per-1M rates, official sourceURL, and honest unverified status",
+        ),
+        (
+            "B13-zh-datasource-english",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            '        case .antigravity:\n            return language == .zhHans\n                ? "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）"\n                : "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"',
+            '        case .antigravity:\n            return "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"',
+            "AgentBarCoreTests.CLITests/headlessSnapshotJSONBilingualAndNullHonesty",
+            "Headless --cli snapshot --json outputs exact schema, explicit JSON nulls, and EN/ZH labels",
+        ),
+        (
+            "B14-unmatched-model-count",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            "self.unmatchedModelCount = (!hasValidRecordedCost && est == nil) ? 1 : 0",
+            "self.unmatchedModelCount = 0",
+            "AgentBarCoreTests.CLITests/dailyBreakdownCarriesPerDayB14PricingAndB15Mismatch",
+            "M1 Part 2: Exposes 14-day dailyBreakdown in --cli snapshot and --cli daily with per-day B14 pricing counts, B15 Codex mismatch, B7 429s, and --tz UTC",
+        ),
+        (
+            "B15-codex-mismatch-ignored",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            "let isMismatch = (rolloutTotal != totalTok)\n                        || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)",
+            "let isMismatch = false && (rolloutTotal != totalTok || breakdown.reportedTotalTokens != nil)",
+            "AgentBarCoreTests.CLITests/costCoverageNoteAndCodexMismatchInCLI",
+            "Formats explicit priced N vs excluded unknown-model M beside cost and surfaces Codex rollout mismatch in EN/ZH CLI",
+        ),
+        (
+            "B16-nonexistent-home-exit-zero",
+            "Sources/AgentBarCore/CLI/CLIRunner.swift",
+            "if !fm.fileExists(atPath: explicitHome.path, isDirectory: &isDir) || !isDir.boolValue {",
+            "if false && (!fm.fileExists(atPath: explicitHome.path, isDirectory: &isDir) || !isDir.boolValue) {",
+            "AgentBarCoreTests.CLITests/nonexistentHomeOrWorkspaceExitsNonZeroWithError",
+            "Exits non-zero with stderr message when explicit --home or --workspace path does not exist or is not a directory",
+        ),
+        (
+            "B17-singular-plural-grammar",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            'let pricedPhrase = englishCount(pricedCount, singular: "priced record", plural: "priced records")',
+            'let pricedPhrase = "\\(pricedCount) priced records"',
+            "AgentBarCoreTests.CLITests/b17SingularPluralGrammarAndCanonicalUnmatchedModelCountKey",
+            "B17: Singular/plural English grammar across CLI snapshot/daily/relay and single canonical unmatchedModelCount JSON key",
+        ),
     ]
+
+    pre_repo_diff = ""
+    if (REPO_ROOT / ".git").exists():
+        pre_repo_diff = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "diff", "--", "Sources", "Tests"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
 
     with tempfile.TemporaryDirectory(prefix="agentbar-m1-mutations-") as tmpdir:
         mut_root = pathlib.Path(tmpdir) / "repo"
@@ -1076,6 +1149,12 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
 
         env = dict(os.environ)
         env["HOME"] = str(iso_home)
+
+        subprocess.run(["git", "init", "-q"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "config", "user.email", "mut@local"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "config", "user.name", "mut"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "add", "Package.swift", "Sources", "Tests"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "commit", "-qm", "baseline"], cwd=str(mut_root), env=env, check=True)
 
         details: list[str] = []
         for label, rel_file, target, replacement, test_filter, test_display in mutations:
@@ -1096,8 +1175,8 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
                 combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                 compiled = "Build complete!" in combined
                 ran = "Test run started" in combined
-                named_failed = (test_display in combined) and (
-                    "✘ Test" in combined or "recorded an issue" in combined or "failed" in combined
+                named_failed = (f'✘ Test "{test_display}' in combined) or (
+                    (test_display in combined) and "recorded an issue" in combined
                 )
                 if proc.returncode == 0 or not compiled or not ran or not named_failed:
                     return (
@@ -1107,6 +1186,13 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
                 details.append(f"{label}=RED(rc={proc.returncode})")
             finally:
                 fpath.write_text(original, encoding="utf-8")
+                git_diff = subprocess.run(
+                    ["git", "-C", str(mut_root), "diff", "--quiet", "--", "Package.swift", "Sources", "Tests"],
+                    env=env,
+                    check=False,
+                )
+                if fpath.read_text(encoding="utf-8") != original or git_diff.returncode != 0:
+                    return (False, f"{label}: failed to restore {rel_file} (git diff rc={git_diff.returncode})")
 
         clean_proc = subprocess.run(
             [
@@ -1115,6 +1201,10 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
                 "--no-parallel",
                 "--filter",
                 "AgentBarCoreTests.CollectorsTests",
+                "--filter",
+                "AgentBarCoreTests.PricingTests",
+                "--filter",
+                "AgentBarCoreTests.RelayLogTests",
                 "--filter",
                 "AgentBarCoreTests.CLITests",
             ],
@@ -1126,8 +1216,19 @@ def verify_row5_scripted_mutations() -> tuple[bool, str]:
         )
         if clean_proc.returncode != 0:
             return (False, f"restored workspace failed (rc={clean_proc.returncode})")
-        details.append("restored=GREEN(rc=0)")
-        return (True, ", ".join(details))
+
+    if (REPO_ROOT / ".git").exists():
+        post_repo_diff = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "diff", "--", "Sources", "Tests"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        if post_repo_diff != pre_repo_diff:
+            return (False, "git diff on REPO_ROOT Sources/Tests changed during mutation suite")
+
+    details.append("restored=GREEN(rc=0,git_diff=empty)")
+    return (True, ", ".join(details))
 
 
 # ===========================================================================
@@ -1593,7 +1694,7 @@ def main() -> int:
     record("Row 4 ", r4_ok, f"Per-day B14/B15 + structured B7 429: {r4_msg}")
 
     r5_ok, r5_msg = verify_row5_scripted_mutations()
-    record("Row 5 ", r5_ok, f"Scripted isolated M1 + BR1/BR3 mutations (8): {r5_msg}")
+    record("Row 5 ", r5_ok, f"Scripted isolated M1 + BR1/BR3 + B12-B17 mutations (14): {r5_msg}")
 
     r6_ok, r6_msg = verify_row6_br1_untimestamped(bin_path)
     record("Row 6 ", r6_ok, f"BR1 missing/corrupt timestamps -> untimestamped: {r6_msg}")

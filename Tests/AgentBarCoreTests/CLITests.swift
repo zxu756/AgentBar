@@ -76,7 +76,7 @@ struct CLITests {
         let requiredWindowKeys: Set<String> = [
             "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
             "totalTokens", "recordCount", "pricedRecordCount", "estimatedCostUSD",
-            "unknownModelRecordCount", "unmatchedModelCount", "costNote",
+            "unmatchedModelCount", "costNote",
             "cacheHitRate", "dataSource", "completeness", "completenessLabel",
             "hasRolloutMismatch", "rolloutMismatchCount", "mismatchNote"
         ]
@@ -84,13 +84,16 @@ struct CLITests {
         // Verify Claude 30d window
         let claudeObj = try #require(vendors["claude"] as? [String: Any])
         #expect(claudeObj["completeness"] as? String == "complete")
+        #expect(claudeObj["unmatchedModelCount30d"] as? Int == 0)
+        #expect(!claudeObj.keys.contains("unknownModelRecordCount30d"))
         let claudeWins = try #require(claudeObj["windows"] as? [String: Any])
         let claude30 = try #require(claudeWins["thirtyDays"] as? [String: Any])
         #expect(requiredWindowKeys.isSubset(of: Set(claude30.keys)))
+        #expect(!claude30.keys.contains("unknownModelRecordCount"))
         #expect(claude30["recordCount"] as? Int == 1)
         #expect(claude30["pricedRecordCount"] as? Int == 1)
         #expect(claude30["unmatchedModelCount"] as? Int == 0)
-        #expect(claude30["costNote"] as? String == "Covers 1 priced records only; 0 unknown-model records excluded")
+        #expect(claude30["costNote"] as? String == "Covers 1 priced record only; 0 unknown-model records excluded")
         #expect(claude30["inputTokens"] as? Int == 1_000)
         #expect(claude30["outputTokens"] as? Int == 500)
         #expect(claude30["cacheReadTokens"] as? Int == 3_000)
@@ -262,7 +265,7 @@ struct CLITests {
             "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
         ])
         #expect(enHuman.exitCode == 0)
-        #expect(enHuman.stdout.contains("$4.50 (Covers 1 priced records only; 2 unknown-model records excluded)"))
+        #expect(enHuman.stdout.contains("$4.50 (Covers 1 priced record only; 2 unknown-model records excluded)"))
         #expect(enHuman.stdout.contains("[Codex CLI] (Total mismatch)"))
         #expect(enHuman.stdout.contains("rollout=12000 vs sqlite=50000"))
 
@@ -357,7 +360,7 @@ struct CLITests {
         let d13 = try #require(dailyArr.first(where: { $0["date"] as? String == "2026-11-13" }))
         #expect(d13["pricedRecordCount"] as? Int == 1)
         #expect(d13["unmatchedModelCount"] as? Int == 2)
-        #expect(d13["costNote"] as? String == "Covers 1 priced records only; 2 unknown-model records excluded")
+        #expect(d13["costNote"] as? String == "Covers 1 priced record only; 2 unknown-model records excluded")
         #expect(d13["hasCodexRolloutMismatch"] as? Bool == false)
         #expect(d13["codexMismatchNote"] is NSNull)
         #expect(d13["rateLimit429Count"] as? Int == 0)
@@ -533,6 +536,81 @@ struct CLITests {
         ])
         #expect(dailyTextEN.exitCode == 0)
         #expect(dailyTextEN.stdout.contains("No timestamp |"))
+    }
+
+    @Test("B17: Singular/plural English grammar across CLI snapshot/daily/relay and single canonical unmatchedModelCount JSON key")
+    func b17SingularPluralGrammarAndCanonicalUnmatchedModelCountKey() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("agentbar-b17-cli-\(UUID().uuidString)")
+        let homeDir = tmp.appendingPathComponent("home")
+        let wsDir = tmp.appendingPathComponent("ws")
+        let claudeProj = homeDir.appendingPathComponent(".claude/projects/-tmp-b17")
+        let relayDir = wsDir.appendingPathComponent("proj1/.relay")
+        try FileManager.default.createDirectory(at: claudeProj, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: relayDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        try """
+        {"type":"assistant","timestamp":"2026-11-15T10:00:00Z","sessionId":"sb17","requestId":"r1","cwd":"/tmp/b17","message":{"id":"m1","model":"claude-sonnet-5-5","usage":{"input_tokens":1000000,"output_tokens":100000}}}
+        {"type":"assistant","timestamp":"2026-11-15T10:05:00Z","sessionId":"sb17","requestId":"r2","cwd":"/tmp/b17","message":{"id":"m2","model":"claude-fable-5-1","usage":{"input_tokens":50000,"output_tokens":5000}}}
+        """.write(to: claudeProj.appendingPathComponent("b17.jsonl"), atomically: true, encoding: .utf8)
+
+        try """
+        # Agent Relay Log
+
+        ## 01-agy: ok, 12s, 2026-11-14 10:30
+        - agy: model gemini-2.5-pro, tokens 900, cost $0.05
+        """.write(to: relayDir.appendingPathComponent("LOG.md"), atomically: true, encoding: .utf8)
+
+        let nowStr = "2026-11-15T12:00:00Z"
+
+        let snapEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(snapEN.exitCode == 0)
+        #expect(snapEN.stdout.contains("$4.50 (Covers 1 priced record only; 1 unknown-model record excluded)"))
+        #expect(snapEN.stdout.contains("Relay log (proj1): 1 step, recorded cost $0.05"))
+        #expect(!snapEN.stdout.contains("1 priced records"))
+        #expect(!snapEN.stdout.contains("1 unknown-model records"))
+        #expect(!snapEN.stdout.contains("1 steps"))
+
+        let dailyEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "daily", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(dailyEN.exitCode == 0)
+        #expect(dailyEN.stdout.contains("$0.05 (Covers 1 priced record only; 0 unknown-model records excluded)"))
+        #expect(dailyEN.stdout.contains("$4.50 (Covers 1 priced record only; 1 unknown-model record excluded)"))
+        #expect(!dailyEN.stdout.contains("1 priced records"))
+        #expect(!dailyEN.stdout.contains("1 unknown-model records"))
+
+        let jsonEN = CLIRunner.execute(arguments: [
+            "AgentBar", "--cli", "snapshot", "--json", "--lang", "en", "--tz", "UTC",
+            "--home", homeDir.path, "--workspace", wsDir.path, "--now", nowStr
+        ])
+        #expect(jsonEN.exitCode == 0)
+        #expect(!jsonEN.stdout.contains("unknownModelRecordCount"))
+        let root = try #require(try JSONSerialization.jsonObject(with: Data(jsonEN.stdout.utf8)) as? [String: Any])
+        let vendors = try #require(root["vendors"] as? [String: Any])
+        for (_, rawVendor) in vendors {
+            let vObj = try #require(rawVendor as? [String: Any])
+            #expect(vObj["unmatchedModelCount30d"] is Int)
+            #expect(!vObj.keys.contains("unknownModelRecordCount30d"))
+            let wins = try #require(vObj["windows"] as? [String: Any])
+            for (_, rawWin) in wins {
+                let wObj = try #require(rawWin as? [String: Any])
+                #expect(wObj["unmatchedModelCount"] is Int)
+                #expect(!wObj.keys.contains("unknownModelRecordCount"))
+            }
+            let unt = try #require(vObj["untimestamped"] as? [String: Any])
+            #expect(unt["unmatchedModelCount"] is Int)
+            #expect(!unt.keys.contains("unknownModelRecordCount"))
+        }
+        let claude = try #require(vendors["claude"] as? [String: Any])
+        #expect(claude["unmatchedModelCount30d"] as? Int == 1)
+        let claude30 = try #require((claude["windows"] as? [String: Any])?["thirtyDays"] as? [String: Any])
+        #expect(claude30["unmatchedModelCount"] as? Int == 1)
+        #expect(claude30["costNote"] as? String == "Covers 1 priced record only; 1 unknown-model record excluded")
     }
 
     private func execSQL(at url: URL, sql: String) throws {

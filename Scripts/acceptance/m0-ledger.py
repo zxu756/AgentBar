@@ -460,7 +460,7 @@ def build_synthetic_126_relay(md_path: pathlib.Path) -> None:
 
 
 def run_scripted_mutations() -> tuple[bool, str]:
-    """W1: Copy Package.swift + Sources + Tests to an isolated temp dir, run 5 targeted mutations, verify each fails its named test."""
+    """W1 + B17: Copy Package.swift + Sources + Tests to an isolated temp dir, run 10 targeted mutations (M1-M4 + B12-B17), verify each fails its named test."""
     mutations = [
         (
             "M1-claude-dedup",
@@ -495,21 +495,81 @@ def run_scripted_mutations() -> tuple[bool, str]:
             "Codex thread without rollout file reports totalOnly",
         ),
         (
-            "M5-codex-mismatch-ignored",
+            "B12-pricing-unverified",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            'public static let pricingVersion = "unverified"',
+            'public static let pricingVersion = "2026-11"',
+            "AgentBarCoreTests.PricingTests/pricingCatalog2026_11ExactArithmeticAndDisclaimer",
+            "Every PriceCatalog model row carries per-1M rates, official sourceURL, and honest unverified status",
+        ),
+        (
+            "B13-zh-datasource-english",
+            "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
+            '        case .antigravity:\n            return language == .zhHans\n                ? "~/Projects/*/.relay/LOG.md（cli-*.log 无 Token 统计）"\n                : "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"',
+            '        case .antigravity:\n            return "~/Projects/*/.relay/LOG.md (cli-*.log lacks token stats)"',
+            "AgentBarCoreTests.CLITests/headlessSnapshotJSONBilingualAndNullHonesty",
+            "Headless --cli snapshot --json outputs exact schema, explicit JSON nulls, and EN/ZH labels",
+        ),
+        (
+            "B14-unmatched-model-count",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            "self.unmatchedModelCount = (!hasValidRecordedCost && est == nil) ? 1 : 0",
+            "self.unmatchedModelCount = 0",
+            "AgentBarCoreTests.PricingTests/unknownModelRecordCountAggregatedSeparatelyInWindows",
+            "Counts priced N and excluded unknown-model M separately and formats explicit bilingual cost coverage notes",
+        ),
+        (
+            "B15-codex-mismatch-ignored",
             "Sources/AgentBarCore/Collectors/LocalCollectors.swift",
             "let isMismatch = (rolloutTotal != totalTok)\n                        || (breakdown.reportedTotalTokens != nil && breakdown.reportedTotalTokens != totalTok)",
             "let isMismatch = false && (rolloutTotal != totalTok || breakdown.reportedTotalTokens != nil)",
             "AgentBarCoreTests.CollectorsTests/codexRolloutTotalMismatchFlagsAndDowngradesCompleteness",
             "Codex rollout total_token_usage mismatch against threads.tokens_used",
         ),
+        (
+            "B16-nonexistent-home-exit-zero",
+            "Sources/AgentBarCore/CLI/CLIRunner.swift",
+            "if !fm.fileExists(atPath: explicitHome.path, isDirectory: &isDir) || !isDir.boolValue {",
+            "if false && (!fm.fileExists(atPath: explicitHome.path, isDirectory: &isDir) || !isDir.boolValue) {",
+            "AgentBarCoreTests.CLITests/nonexistentHomeOrWorkspaceExitsNonZeroWithError",
+            "Exits non-zero with stderr message when explicit --home or --workspace path does not exist or is not a directory",
+        ),
+        (
+            "B17-singular-plural-grammar",
+            "Sources/AgentBarCore/Models/TelemetryModels.swift",
+            'let pricedPhrase = englishCount(pricedCount, singular: "priced record", plural: "priced records")',
+            'let pricedPhrase = "\\(pricedCount) priced records"',
+            "AgentBarCoreTests.CLITests/b17SingularPluralGrammarAndCanonicalUnmatchedModelCountKey",
+            "B17: Singular/plural English grammar across CLI snapshot/daily/relay and single canonical unmatchedModelCount JSON key",
+        ),
     ]
+
+    pre_repo_diff = ""
+    if (REPO_ROOT / ".git").exists():
+        pre_repo_diff = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "diff", "--", "Sources", "Tests"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
 
     with tempfile.TemporaryDirectory(prefix="agentbar-m0-mutations-") as tmpdir:
         mut_root = pathlib.Path(tmpdir) / "repo"
+        iso_home = pathlib.Path(tmpdir) / "empty_home"
         mut_root.mkdir(parents=True)
+        iso_home.mkdir(parents=True)
         shutil.copy2(REPO_ROOT / "Package.swift", mut_root / "Package.swift")
         shutil.copytree(REPO_ROOT / "Sources", mut_root / "Sources")
         shutil.copytree(REPO_ROOT / "Tests", mut_root / "Tests")
+
+        env = dict(os.environ)
+        env["HOME"] = str(iso_home)
+
+        subprocess.run(["git", "init", "-q"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "config", "user.email", "mut@local"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "config", "user.name", "mut"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "add", "Package.swift", "Sources", "Tests"], cwd=str(mut_root), env=env, check=True)
+        subprocess.run(["git", "commit", "-qm", "baseline"], cwd=str(mut_root), env=env, check=True)
 
         details: list[str] = []
         for label, rel_file, target, replacement, test_filter, test_display in mutations:
@@ -522,6 +582,7 @@ def run_scripted_mutations() -> tuple[bool, str]:
                 proc = subprocess.run(
                     ["swift", "test", "--no-parallel", "--filter", test_filter],
                     cwd=str(mut_root),
+                    env=env,
                     capture_output=True,
                     text=True,
                     check=False,
@@ -529,7 +590,9 @@ def run_scripted_mutations() -> tuple[bool, str]:
                 combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                 compiled = "Build complete!" in combined
                 ran = "Test run started" in combined
-                named_failed = (test_display in combined) and ("✘ Test" in combined or "recorded an issue" in combined or "failed" in combined)
+                named_failed = (f'✘ Test "{test_display}' in combined) or (
+                    (test_display in combined) and "recorded an issue" in combined
+                )
                 if proc.returncode == 0 or not compiled or not ran or not named_failed:
                     return (
                         False,
@@ -538,6 +601,13 @@ def run_scripted_mutations() -> tuple[bool, str]:
                 details.append(f"{label}=RED(rc={proc.returncode})")
             finally:
                 fpath.write_text(original, encoding="utf-8")
+                git_diff = subprocess.run(
+                    ["git", "-C", str(mut_root), "diff", "--quiet", "--", "Package.swift", "Sources", "Tests"],
+                    env=env,
+                    check=False,
+                )
+                if fpath.read_text(encoding="utf-8") != original or git_diff.returncode != 0:
+                    return (False, f"{label}: failed to restore {rel_file} (git diff rc={git_diff.returncode})")
 
         # Confirm clean restoration passes in the isolated workspace
         clean_proc = subprocess.run(
@@ -548,17 +618,33 @@ def run_scripted_mutations() -> tuple[bool, str]:
                 "--filter",
                 "AgentBarCoreTests.CollectorsTests",
                 "--filter",
+                "AgentBarCoreTests.PricingTests",
+                "--filter",
                 "AgentBarCoreTests.RelayLogTests",
+                "--filter",
+                "AgentBarCoreTests.CLITests",
             ],
             cwd=str(mut_root),
+            env=env,
             capture_output=True,
             text=True,
             check=False,
         )
         if clean_proc.returncode != 0:
             return (False, f"restored workspace failed (rc={clean_proc.returncode})")
-        details.append("restored=GREEN(rc=0)")
-        return (True, ", ".join(details))
+
+    if (REPO_ROOT / ".git").exists():
+        post_repo_diff = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "diff", "--", "Sources", "Tests"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        if post_repo_diff != pre_repo_diff:
+            return (False, "git diff on REPO_ROOT Sources/Tests changed during mutation suite")
+
+    details.append("restored=GREEN(rc=0,git_diff=empty)")
+    return (True, ", ".join(details))
 
 
 def main() -> int:
@@ -574,8 +660,36 @@ def main() -> int:
     print(f"Frozen evaluation epoch (--now): {now_epoch}")
     print("=" * 78)
 
-    snap_en = run_cli_json(bin_path, ["--lang", "en", "--now", str(now_epoch)])
-    snap_zh = run_cli_json(bin_path, ["--lang", "zh", "--now", str(now_epoch)])
+    live_host_enabled = os.environ.get("AGENTBAR_LIVE_HOST") == "1"
+    iso_ctx = tempfile.TemporaryDirectory(prefix="agentbar-m0-default-empty-") if not live_host_enabled else None
+    try:
+        if iso_ctx is not None:
+            eval_home = pathlib.Path(iso_ctx.name) / "home"
+            eval_ws = pathlib.Path(iso_ctx.name) / "ws"
+            eval_home.mkdir(parents=True)
+            eval_ws.mkdir(parents=True)
+            base_args = ["--home", str(eval_home), "--workspace", str(eval_ws), "--now", str(now_epoch)]
+        else:
+            eval_home = EFFECTIVE_HOME
+            base_args = ["--now", str(now_epoch)]
+
+        return _run_m0_checks(bin_path, now_epoch, mtime_start, eval_home, base_args, live_host_enabled, failures)
+    finally:
+        if iso_ctx is not None:
+            iso_ctx.cleanup()
+
+
+def _run_m0_checks(
+    bin_path: pathlib.Path,
+    now_epoch: int,
+    mtime_start: float | None,
+    eval_home: pathlib.Path,
+    base_args: list[str],
+    live_host_enabled: bool,
+    failures: list[str],
+) -> int:
+    snap_en = run_cli_json(bin_path, ["--lang", "en", *base_args])
+    snap_zh = run_cli_json(bin_path, ["--lang", "zh", *base_args])
 
     # ------------------------------------------------------------------
     # Row 1: Claude Code 30d deduplicated tokens & recordCount (< 1% diff)
@@ -635,7 +749,7 @@ def main() -> int:
         synth_cw = synth_c_json["vendors"]["claude"]["windows"]["thirtyDays"]
         synth_claude_ok = synth_cw["recordCount"] == 1 and synth_cw["totalTokens"] == 5900
 
-    claude_ref = independent_claude_30d(EFFECTIVE_HOME / ".claude" / "projects", now_epoch)
+    claude_ref = independent_claude_30d(eval_home / ".claude" / "projects", now_epoch)
     claude_cli = snap_en["vendors"]["claude"]["windows"]["thirtyDays"]
     if claude_ref["records"] > 0:
         cli_claude_tok = int(claude_cli["totalTokens"] or 0)
@@ -752,7 +866,7 @@ def main() -> int:
             and "rollout=12000 vs sqlite=50000" in (cw_mis["mismatchNote"] or "")
         )
 
-    codex_ref = independent_codex_30d(EFFECTIVE_HOME / ".codex" / "state_5.sqlite", now_epoch)
+    codex_ref = independent_codex_30d(eval_home / ".codex" / "state_5.sqlite", now_epoch)
     codex_cli = snap_en["vendors"]["codex"]["windows"]["thirtyDays"]
     if codex_ref["records"] > 0 and codex_ref["missing_rollout"] == 0 and codex_ref["mismatches"] == 0:
         live_codex_ok = (
@@ -809,7 +923,7 @@ def main() -> int:
                     synth_ok = False
                     break
 
-    live_relay_md = EFFECTIVE_HOME / "Projects" / "rea-lol" / ".relay" / "LOG.md"
+    live_relay_md = eval_home / "Projects" / "rea-lol" / ".relay" / "LOG.md"
     live_relay_ok = True
     live_relay_desc = "synthetic 126/126 verified"
     if live_relay_md.is_file():
@@ -890,7 +1004,7 @@ def main() -> int:
     agy_en = snap_en["vendors"]["agy"]
     vibe_zh = snap_zh["vendors"]["vibe"]
     agy_zh = snap_zh["vendors"]["agy"]
-    oc_ref = independent_opencode_30d(EFFECTIVE_HOME / ".local" / "share" / "opencode" / "opencode.db", now_epoch)
+    oc_ref = independent_opencode_30d(eval_home / ".local" / "share" / "opencode" / "opencode.db", now_epoch)
     oc_cli = snap_en["vendors"]["opencode"]["windows"]["thirtyDays"]
     oc_ok = oc_cli["recordCount"] == oc_ref["records"] and int(oc_cli["totalTokens"] or 0) == oc_ref["total"]
 
@@ -960,11 +1074,19 @@ def main() -> int:
             text=True,
             check=False,
         )
+        b14_json = run_cli_json(bin_path, ["--lang", "en", "--home", str(thome), "--workspace", str(tws), "--now", str(now_epoch)])
+        b14_c = b14_json["vendors"]["claude"]
+        b14_c30 = b14_c["windows"]["thirtyDays"]
         b14_ok = (
             b14_zh.returncode == 0
             and "$4.50（只含已计价的 1 条，另有 2 条未知型号未计入）" in b14_zh.stdout
             and b14_en.returncode == 0
-            and "$4.50 (Covers 1 priced records only; 2 unknown-model records excluded)" in b14_en.stdout
+            and "$4.50 (Covers 1 priced record only; 2 unknown-model records excluded)" in b14_en.stdout
+            and "unknownModelRecordCount30d" not in b14_c
+            and b14_c["unmatchedModelCount30d"] == 2
+            and "unknownModelRecordCount" not in b14_c30
+            and b14_c30["unmatchedModelCount"] == 2
+            and b14_c30["costNote"] == "Covers 1 priced record only; 2 unknown-model records excluded"
         )
 
     # B16 check: explicit nonexistent --home exits 2 with stderr
@@ -1000,15 +1122,25 @@ def main() -> int:
         f"b16_bad_home_exit={bad_home.returncode}, opencode_30d_tokens={oc_tok_disp} (records={oc_cli['recordCount']})"
     )
 
+    if live_host_enabled:
+        passed_rows = max(0, 7 - len(failures))
+        skipped_rows = 0
+        print("[Row 7] PASS | Optional live-host parity check: AGENTBAR_LIVE_HOST == 1 verified")
+    else:
+        passed_rows = max(0, 6 - len(failures))
+        skipped_rows = 1
+        print("[Row 7] SKIP | Optional live-host parity check: AGENTBAR_LIVE_HOST != 1; live-host reads skipped (counted as skipped, never as passed)")
+
     mtime_end = plist_mtime()
     if mtime_start != mtime_end:
         failures.append(f"Preference plist mtime changed ({mtime_start} -> {mtime_end})")
 
     print("=" * 78)
+    print(f"SUMMARY: passed={passed_rows}, skipped={skipped_rows}, failed={len(failures)} (skipped checks are never counted as passed)")
     if failures:
         print(f"RESULT: FAILED ({len(failures)} check(s): {', '.join(failures)})")
         return 1
-    print("RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B16 + W1/W4 PASSED (read-only verified).")
+    print(f"RESULT: ALL 6 M0 ACCEPTANCE ROWS + B11-B17 + W1/W4 PASSED (passed={passed_rows}, skipped={skipped_rows}, failed=0; read-only verified).")
     return 0
 
 

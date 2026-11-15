@@ -145,9 +145,9 @@ struct PricingTests {
         let est = try #require(w30.estimatedCostUSD)
         #expect(abs(est - 4.50) < 0.000_001)
         #expect(w30.costNote(in: .zhHans) == "只含已计价的 1 条，另有 2 条未知型号未计入")
-        #expect(w30.costNote(in: .en) == "Covers 1 priced records only; 2 unknown-model records excluded")
+        #expect(w30.costNote(in: .en) == "Covers 1 priced record only; 2 unknown-model records excluded")
         #expect(snap.thirtyDayCostNote(in: .zhHans) == "只含已计价的 1 条，另有 2 条未知型号未计入")
-        #expect(snap.thirtyDayCostNote(in: .en) == "Covers 1 priced records only; 2 unknown-model records excluded")
+        #expect(snap.thirtyDayCostNote(in: .en) == "Covers 1 priced record only; 2 unknown-model records excluded")
 
         // Also test M == 0 case (2 priced records, 0 unknown models)
         let priced2 = UsageSample(
@@ -173,5 +173,33 @@ struct PricingTests {
             .metrics(for: .thirtyDays)
         #expect(codexEmpty.costNote(in: .zhHans) == nil)
         #expect(codexEmpty.costNote(in: .en) == nil)
+    }
+
+    @Test("B17: English costCoverageNote uses singular noun for count == 1 and plural for count == 0 or >= 2")
+    func englishSingularAndPluralCostCoverageNotes() throws {
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 1, unmatchedCount: 0, in: .en)
+            == "Covers 1 priced record only; 0 unknown-model records excluded"
+        )
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 1, unmatchedCount: 1, in: .en)
+            == "Covers 1 priced record only; 1 unknown-model record excluded"
+        )
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 2, unmatchedCount: 1, in: .en)
+            == "Covers 2 priced records only; 1 unknown-model record excluded"
+        )
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 2, unmatchedCount: 2, in: .en)
+            == "Covers 2 priced records only; 2 unknown-model records excluded"
+        )
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 0, unmatchedCount: 1, in: .en)
+            == "Covers 0 priced records only; 1 unknown-model record excluded"
+        )
+        #expect(
+            TelemetryFormatter.costCoverageNote(pricedCount: 0, unmatchedCount: 2, in: .en)
+            == "Covers 0 priced records only; 2 unknown-model records excluded"
+        )
     }
 }

@@ -38,7 +38,7 @@ AgentBar README Command Replay (Extracted from README.md & README.zh-CN.md)
   -> exit=0, verified ZH 14-day daily ledger (14 rows) & per-day B14 costNote
 
 [RUN]  .build/debug/AgentBar --cli snapshot --json --tz UTC --lang en
-  -> exit=0, verified EN JSON schemaVersion=1.1, 14-day dailyBreakdown, Vibe complete & AGY != complete
+  -> exit=0, verified EN JSON schemaVersion=1.1, canonical unmatchedModelCount, 14-day dailyBreakdown, Vibe complete & AGY != complete
 
 [RUN]  .build/debug/AgentBar --cli snapshot --json --tz UTC --lang zh
   -> exit=0, verified ZH JSON schemaVersion=1.1, 14-day dailyBreakdown & localized dataSource/costNote

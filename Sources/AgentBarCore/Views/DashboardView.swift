@@ -250,7 +250,7 @@ public struct DashboardView: View {
                 value: fiveVal,
                 label: localizer.L("5-hour rolling burst", "5 小时滚动突发"),
                 detail: localizer.L(
-                    "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) priced across \(snap.activeVendorCount) CLIs",
+                    "\(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD)) priced across \(TelemetryFormatter.englishCount(snap.activeVendorCount, singular: "CLI", plural: "CLIs"))",
                     "\(snap.activeVendorCount) 个有数据 CLI · 已计价 \(TelemetryFormatter.usd(snap.fiveHourTotalCostUSD))"
                 )
             )
@@ -270,7 +270,7 @@ public struct DashboardView: View {
                 detail: snap.rateLimitHits24h == 0
                     ? localizer.L("0 rate-limit markers (24h)", "24 小时内 0 条限流标记")
                     : localizer.L(
-                        "\(snap.rateLimitHits24h) rate-limit markers (24h)",
+                        "\(TelemetryFormatter.englishCount(snap.rateLimitHits24h, singular: "rate-limit marker", plural: "rate-limit markers")) (24h)",
                         "24 小时内 \(snap.rateLimitHits24h) 条限流标记"
                     )
             )
@@ -398,7 +398,7 @@ public struct DashboardView: View {
                     .foregroundStyle(AgentBarPalette.muted)
                 Spacer()
                 Text(localizer.L(
-                    "\(snap.recentSessions.count) sessions",
+                    TelemetryFormatter.englishCount(snap.recentSessions.count, singular: "session", plural: "sessions"),
                     "\(snap.recentSessions.count) 个会话"
                 ))
                 .font(.system(size: 11, design: .monospaced))

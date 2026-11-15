@@ -241,7 +241,7 @@ public struct MenuBarPopoverView: View {
                     .foregroundStyle(AgentBarPalette.ink)
                 Spacer()
                 Text(localizer.L(
-                    "\(run.steps.count) steps · \(TelemetryFormatter.usd(run.totalCostUSD))",
+                    "\(TelemetryFormatter.englishCount(run.steps.count, singular: "step", plural: "steps")) · \(TelemetryFormatter.usd(run.totalCostUSD))",
                     "\(run.steps.count) 步 · \(TelemetryFormatter.usd(run.totalCostUSD))"
                 ))
                 .font(.system(size: 11, design: .monospaced))

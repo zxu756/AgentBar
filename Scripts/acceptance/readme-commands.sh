@@ -184,7 +184,7 @@ while IFS= read -r cmd; do
           ;;
         *".build/debug/AgentBar --cli snapshot --lang en")
           grep -Fq "API-equivalent estimate (rates unverified; covers priced records only, unknown models excluded)" "$OUT_FILE"
-          grep -Fq '$4.50 (Covers 1 priced records only; 2 unknown-model records excluded)' "$OUT_FILE"
+          grep -Fq '$4.50 (Covers 1 priced record only; 2 unknown-model records excluded)' "$OUT_FILE"
           grep -Fq "[Mistral Vibe] (Complete)" "$OUT_FILE"
           grep -Fq "[Antigravity] (Relay logs only)" "$OUT_FILE"
           echo "  -> exit=0, verified EN snapshot disclaimer, priced/excluded costNote, Vibe Complete & Antigravity Relay logs only"
@@ -217,19 +217,23 @@ while IFS= read -r cmd; do
         *".build/debug/AgentBar --cli snapshot --json --tz UTC --lang en")
           python3 - "$OUT_FILE" <<'PY'
 import json, pathlib, sys
-doc = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raw = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "unknownModelRecordCount" not in raw
+doc = json.loads(raw)
 assert doc["schemaVersion"] == "1.1"
 assert doc["timeZone"] in ("UTC", "GMT")
 assert doc["pricingVersion"] == "unverified"
 assert doc["isDemoData"] is False
 assert len(doc["dailyBreakdown"]) == 14
-c30 = doc["vendors"]["claude"]["windows"]["thirtyDays"]
-assert c30["pricedRecordCount"] == 1 and c30["unmatchedModelCount"] == 2
-assert c30["costNote"] == "Covers 1 priced records only; 2 unknown-model records excluded"
+c_vendor = doc["vendors"]["claude"]
+assert c_vendor["unmatchedModelCount30d"] == 2 and "unknownModelRecordCount30d" not in c_vendor
+c30 = c_vendor["windows"]["thirtyDays"]
+assert c30["pricedRecordCount"] == 1 and c30["unmatchedModelCount"] == 2 and "unknownModelRecordCount" not in c30
+assert c30["costNote"] == "Covers 1 priced record only; 2 unknown-model records excluded"
 assert doc["vendors"]["vibe"]["completeness"] == "complete"
 assert doc["vendors"]["agy"]["completeness"] != "complete"
 PY
-          echo "  -> exit=0, verified EN JSON schemaVersion=1.1, 14-day dailyBreakdown, Vibe complete & AGY != complete"
+          echo "  -> exit=0, verified EN JSON schemaVersion=1.1, canonical unmatchedModelCount, 14-day dailyBreakdown, Vibe complete & AGY != complete"
           ;;
         *".build/debug/AgentBar --cli snapshot --json --tz UTC --lang zh")
           python3 - "$OUT_FILE" <<'PY'

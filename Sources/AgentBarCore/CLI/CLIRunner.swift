@@ -21,7 +21,6 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
     public let recordCount: Int
     public let pricedRecordCount: Int
     public let estimatedCostUSD: Double?
-    public let unknownModelRecordCount: Int
     public let unmatchedModelCount: Int
     public let costNote: String?
     public let cacheHitRate: Double?
@@ -42,7 +41,6 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         case recordCount
         case pricedRecordCount
         case estimatedCostUSD
-        case unknownModelRecordCount
         case unmatchedModelCount
         case costNote
         case cacheHitRate
@@ -64,7 +62,6 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         self.recordCount = metrics.recordCount
         self.pricedRecordCount = metrics.pricedRecordCount
         self.estimatedCostUSD = metrics.estimatedCostUSD
-        self.unknownModelRecordCount = metrics.unknownModelRecordCount
         self.unmatchedModelCount = metrics.unknownModelRecordCount
         self.costNote = metrics.costNote(in: language)
         self.cacheHitRate = metrics.cacheHitRate
@@ -87,7 +84,6 @@ public struct CLIWindowPayload: Codable, Sendable, Equatable {
         try c.encode(recordCount, forKey: .recordCount)
         try c.encode(pricedRecordCount, forKey: .pricedRecordCount)
         try encodeOptional(estimatedCostUSD, forKey: .estimatedCostUSD, in: &c)
-        try c.encode(unknownModelRecordCount, forKey: .unknownModelRecordCount)
         try c.encode(unmatchedModelCount, forKey: .unmatchedModelCount)
         try encodeOptional(costNote, forKey: .costNote, in: &c)
         try encodeOptional(cacheHitRate, forKey: .cacheHitRate, in: &c)
@@ -110,7 +106,6 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
     public let activeModel: String?
     public let sessionCount30d: Int
     public let pricedRecordCount30d: Int
-    public let unknownModelRecordCount30d: Int
     public let unmatchedModelCount30d: Int
     public let costNote30d: String?
     public let hasRolloutMismatch30d: Bool
@@ -128,7 +123,6 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         case activeModel
         case sessionCount30d
         case pricedRecordCount30d
-        case unknownModelRecordCount30d
         case unmatchedModelCount30d
         case costNote30d
         case hasRolloutMismatch30d
@@ -148,7 +142,6 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         self.activeModel = (summary.activeModel.isEmpty || summary.activeModel == "—") ? nil : summary.activeModel
         self.sessionCount30d = summary.sessionCount30d
         self.pricedRecordCount30d = w30.pricedRecordCount
-        self.unknownModelRecordCount30d = summary.unknownModelRecordCount30d
         self.unmatchedModelCount30d = summary.unknownModelRecordCount30d
         self.costNote30d = w30.costNote(in: language)
         self.hasRolloutMismatch30d = w30.hasRolloutMismatch
@@ -173,7 +166,6 @@ public struct CLIVendorPayload: Codable, Sendable, Equatable {
         try encodeOptional(activeModel, forKey: .activeModel, in: &c)
         try c.encode(sessionCount30d, forKey: .sessionCount30d)
         try c.encode(pricedRecordCount30d, forKey: .pricedRecordCount30d)
-        try c.encode(unknownModelRecordCount30d, forKey: .unknownModelRecordCount30d)
         try c.encode(unmatchedModelCount30d, forKey: .unmatchedModelCount30d)
         try encodeOptional(costNote30d, forKey: .costNote30d, in: &c)
         try c.encode(hasRolloutMismatch30d, forKey: .hasRolloutMismatch30d)
@@ -831,7 +823,7 @@ public enum CLIRunner {
                 if isZH {
                     lines.append("接力日志 (\(run.projectName)): \(run.steps.count) 个步骤, 已记录开销 \(TelemetryFormatter.usd(run.totalCostUSD))")
                 } else {
-                    lines.append("Relay log (\(run.projectName)): \(run.steps.count) steps, recorded cost \(TelemetryFormatter.usd(run.totalCostUSD))")
+                    lines.append("Relay log (\(run.projectName)): \(TelemetryFormatter.englishCount(run.steps.count, singular: "step", plural: "steps")), recorded cost \(TelemetryFormatter.usd(run.totalCostUSD))")
                 }
             }
         }
